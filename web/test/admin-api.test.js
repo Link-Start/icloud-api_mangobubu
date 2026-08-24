@@ -575,6 +575,7 @@ test("alias pages apply search and primary-account filters before server paginat
     limit: 50,
     offset: 50,
     query: "  private+box  ",
+    withoutLatestMail: true,
   });
   const url = new URL(request.url, "https://admin.invalid");
 
@@ -583,6 +584,7 @@ test("alias pages apply search and primary-account filters before server paginat
     offset: "50",
     account_id: "12",
     query: "private+box",
+    without_latest_mail: "true",
   });
   assert.equal(page.items[0].accountId, 12);
   assert.deepEqual(
@@ -650,6 +652,7 @@ test("alias group filters and moves preserve explicit ungrouping", async () => {
   await moveAliasesToGroup([9, 10], null, "csrf-token");
 
   assert.equal(requests[0].url.searchParams.get("group_id"), "none");
+  assert.equal(requests[0].url.searchParams.has("without_latest_mail"), false);
   assert.equal(moved.groupId, 7);
   assert.equal(moved.groupName, "注册");
   assert.deepEqual(JSON.parse(requests[1].options.body), { group_id: 7 });
@@ -676,7 +679,10 @@ test("full alias export preserves search across every server page", async () => 
     return jsonResponse(pages.shift());
   };
 
-  const aliases = await getAllAliases(12, { query: "receipt" });
+  const aliases = await getAllAliases(12, {
+    query: "receipt",
+    withoutLatestMail: true,
+  });
 
   assert.deepEqual(aliases.map((alias) => alias.id), [2, 1]);
   assert.equal(requests.length, 2);
@@ -686,6 +692,7 @@ test("full alias export preserves search across every server page", async () => 
     assert.equal(request.searchParams.get("limit"), "1000");
     assert.equal(request.searchParams.get("account_id"), "12");
     assert.equal(request.searchParams.get("query"), "receipt");
+    assert.equal(request.searchParams.get("without_latest_mail"), "true");
   }
 });
 

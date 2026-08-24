@@ -1529,6 +1529,15 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 	if !ok {
 		return
 	}
+	withoutLatestMail := false
+	if rawWithoutLatestMail, present := c.GetQuery("without_latest_mail"); present {
+		parsed, parseErr := strconv.ParseBool(strings.TrimSpace(rawWithoutLatestMail))
+		if parseErr != nil {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "without_latest_mail 必须是布尔值")
+			return
+		}
+		withoutLatestMail = parsed
+	}
 	query := strings.TrimSpace(c.Query("query"))
 	if len([]rune(query)) > adminAPIMaxListQueryRunes {
 		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "query 参数不能超过 200 个字符")
@@ -1558,12 +1567,13 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 		}
 	}
 	page, err := s.store.ListAliasesPage(c.Request.Context(), store.AliasListFilter{
-		AccountID: accountID,
-		GroupID:   groupID,
-		Ungrouped: groupUngrouped,
-		Query:     query,
-		Limit:     limit,
-		Offset:    offset,
+		AccountID:         accountID,
+		GroupID:           groupID,
+		Ungrouped:         groupUngrouped,
+		WithoutLatestMail: withoutLatestMail,
+		Query:             query,
+		Limit:             limit,
+		Offset:            offset,
 	})
 	if err != nil {
 		s.writeAdminAPIInternalError(c, err)

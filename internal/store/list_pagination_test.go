@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"icloud-api/internal/domain"
 	"icloud-api/internal/store"
@@ -248,6 +249,83 @@ func TestListAliasesPageSearchesAddressAndLabelBeforePagination(t *testing.T) {
 	}
 }
 
+func TestListAliasesPageFiltersWithoutLatestMailBeforePagination(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	first := createAccount(t, ctx, db, "First", "first-without-mail@icloud.com")
+	second := createAccount(t, ctx, db, "Second", "second-without-mail@icloud.com")
+
+	fixtures := []struct {
+		accountID int64
+		address   string
+		label     string
+	}{
+		{accountID: first.ID, address: "alpha-empty-filter@icloud.com", label: "Campaign target"},
+		{accountID: first.ID, address: "bravo-with-mail-filter@icloud.com", label: "Campaign target"},
+		{accountID: first.ID, address: "charlie-empty-filter@icloud.com", label: "Campaign target"},
+		{accountID: first.ID, address: "delta-empty-filter@icloud.com", label: "Personal"},
+		{accountID: second.ID, address: "echo-empty-filter@icloud.com", label: "Campaign target"},
+	}
+	aliases := make(map[string]domain.Alias, len(fixtures))
+	for index, fixture := range fixtures {
+		alias, err := db.CreateAlias(ctx, domain.Alias{
+			AccountID:  fixture.accountID,
+			Address:    fixture.address,
+			Label:      fixture.label,
+			APIKeyHash: []byte(fmt.Sprintf("without-mail-hash-%d", index)),
+			Enabled:    true,
+		})
+		if err != nil {
+			t.Fatalf("create without-mail fixture %q: %v", fixture.address, err)
+		}
+		aliases[fixture.address] = alias
+	}
+	seedAliasArchivedMail(t, ctx, db, aliases["bravo-with-mail-filter@icloud.com"], 1,
+		time.Date(2026, 8, 24, 9, 30, 0, 0, time.UTC))
+
+	filtered, err := db.ListAliasesPage(ctx, store.AliasListFilter{
+		AccountID:         &first.ID,
+		WithoutLatestMail: true,
+		Query:             "campaign",
+		Limit:             1,
+		Offset:            1,
+	})
+	if err != nil {
+		t.Fatalf("list aliases without latest mail: %v", err)
+	}
+	if filtered.Total != 2 {
+		t.Fatalf("aliases without latest mail total = %d, want 2", filtered.Total)
+	}
+	if got := aliasAddresses(filtered.Items); len(got) != 1 || got[0] != "charlie-empty-filter@icloud.com" {
+		t.Fatalf("aliases without latest mail page = %#v, want charlie fixture", got)
+	}
+	if filtered.Items[0].LatestReceivedAt != nil {
+		t.Fatalf("alias without latest mail has latest timestamp %v", filtered.Items[0].LatestReceivedAt)
+	}
+
+	unfiltered, err := db.ListAliasesPage(ctx, store.AliasListFilter{
+		AccountID: &first.ID,
+		Query:     "campaign",
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("list aliases with without-mail filter disabled: %v", err)
+	}
+	if unfiltered.Total != 3 {
+		t.Fatalf("unfiltered alias total = %d, want 3", unfiltered.Total)
+	}
+	assertStringsEqual(t, aliasAddresses(unfiltered.Items), []string{
+		"alpha-empty-filter@icloud.com",
+		"bravo-with-mail-filter@icloud.com",
+		"charlie-empty-filter@icloud.com",
+	})
+	if unfiltered.Items[1].LatestReceivedAt == nil {
+		t.Fatal("archived-mail fixture has nil latest timestamp")
+	}
+}
+
 func TestListPagesRejectInvalidBounds(t *testing.T) {
 	t.Parallel()
 
@@ -291,5 +369,34 @@ func assertStringsEqual(t *testing.T, got, want []string) {
 		if got[index] != want[index] {
 			t.Fatalf("value %d = %q, want %q; all values = %#v", index, got[index], want[index], got)
 		}
+	}
+}
+
+func seedAliasArchivedMail(
+	t *testing.T,
+	ctx context.Context,
+	db *store.Store,
+	alias domain.Alias,
+	upstreamUID uint32,
+	receivedAt time.Time,
+) {
+	t.Helper()
+	timestamp := receivedAt.UTC().UnixNano()
+	var messageID int64
+	if err := db.DB().QueryRowContext(ctx, `
+		INSERT INTO archived_messages(
+			account_id, uid_validity, upstream_uid, message_id,
+			internal_date, synced_at, created_at
+		) VALUES(?, 1, ?, ?, ?, ?, ?)
+		RETURNING id`,
+		alias.AccountID, int64(upstreamUID), fmt.Sprintf("<filter-%d@example.test>", upstreamUID),
+		timestamp, timestamp, timestamp,
+	).Scan(&messageID); err != nil {
+		t.Fatalf("seed archived message for alias %d: %v", alias.ID, err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO alias_messages(alias_id, message_id, mailbox_uid, created_at)
+		VALUES(?, ?, 1, ?)`, alias.ID, messageID, timestamp); err != nil {
+		t.Fatalf("link archived message to alias %d: %v", alias.ID, err)
 	}
 }

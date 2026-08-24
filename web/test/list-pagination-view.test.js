@@ -86,8 +86,16 @@ test("alias paging resets on filters and supports full batched display/export", 
   assert.match(source, /v-model="keywordDraft"/);
   assert.match(source, /placeholder="邮箱地址或用途备注"/);
   assert.match(source, /aria-label="关键词：模糊搜索隐私邮箱"/);
+  assert.match(source, /v-model="selectedLatestMailFilter"/);
+  assert.match(source, /<el-option label="无最新邮件" value="none"/);
+  assert.match(source, /withoutLatestMail:\s*withoutLatestMailOnly/);
+  assert.match(source, /function handleLatestMailFilterChange/);
+  assert.match(
+    source,
+    /function resetAliasFilters[\s\S]{0,360}selectedLatestMailFilter\.value = ""/,
+  );
   assert.doesNotMatch(source, /:disabled="accountsLoading \|\| accounts\.length === 0"/);
-  assert.match(source, /@media \(max-width: 1080px\)/);
+  assert.match(source, /@media \(max-width: 1280px\)/);
   assert.match(source, /function applyAliasSearch/);
   assert.match(source, /appliedAliasQuery\.value = query/);
   assert.match(
@@ -99,6 +107,8 @@ test("alias paging resets on filters and supports full batched display/export", 
     /function handleGroupFilterChange[\s\S]{0,220}appliedAliasQuery\.value = keywordDraft\.value\.trim\(\)/,
   );
   assert.match(source, /query:\s*appliedAliasQuery\.value/);
+  assert.match(source, /withoutLatestMail:\s*withoutLatestMail\.value/);
+  assert.match(source, /appliedAliasQuery \|\| appliedGroupId \|\| withoutLatestMail/);
   assert.match(source, /没有匹配的隐私邮箱/);
   assert.match(source, /:remote-method="searchAccounts"/);
   assert.match(source, /getAccountPage\(\{/);
