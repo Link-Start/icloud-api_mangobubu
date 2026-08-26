@@ -369,6 +369,43 @@
         </div>
 
         <div
+          class="account-alias-search"
+          role="search"
+          aria-label="搜索当前主号隐私邮箱"
+        >
+          <label class="account-alias-search__field">
+            <span>关键词</span>
+            <el-input
+              v-model="aliasQueryDraft"
+              clearable
+              maxlength="200"
+              :prefix-icon="Search"
+              aria-label="关键词：模糊搜索当前主号隐私邮箱"
+              placeholder="邮箱地址或用途备注"
+              @keyup.enter="applyAliasSearch"
+              @clear="applyAliasSearch"
+            />
+          </label>
+          <div class="account-alias-search__actions">
+            <el-button
+              type="primary"
+              :icon="Search"
+              :loading="loading"
+              @click="applyAliasSearch"
+            >
+              搜索
+            </el-button>
+            <el-button
+              :icon="RefreshLeft"
+              :disabled="!hasAliasSearch"
+              @click="clearAliasSearch"
+            >
+              清空
+            </el-button>
+          </div>
+        </div>
+
+        <div
           v-if="loading && aliases.length === 0"
           class="data-panel loading-panel"
         >
@@ -625,11 +662,25 @@
           v-if="!loading && !loadError && aliases.length === 0"
           class="empty-state--compact"
           level="h3"
-          :title="isCustomMailbox ? '尚未生成邮箱' : '尚未登记隐私邮箱'"
-          :description="isCustomMailbox
-            ? '输入生成数量批量创建，或在下方手动登记一个邮箱地址。'
-            : '添加一个已经转发到此主号的 Hide My Email 地址。'"
-          />
+          :title="appliedAliasQuery
+            ? '没有匹配的隐私邮箱'
+            : isCustomMailbox
+              ? '尚未生成邮箱'
+              : '尚未登记隐私邮箱'"
+          :description="appliedAliasQuery
+            ? '请尝试其他关键词，或清空搜索后查看全部邮箱。'
+            : isCustomMailbox
+              ? '输入生成数量批量创建，或在下方手动登记一个邮箱地址。'
+              : '添加一个已经转发到此主号的 Hide My Email 地址。'"
+        >
+          <el-button
+            v-if="appliedAliasQuery"
+            :icon="RefreshLeft"
+            @click="clearAliasSearch"
+          >
+            清空搜索
+          </el-button>
+        </EmptyState>
 
         <ListPagination
           :page="currentPage"
@@ -714,6 +765,8 @@ import {
   Key,
   Plus,
   Refresh,
+  RefreshLeft,
+  Search,
   SwitchButton,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -738,6 +791,7 @@ import {
   deleteAlias,
   deleteAppleSession,
   getAccount,
+  getAliasPage,
   getAllAliases,
   getMailGroups,
   loginAppleSession,
@@ -790,6 +844,8 @@ const aliases = ref([]);
 const currentPage = ref(1);
 const pageSize = ref(DEFAULT_PAGE_SIZE);
 const total = ref(0);
+const aliasQueryDraft = ref("");
+const appliedAliasQuery = ref("");
 const groups = ref([]);
 const groupsLoading = ref(false);
 const groupsError = ref(null);
@@ -834,6 +890,9 @@ let resumeAliasSyncAfterAuth = false;
 let resumeAutoCreationAfterAuth = false;
 
 const syncActive = computed(() => Boolean(account.value?.syncProgress?.active));
+const hasAliasSearch = computed(() =>
+  Boolean(aliasQueryDraft.value.trim() || appliedAliasQuery.value),
+);
 const isCustomMailbox = computed(
   () => account.value?.mailboxType === "custom",
 );
@@ -1146,8 +1205,9 @@ function detailRequestKey(
   accountId = detailRouteKey(),
   page = currentPage.value,
   selectedPageSize = pageSize.value,
+  query = appliedAliasQuery.value,
 ) {
-  return `${accountId}\u0000${page}\u0000${selectedPageSize}`;
+  return `${accountId}\u0000${query}\u0000${page}\u0000${selectedPageSize}`;
 }
 
 function replaceAlias(updated) {
@@ -1213,7 +1273,8 @@ async function loadDetail({ silent = false } = {}) {
   const accountId = detailRouteKey();
   const page = currentPage.value;
   const selectedPageSize = pageSize.value;
-  const requestKey = detailRequestKey(accountId, page, selectedPageSize);
+  const query = appliedAliasQuery.value;
+  const requestKey = detailRequestKey(accountId, page, selectedPageSize, query);
   const ticket = detailGate.begin(requestKey);
   detailAbortController?.abort();
   const abortController = new AbortController();
@@ -1225,6 +1286,7 @@ async function loadDetail({ silent = false } = {}) {
   try {
     let detail;
     let nextAliases;
+    let aliasPage;
     if (selectedPageSize === ALL_PAGE_SIZE) {
       [detail, nextAliases] = await Promise.all([
         getAccount(accountId, {
@@ -1232,8 +1294,28 @@ async function loadDetail({ silent = false } = {}) {
           offset: 0,
           signal: abortController.signal,
         }),
-        getAllAliases(accountId, { signal: abortController.signal }),
+        getAllAliases(accountId, {
+          signal: abortController.signal,
+          query,
+        }),
       ]);
+    } else if (query) {
+      [detail, aliasPage] = await Promise.all([
+        // Keep the account request focused on metadata. Its alias count is
+        // the unfiltered total used by the automatic-creation panel.
+        getAccount(accountId, {
+          limit: DEFAULT_PAGE_SIZE,
+          offset: 0,
+          signal: abortController.signal,
+        }),
+        getAliasPage(accountId, {
+          limit: selectedPageSize,
+          offset: (page - 1) * selectedPageSize,
+          query,
+          signal: abortController.signal,
+        }),
+      ]);
+      nextAliases = Array.isArray(aliasPage?.items) ? aliasPage.items : [];
     } else {
       detail = await getAccount(accountId, {
         limit: selectedPageSize,
@@ -1249,7 +1331,9 @@ async function loadDetail({ silent = false } = {}) {
       return false;
     }
     const allItems = selectedPageSize === ALL_PAGE_SIZE;
-    const reportedTotal = Number(detail?.pagination?.total);
+    const reportedTotal = Number(
+      aliasPage?.total ?? detail?.pagination?.total,
+    );
     const resolvedTotal = allItems
       ? nextAliases.length
       : Number.isFinite(reportedTotal) && reportedTotal >= 0
@@ -1265,7 +1349,7 @@ async function loadDetail({ silent = false } = {}) {
       loadError.value = null;
       return await loadDetail({ silent });
     }
-    account.value = allItems
+    account.value = allItems && !query
       ? { ...detail.account, aliasCount: resolvedTotal }
       : detail.account;
     aliases.value = nextAliases;
@@ -1327,6 +1411,30 @@ function handlePageSizeChange(value) {
   detailGate.invalidate();
   detailAbortController?.abort();
   void loadDetail();
+}
+
+function resetAliasSearchResults() {
+  currentPage.value = 1;
+  aliases.value = [];
+  total.value = 0;
+  loadError.value = null;
+  detailGate.invalidate();
+  detailAbortController?.abort();
+  void loadDetail();
+}
+
+function applyAliasSearch() {
+  const query = aliasQueryDraft.value.trim();
+  if (query === appliedAliasQuery.value) return;
+  appliedAliasQuery.value = query;
+  resetAliasSearchResults();
+}
+
+function clearAliasSearch() {
+  if (!aliasQueryDraft.value && !appliedAliasQuery.value) return;
+  aliasQueryDraft.value = "";
+  appliedAliasQuery.value = "";
+  resetAliasSearchResults();
 }
 
 const liveRefresh = createLiveRefresh(() => loadDetail({ silent: true }));
@@ -2078,6 +2186,8 @@ watch(
       aliases.value = [];
       currentPage.value = 1;
       total.value = 0;
+      aliasQueryDraft.value = "";
+      appliedAliasQuery.value = "";
       appleSession.value = null;
       autoCreation.value = null;
       aliasSyncSummary.value = null;
@@ -2105,6 +2215,35 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.account-alias-search {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.account-alias-search__field {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 6px;
+}
+
+.account-alias-search__field > span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.account-alias-search__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
 .credential-value {
   display: block;
   max-width: 100%;
@@ -2121,5 +2260,18 @@ onBeforeUnmount(() => {
 
 .mobile-alias-group-select {
   min-width: 150px;
+}
+
+@media (max-width: 720px) {
+  .account-alias-search {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 14px;
+  }
+
+  .account-alias-search__actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 </style>

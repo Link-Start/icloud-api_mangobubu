@@ -140,6 +140,32 @@ test("account detail aliases use the shared server-backed pagination contract", 
     /getAccount\(accountId,\s*\{[\s\S]{0,180}limit:\s*selectedPageSize,[\s\S]{0,120}offset:\s*\(page - 1\) \* selectedPageSize/,
   );
   assert.match(source, /getAllAliases\(accountId,\s*\{\s*signal:/);
+  assert.match(source, /v-model="aliasQueryDraft"/);
+  assert.match(source, /placeholder="邮箱地址或用途备注"/);
+  assert.match(source, /aria-label="关键词：模糊搜索当前主号隐私邮箱"/);
+  assert.match(source, /@keyup\.enter="applyAliasSearch"/);
+  assert.match(source, /@clear="applyAliasSearch"/);
+  assert.match(
+    source,
+    /function detailRequestKey\([\s\S]{0,240}query = appliedAliasQuery\.value[\s\S]{0,140}\$\{query\}/,
+  );
+  assert.match(
+    source,
+    /getAliasPage\(accountId,\s*\{[\s\S]{0,220}offset:\s*\(page - 1\) \* selectedPageSize,[\s\S]{0,100}query/,
+  );
+  assert.match(
+    source,
+    /getAllAliases\(accountId,\s*\{[\s\S]{0,120}query/,
+  );
+  assert.match(
+    source,
+    /function applyAliasSearch[\s\S]{0,220}appliedAliasQuery\.value = query[\s\S]{0,100}resetAliasSearchResults\(\)/,
+  );
+  assert.match(
+    source,
+    /function resetAliasSearchResults[\s\S]{0,160}currentPage\.value = 1/,
+  );
+  assert.match(source, /没有匹配的隐私邮箱/);
   assert.match(source, /detail\?\.pagination\?\.total/);
   assert.match(source, /if \(!allItems && page > lastPage\)/);
   assert.match(source, /currentPage\.value = lastPage/);
