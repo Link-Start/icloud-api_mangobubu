@@ -4,7 +4,10 @@ import { setUnauthorizedHandler } from "../api/client.js";
 import AdminLayout from "../layouts/AdminLayout.vue";
 import { useAuth } from "../stores/auth.js";
 import { setPageHeader } from "../stores/page.js";
-import { buildLoginRedirect } from "../utils/authFlow.js";
+import {
+  buildLoginRedirect,
+  loginNoticeRequiresExplicitLogin,
+} from "../utils/authFlow.js";
 import { ADMIN_BASE_PATH } from "../utils/runtimePath.js";
 
 const routes = [
@@ -103,7 +106,11 @@ const auth = useAuth();
 router.beforeEach(async (to) => {
   setPageHeader(to.meta.title || "", to.meta.subtitle || "");
   if (!to.matched.some((record) => record.meta.requiresAuth)) {
-    if (to.name === "login" && auth.isAuthenticated.value) {
+    if (
+      to.name === "login" &&
+      auth.isAuthenticated.value &&
+      !loginNoticeRequiresExplicitLogin(String(to.query.notice || ""))
+    ) {
       return { name: "accounts", replace: true };
     }
     return true;

@@ -81,7 +81,15 @@ IMAP/OAuth 严格使用四个横线：
 alias@example.com----IMAP_PASSWORD----CLIENT_ID----REFRESH_TOKEN
 ```
 
-管理 API 的凭证响应设置 `Cache-Control: no-store`。legacy alias 使用兼容接口只轮换 API Key 和由其派生的旧直达链接，保留消费记录、邮件快照、IMAP `Seen` 状态及 credential mode。v2 alias 可显式轮换整套凭证，使旧 API Key、派生取码 URL、IMAP 密码、refresh token 和所有已签发 access token 同时失效。迁移本身不会轮换已领取的 legacy Key。
+管理 API 的凭证响应设置 `Cache-Control: no-store`。legacy alias 使用兼容接口只轮换 API Key 和由其派生的旧直达链接，保留消费记录、邮件快照、IMAP `Seen` 状态及 credential mode。v2 alias 可显式轮换整套凭证，使旧 API Key、派生取码 URL、IMAP 密码、refresh token 和所有已签发 access token 同时失效。schema 迁移本身不会轮换已领取的 legacy Key。
+
+需要在凭据泄露后整体止损时，可在安装级随机管理前缀或固定兼容入口调用 `POST <admin-path>/api/v1/aliases/rotate-all-credentials`。该接口要求有效管理 Session、`X-CSRF-Token` 和当前管理员密码，并提交 JSON `{"confirmation":"ROTATE_ALL","current_password":"CURRENT_ADMIN_PASSWORD"}`。重认证具有独立限流；`current_password` 与 `confirmation` 只用于本次校验，不得写入访问日志、应用日志或审计详情。
+
+全量轮换在同一事务中把所有 legacy alias 强制迁移为 v2，并为所有现有 v2 alias 轮换整套凭据。等待 Apple 目录确认的 alias 也会轮换；对应 `pending_alias_api_keys` 会同步更新为新凭证包的 API Key，原确认关系和领取流程保持不变。响应的 `data` 只返回 `total`、`rotated`、`migrated_legacy`、`rotated_v2`、`rotated_pending` 和固定为 `true` 的 `reauthentication_required`，不返回任何新凭据；其中 `rotated_pending` 是已轮换总数的子集。执行后，旧 legacy API Key 与 v1 直达链接，以及原 v2 API Key、派生链接、IMAP/OAuth 凭据和 access token 全部失效；邮件归档、消费/已读状态和 IMAP `Seen` 任务保留。管理员密码本身不变，但服务会提升执行管理员的 `password_version`、撤销该管理员的全部后台 Session，并清除随机管理路径与固定兼容路径的 Cookie，必须重新登录。
+
+轮换与所有会消费或返回 alias 凭据的公开 HTTP 请求形成明确截止点。`GET /api/v1/otp`、`GET /api/v1/mail/latest`、`GET /api/v1/mail/recent[/]`、`POST /oauth2/v2.0/token` 和外部 `POST /api/v1/aliases[/]` 从鉴权前一直保护到响应写完；全量轮换会先等待这些已在途请求完成，再提交并返回成功。成功响应之后，使用任何旧 HTTP 凭据发起的新请求都会被拒绝。
+
+IMAPS 不等待 HTTP 截止点。轮换提交后，旧 IMAP 密码和旧 access token 立即不能建立新会话；已经登录的会话会在下一条邮箱命令复验凭据版本并拒绝继续操作，IDLE 会话最迟在下一次轮询 tick 失效。提交时已经通过复验并开始执行的单条命令可以完成。
 
 ## OTP API
 
@@ -104,7 +112,7 @@ curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN'
 [{"otp":"123456","time":"2026-08-11T12:00:00+08:00"}]
 ```
 
-没有验证码时返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。v2 的 OTP token 与 recent-mail 消费 token 按用途分别签名，不能通过改写 URL 路径互换；原 v1 直达 token 只继续用于 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，只接受未与字母或数字相邻的 4–8 位 ASCII 数字；每封邮件最多保存一个候选。
+没有验证码时返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。迁移和轮换后 OTP URL 仍使用 `/api/v1/otp`；v2 alias 的 OTP token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名，不能通过改写 URL 路径或信封版本互换。这里的 v3 仅指 OTP token 信封版本，不是新的 alias credential mode。原 v1 直达 token 只继续用于尚未执行全量迁移的 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，只接受未与字母或数字相邻的 4–8 位 ASCII 数字；每封邮件最多保存一个候选。
 
 ## 旧接口兼容
 
@@ -116,7 +124,7 @@ PR2 保留原有 v1 外部接口，已有调用方无需改 URL 或鉴权方式�
 | `GET /api/v1/mail/recent` | `?api_key=<API Key、legacy 旧直达 token 或 v2 recent-mail token>` | 返回最近一小时内当前快照；成功后记录消费并异步写入 IMAP `Seen` |
 | `POST /api/v1/aliases` | `Authorization: Bearer <OAuth Token>` | 使用 query、表单或二者组合传递既有 `add_hide_my_eamil` 和 `icloud` 字段；合并后每个字段必须恰好出现一次 |
 
-旧 alias 的 API Key、旧直达链接和消费状态继续有效。迁移前已经领取的 alias 保持 `legacy` 模式；新建 alias，以及迁移前存在 pending 一次性 Key 但尚未领取的 alias，才会补齐 v2 凭证。`latest_messages`、`consumed_messages`、`imap_seen_tasks` 和 `pending_alias_api_keys` 数据会保留并继续参与兼容流程。
+默认兼容升级中，旧 alias 的 API Key、旧直达链接和消费状态继续有效。迁移前已经领取的 alias 保持 `legacy` 模式；新建 alias，以及迁移前存在 pending 一次性 Key 但尚未领取的 alias，才会补齐 v2 凭证。显式调用全量轮换接口是例外：所有 legacy alias 会迁移为 v2，旧 API Key 与 v1 直达链接立即失效；`pending_alias_api_keys` 行不会删除，而会在同一事务中替换为新凭证包的 API Key。`latest_messages`、`consumed_messages`、`imap_seen_tasks` 和 pending 确认流程会保留并继续参与兼容流程。
 
 外部登记接口仍读取 `ICLOUD_API_OAUTH_TOKEN`（或等价的部署密钥注入），升级过程不应删除已配置的 OAuth Token。成功响应继续使用 `api_key` 和 `mail_api_direct_link` 字段；管理 API 的 alias DTO 继续提供 `direct_link_path`，新字段可作为附加信息但不能替代旧字段。
 
@@ -244,7 +252,7 @@ location / {
 
 schema 升级后，服务会先校验主密钥，再按 alias ID 逐条事务补齐 v2 凭证包。迁移前已经领取的 alias 保持 `legacy` 模式，原 API Key、旧直达链接、消费记录和 IMAP `Seen` 任务不变；只有新 alias，或迁移前存在 pending 一次性 Key 但尚未领取的 alias，才会使用 v2 凭证。pending Key 会在补齐 v2 凭证时复用原 Key，不会静默替换。
 
-升级会保留 `latest_messages`、`consumed_messages`、`imap_seen_tasks`、`pending_alias_api_keys` 及 `api_key_prefix`。归档表与旧快照双写，旧邮件路由继续读取兼容快照；安装级 OAuth Token 配置也继续可用于 `/api/v1/aliases`。如果曾部署过 PR2 的前序 v7 版本，应从管理端重新复制 v2 的 OTP 与 recent-mail URL，以换用用途隔离 token；迁移前 legacy alias 已保存的 v1 直达链接不受影响。升级从既有游标建立归档基线，远端历史邮件不会回填。
+升级会保留 `latest_messages`、`consumed_messages`、`imap_seen_tasks`、`pending_alias_api_keys` 及 `api_key_prefix`。归档表与旧快照双写，旧邮件路由继续读取兼容快照；安装级 OAuth Token 配置也继续可用于 `/api/v1/aliases`。如果曾部署过 PR2 的前序 v7 版本，应从管理端重新复制 v2 的 OTP 与 recent-mail URL，以换用用途隔离 token；迁移前 legacy alias 已保存的 v1 直达链接默认不受 schema 升级影响。只有管理员显式调用全量轮换接口时，legacy alias 才会强制迁移为 v2 并使旧链接失效；等待 Apple 确认的项也会同步轮换 pending Key，同时保留既有确认流程。升级从既有游标建立归档基线，远端历史邮件不会回填。
 
 升级前必须同时备份 PostgreSQL、keys 卷和 mail archive 卷。不要只备份数据库：keys 卷包含主密钥、随机管理路径和本地 IMAPS 证书，mail archive 卷包含数据库所引用的 MIME 文件。使用卷快照时还应把 `postgres_data`、`postgres_config`、`installation_state`、`icloud_api_keys` 和 `icloud_api_mail_archive` 作为同一个恢复点；`postgres_socket` 属于临时通信卷。
 
@@ -302,6 +310,7 @@ npm run build
 
 - 生产环境保持单个 `icloud-api` 实例，避免拆分进程内账号锁、同步调度和限流状态。
 - 管理端、部署级 OAuth token、API Key、取码 URL、IMAP 密码、refresh token、主密钥、App 专用密码和备份都按敏感凭据管理。
+- 全量轮换请求的 `current_password` 和 `confirmation` 不得进入反向代理访问日志、应用日志或审计详情；不要记录管理 API 请求体。
 - URL 可能进入浏览器历史、代理日志和监控系统；legacy alias 可轮换 API Key 使旧直达链接失效，v2 alias 应轮换整套凭证。
 - 原始 MIME、主题和 HTML 都属于外部输入；展示 HTML 前应清理内容或放入严格隔离的沙箱。
 - 邮件归属依赖 iCloud 转发链路中的收件人头。使用第三方转发邮箱时，应把 IMAP 用户名填写为最终物理投递/登录地址，以便在 Apple 原始收件人头被改写后仍能校验目标；保持 `ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS=false`，并用真实 Hide My Email 样本验收路由。

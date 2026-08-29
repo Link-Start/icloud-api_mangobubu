@@ -46,8 +46,16 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	auth.GET("/csrf", s.adminAPILoginCSRF(basePath))
 	auth.POST("/login", s.adminAPILoginRequestGate(), s.adminAPILogin(basePath))
 
+	rotationProtected := api.Group("")
+	rotationProtected.Use(s.adminAPIAuth(), s.adminAPICSRF())
+	rotationProtected.POST("/aliases/rotate-all-credentials", s.adminAPIRotateAllAliasCredentials)
+
 	protected := api.Group("")
-	protected.Use(s.adminAPIAuth(), s.adminAPICSRF())
+	protected.Use(
+		s.adminAPIAuth(),
+		s.adminAPICSRF(),
+		s.adminAPICredentialRotationReadGuard(),
+	)
 	protected.GET("/auth/session", s.adminAPISession)
 	protected.POST("/auth/logout", s.adminAPILogout(basePath))
 	protected.PUT("/auth/password", s.adminAPIChangePassword(basePath))
@@ -343,6 +351,11 @@ type adminAPICreateAliasRequest struct {
 type adminAPIUpdateAliasRequest struct {
 	Enabled *bool                 `json:"enabled"`
 	GroupID adminAPIOptionalInt64 `json:"group_id"`
+}
+
+type adminAPIRotateAllCredentialsRequest struct {
+	Confirmation    string `json:"confirmation"`
+	CurrentPassword string `json:"current_password"`
 }
 
 func adminAPISessionFromDomain(session domain.Session) adminAPISessionDTO {
@@ -1773,6 +1786,101 @@ func (s *Server) adminAPIGetAlias(c *gin.Context) {
 		return
 	}
 	writeAdminAPIData(c, http.StatusOK, aliasDTO)
+}
+
+func (s *Server) adminAPIRotateAllAliasCredentials(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	var input adminAPIRotateAllCredentialsRequest
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	if input.Confirmation != "ROTATE_ALL" {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "confirmation 必须为 ROTATE_ALL")
+		return
+	}
+
+	session := mustSession(c)
+	limiterKey := strconv.FormatInt(session.AdminID, 10) + "|" + c.ClientIP()
+	if s.credentialRotationLimiter == nil ||
+		!s.credentialRotationLimiter.Allow(limiterKey) {
+		writeAdminAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁，请稍后再试")
+		return
+	}
+	admin, err := s.store.GetAdminByID(c.Request.Context(), session.AdminID)
+	if errors.Is(err, store.ErrNotFound) || (err == nil &&
+		admin.PasswordVersion != session.PasswordVersion) {
+		s.clearSessionCookies(c)
+		writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已失效")
+		return
+	}
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	if input.CurrentPassword == "" ||
+		bcrypt.CompareHashAndPassword(
+			[]byte(admin.PasswordHash), []byte(input.CurrentPassword),
+		) != nil {
+		s.audit(
+			c, &session.AdminID, session.Username,
+			"rotate_all_credentials", "alias", "all", "failed",
+			"current_password_invalid",
+		)
+		writeAdminAPIError(c, http.StatusUnauthorized, "CURRENT_PASSWORD_INVALID", "当前密码不正确")
+		return
+	}
+
+	if s.beforeCredentialRotationLock != nil {
+		s.beforeCredentialRotationLock()
+	}
+	s.credentialRotationMu.Lock()
+	defer s.credentialRotationMu.Unlock()
+
+	rawSession, cookieErr := c.Cookie(sessionCookie)
+	currentSession, sessionErr := s.store.GetSessionByHash(
+		c.Request.Context(), secure.HashToken(rawSession),
+	)
+	if cookieErr != nil || rawSession == "" || errors.Is(sessionErr, store.ErrNotFound) ||
+		(sessionErr == nil && (currentSession.AdminID != session.AdminID ||
+			currentSession.PasswordVersion != session.PasswordVersion)) {
+		s.clearSessionCookies(c)
+		writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已失效")
+		return
+	}
+	if sessionErr != nil {
+		s.writeAdminAPIInternalError(c, sessionErr)
+		return
+	}
+
+	summary, err := s.store.RotateAllAliasCredentialsWithAudit(
+		c.Request.Context(), session.AdminID, session.PasswordVersion, domain.AuditLog{
+			AdminID:      &session.AdminID,
+			Username:     session.Username,
+			Action:       "rotate_all_credentials",
+			ResourceType: "alias",
+			ResourceID:   "all",
+			Result:       "success",
+			IP:           c.ClientIP(),
+			RequestID:    requestID(c),
+		})
+	if err != nil {
+		if errors.Is(err, store.ErrCredentialsChanged) {
+			s.clearSessionCookies(c)
+			writeAdminAPIError(c, http.StatusConflict, "CREDENTIALS_CHANGED", "登录凭据已更新，请重新登录")
+			return
+		}
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	s.clearSessionCookies(c)
+	writeAdminAPIData(c, http.StatusOK, gin.H{
+		"total":                     summary.Total,
+		"rotated":                   summary.Rotated,
+		"migrated_legacy":           summary.MigratedLegacy,
+		"rotated_v2":                summary.RotatedV2,
+		"rotated_pending":           summary.RotatedPending,
+		"reauthentication_required": true,
+	})
 }
 
 func (s *Server) adminAPIRotateAliasCredentials(c *gin.Context) {

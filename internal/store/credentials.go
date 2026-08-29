@@ -40,6 +40,14 @@ func (s *Store) ConfigureAliasCredentialRevealFactory(
 	s.credentialRevealFactory = factory
 }
 
+// ConfigureAliasPendingKeyRotationFactory installs the trusted issuer that
+// derives and encrypts the one-time API key from a newly generated bundle.
+func (s *Store) ConfigureAliasPendingKeyRotationFactory(
+	factory func(aliasID int64, credentialCiphertext string) (string, error),
+) {
+	s.credentialPendingKeyRotationFactory = factory
+}
+
 // ConfigureAliasAPIKeyRotationFactory installs the trusted issuer that
 // rewrites only the API key inside an existing v2 credential bundle.
 func (s *Store) ConfigureAliasAPIKeyRotationFactory(
@@ -121,9 +129,20 @@ func (s *Store) installGeneratedAliasCredentialsTx(
 	}
 	uidValidity := uint32(0)
 	if initializeMailbox {
-		uidValidity, err = randomMailboxUIDValidity()
-		if err != nil {
-			return domain.AliasCredentialMaterial{}, fmt.Errorf("generate alias mailbox UIDVALIDITY: %w", err)
+		var currentUIDValidity int64
+		if err := s.txQueryRowContext(ctx, tx,
+			`SELECT mailbox_uid_validity FROM aliases WHERE id = ?`, aliasID,
+		).Scan(&currentUIDValidity); err != nil {
+			return domain.AliasCredentialMaterial{}, fmt.Errorf("read alias mailbox UIDVALIDITY: %w", err)
+		}
+		for {
+			uidValidity, err = randomMailboxUIDValidity()
+			if err != nil {
+				return domain.AliasCredentialMaterial{}, fmt.Errorf("generate alias mailbox UIDVALIDITY: %w", err)
+			}
+			if int64(uidValidity) != currentUIDValidity {
+				break
+			}
 		}
 	}
 	query := `
@@ -391,6 +410,307 @@ func (s *Store) RotateAliasCredentials(ctx context.Context, id int64) (domain.Al
 		return domain.Alias{}, fmt.Errorf("commit alias credential rotation: %w", err)
 	}
 	return rotated, nil
+}
+
+// RotateAllAliasCredentialsResult reports only aggregate progress. Newly
+// issued credentials deliberately never leave the store through this API.
+type RotateAllAliasCredentialsResult struct {
+	Total          int `json:"total"`
+	Rotated        int `json:"rotated"`
+	MigratedLegacy int `json:"migrated_legacy"`
+	RotatedV2      int `json:"rotated_v2"`
+	RotatedPending int `json:"rotated_pending"`
+}
+
+// RotateAllAliasCredentials replaces every usable alias credential bundle in
+// one transaction. Legacy aliases receive a completely new v2 bundle at
+// version 1 and a fresh mailbox UIDVALIDITY. Existing v2 aliases advance their
+// version while retaining mailbox identity. Every pending one-time key is
+// replaced with the API key from the new bundle, including aliases awaiting
+// confirmation from Apple.
+func (s *Store) RotateAllAliasCredentials(ctx context.Context) (RotateAllAliasCredentialsResult, error) {
+	return s.rotateAllAliasCredentials(ctx, nil, 0, 0)
+}
+
+// RotateAllAliasCredentialsWithAudit performs the same atomic rotation and
+// inserts its administrator audit entry, advances the authenticated admin's
+// password version, and revokes all of that admin's sessions before commit.
+func (s *Store) RotateAllAliasCredentialsWithAudit(
+	ctx context.Context,
+	adminID, expectedPasswordVersion int64,
+	audit domain.AuditLog,
+) (RotateAllAliasCredentialsResult, error) {
+	if adminID < 1 || expectedPasswordVersion < 1 {
+		return RotateAllAliasCredentialsResult{}, ErrCredentialsChanged
+	}
+	return s.rotateAllAliasCredentials(ctx, &audit, adminID, expectedPasswordVersion)
+}
+
+func (s *Store) rotateAllAliasCredentials(
+	ctx context.Context,
+	audit *domain.AuditLog,
+	adminID, expectedPasswordVersion int64,
+) (RotateAllAliasCredentialsResult, error) {
+	var summary RotateAllAliasCredentialsResult
+	if s.credentialFactory == nil {
+		return summary, errors.New("alias credential factory is not configured")
+	}
+
+	// The global namespace lock is always acquired before account locks. This
+	// matches account and alias creation and makes the alias set stable while we
+	// rotate credentials across every account.
+	tx, err := s.beginAddressNamespaceTx(ctx)
+	if err != nil {
+		return summary, fmt.Errorf("begin all alias credential rotation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if audit != nil {
+		lockSuffix := ""
+		if s.dialect == dialectPostgres {
+			lockSuffix = " FOR UPDATE"
+		}
+		var currentPasswordVersion int64
+		err := s.txQueryRowContext(ctx, tx,
+			`SELECT password_version FROM admins WHERE id = ?`+lockSuffix, adminID,
+		).Scan(&currentPasswordVersion)
+		if errors.Is(err, sql.ErrNoRows) {
+			return RotateAllAliasCredentialsResult{}, ErrCredentialsChanged
+		}
+		if err != nil {
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+				"lock administrator before all alias credential rotation: %w", err,
+			)
+		}
+		if currentPasswordVersion != expectedPasswordVersion {
+			return RotateAllAliasCredentialsResult{}, ErrCredentialsChanged
+		}
+		audit.AdminID = &adminID
+	}
+
+	accountRows, err := s.txQueryContext(ctx, tx, `SELECT id FROM accounts ORDER BY id`)
+	if err != nil {
+		return summary, fmt.Errorf("list accounts before all alias credential rotation: %w", err)
+	}
+	var accountIDs []int64
+	for accountRows.Next() {
+		var accountID int64
+		if err := accountRows.Scan(&accountID); err != nil {
+			_ = accountRows.Close()
+			return summary, fmt.Errorf("scan account before all alias credential rotation: %w", err)
+		}
+		accountIDs = append(accountIDs, accountID)
+	}
+	if err := accountRows.Err(); err != nil {
+		_ = accountRows.Close()
+		return summary, fmt.Errorf("iterate accounts before all alias credential rotation: %w", err)
+	}
+	if err := accountRows.Close(); err != nil {
+		return summary, fmt.Errorf("close account list before all alias credential rotation: %w", err)
+	}
+	for _, accountID := range accountIDs {
+		if _, err := s.lockAccountVersionForUpdate(ctx, tx, accountID); err != nil {
+			return summary, fmt.Errorf("lock account %d before all alias credential rotation: %w", accountID, err)
+		}
+	}
+
+	type aliasRotationState struct {
+		id                int64
+		credentialVersion int64
+		credentialMode    string
+		enabled           bool
+		lastSyncError     string
+		hasPendingKey     bool
+	}
+	lockSuffix := ""
+	if s.dialect == dialectPostgres {
+		lockSuffix = " FOR UPDATE OF al"
+	}
+	aliasRows, err := s.txQueryContext(ctx, tx, `
+		SELECT al.id, al.credential_version, al.credential_mode, al.enabled, al.last_sync_error
+		FROM aliases al ORDER BY al.account_id, al.id`+lockSuffix)
+	if err != nil {
+		return summary, fmt.Errorf("list aliases for all credential rotation: %w", err)
+	}
+	var aliases []aliasRotationState
+	for aliasRows.Next() {
+		var alias aliasRotationState
+		if err := aliasRows.Scan(
+			&alias.id, &alias.credentialVersion, &alias.credentialMode,
+			&alias.enabled, &alias.lastSyncError,
+		); err != nil {
+			_ = aliasRows.Close()
+			return summary, fmt.Errorf("scan alias for all credential rotation: %w", err)
+		}
+		aliases = append(aliases, alias)
+	}
+	if err := aliasRows.Err(); err != nil {
+		_ = aliasRows.Close()
+		return summary, fmt.Errorf("iterate aliases for all credential rotation: %w", err)
+	}
+	if err := aliasRows.Close(); err != nil {
+		return summary, fmt.Errorf("close alias list for all credential rotation: %w", err)
+	}
+
+	pendingLockSuffix := ""
+	if s.dialect == dialectPostgres {
+		pendingLockSuffix = " FOR UPDATE"
+	}
+	pendingRows, err := s.txQueryContext(ctx, tx,
+		`SELECT alias_id FROM pending_alias_api_keys ORDER BY alias_id`+pendingLockSuffix,
+	)
+	if err != nil {
+		return summary, fmt.Errorf("lock pending alias keys for all credential rotation: %w", err)
+	}
+	pendingAliasIDs := make(map[int64]struct{})
+	for pendingRows.Next() {
+		var aliasID int64
+		if err := pendingRows.Scan(&aliasID); err != nil {
+			_ = pendingRows.Close()
+			return summary, fmt.Errorf("scan pending alias key for all credential rotation: %w", err)
+		}
+		pendingAliasIDs[aliasID] = struct{}{}
+	}
+	if err := pendingRows.Err(); err != nil {
+		_ = pendingRows.Close()
+		return summary, fmt.Errorf("iterate pending alias keys for all credential rotation: %w", err)
+	}
+	if err := pendingRows.Close(); err != nil {
+		return summary, fmt.Errorf("close pending alias keys for all credential rotation: %w", err)
+	}
+	for index := range aliases {
+		_, aliases[index].hasPendingKey = pendingAliasIDs[aliases[index].id]
+	}
+
+	summary.Total = len(aliases)
+	for _, alias := range aliases {
+		confirmationPending := !alias.enabled &&
+			alias.lastSyncError == domain.AppleAliasConfirmationPending
+		if confirmationPending && !alias.hasPendingKey {
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+				"rotate alias %d credentials: confirmation-pending alias has no pending API key",
+				alias.id,
+			)
+		}
+
+		var version int64
+		initializeMailbox := false
+		switch alias.credentialMode {
+		case domain.AliasCredentialModeLegacy:
+			version = 1
+			initializeMailbox = true
+		case domain.AliasCredentialModeV2:
+			if alias.credentialVersion < 0 {
+				return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+					"rotate alias %d credentials: negative credential version %d",
+					alias.id, alias.credentialVersion,
+				)
+			}
+			if alias.credentialVersion == int64(^uint64(0)>>1) {
+				return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+					"rotate alias %d credentials: credential version is exhausted", alias.id,
+				)
+			}
+			version = alias.credentialVersion + 1
+		default:
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+				"rotate alias %d credentials: unsupported credential mode %q",
+				alias.id, alias.credentialMode,
+			)
+		}
+
+		material, err := s.installGeneratedAliasCredentialsTx(
+			ctx, tx, alias.id, version, initializeMailbox,
+		)
+		if err != nil {
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+				"rotate alias %d credentials: %w", alias.id, err,
+			)
+		}
+		if alias.hasPendingKey {
+			if s.credentialPendingKeyRotationFactory == nil {
+				return RotateAllAliasCredentialsResult{}, errors.New(
+					"pending alias key rotation factory is not configured",
+				)
+			}
+			pendingCiphertext, err := s.credentialPendingKeyRotationFactory(
+				alias.id, material.Ciphertext,
+			)
+			if err != nil {
+				return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+					"rotate pending API key for alias %d: %w", alias.id, err,
+				)
+			}
+			if strings.TrimSpace(pendingCiphertext) == "" {
+				return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+					"rotate pending API key for alias %d: ciphertext is empty", alias.id,
+				)
+			}
+			result, err := s.txExecContext(ctx, tx, `
+				UPDATE pending_alias_api_keys SET api_key_ciphertext = ?
+				WHERE alias_id = ?`, pendingCiphertext, alias.id,
+			)
+			if err != nil {
+				return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+					"store rotated pending API key for alias %d: %w", alias.id, err,
+				)
+			}
+			if err := requireAffected(result, "pending alias API key"); err != nil {
+				return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+					"store rotated pending API key for alias %d: %w", alias.id, err,
+				)
+			}
+			summary.RotatedPending++
+		}
+
+		summary.Rotated++
+		if initializeMailbox {
+			summary.MigratedLegacy++
+		} else {
+			summary.RotatedV2++
+		}
+	}
+
+	if audit != nil {
+		audit.Detail = fmt.Sprintf(
+			`{"total":%d,"rotated":%d,"migrated_legacy":%d,"rotated_v2":%d,"rotated_pending":%d}`,
+			summary.Total, summary.Rotated, summary.MigratedLegacy,
+			summary.RotatedV2, summary.RotatedPending,
+		)
+		result, err := s.txExecContext(ctx, tx, `
+			UPDATE admins SET password_version = password_version + 1
+			WHERE id = ? AND password_version = ?`,
+			adminID, expectedPasswordVersion,
+		)
+		if err != nil {
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+				"advance administrator password version after all alias credential rotation: %w", err,
+			)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+				"read administrator password version result: %w", err,
+			)
+		}
+		if changed != 1 {
+			return RotateAllAliasCredentialsResult{}, ErrCredentialsChanged
+		}
+		if _, err := s.txExecContext(ctx, tx,
+			`DELETE FROM admin_sessions WHERE admin_id = ?`, adminID,
+		); err != nil {
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf(
+				"revoke administrator sessions after all alias credential rotation: %w", err,
+			)
+		}
+		if _, err := s.createAuditLogTx(ctx, tx, *audit); err != nil {
+			return RotateAllAliasCredentialsResult{}, fmt.Errorf("audit all alias credential rotation: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return RotateAllAliasCredentialsResult{}, fmt.Errorf("commit all alias credential rotation: %w", err)
+	}
+	return summary, nil
 }
 
 // RotateAliasAPIKey preserves the original hash-only store contract. Legacy

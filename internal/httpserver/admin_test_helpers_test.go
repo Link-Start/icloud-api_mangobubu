@@ -57,6 +57,13 @@ func newAdminAPITestEnv(t *testing.T) *adminAPITestEnv {
 		}
 		return credentials.APIKey, nil
 	})
+	db.ConfigureAliasPendingKeyRotationFactory(func(aliasID int64, credentialCiphertext string) (string, error) {
+		credentials, decryptErr := cipher.DecryptAliasCredentials(aliasID, credentialCiphertext)
+		if decryptErr != nil {
+			return "", decryptErr
+		}
+		return cipher.EncryptPendingAliasAPIKey(credentials.APIKey)
+	})
 	db.ConfigureAliasAPIKeyRotationFactory(func(aliasID, version int64, credentialCiphertext, apiKey string) (domain.AliasCredentialMaterial, error) {
 		credentials, decryptErr := cipher.DecryptAliasCredentials(aliasID, credentialCiphertext)
 		if decryptErr != nil {

@@ -37,6 +37,14 @@ info:
     取码 URL、IMAP 密码、refresh token 和尚未过期的 access token 失效。
     v2 的只读 OTP URL 与消费 recent-mail URL 使用不同用途的派生 token，不能互换；
     原 v1 直达 token 只继续授权 legacy alias 的 `/api/v1/mail/recent`。
+    管理员可显式执行全量凭据轮换：所有 legacy alias 会强制迁移为 v2，所有现有
+    v2 alias 及等待 Apple 目录确认的 pending 凭据也会同步轮换。该操作保留确认流程、
+    邮件归档、消费与已读状态，但会使旧 v1 直达凭据和全部旧 v2 凭据失效；成功后
+    撤销执行管理员的全部后台会话并要求重新登录。
+    轮换会等待所有正在消费或返回 alias 凭据的公开 HTTP 请求写完响应后再提交；
+    成功响应后，以旧 HTTP 凭据发起的新请求均被拒绝。旧 IMAP 密码和 access token
+    不能再建立会话，已有 IMAPS 会话在下一条邮箱命令复验时失效；已经通过复验并
+    开始执行的单条命令仍可完成。
     迁移前已经领取的 legacy alias 不会因 schema 升级而轮换。兼容接口
     `/api/v1/aliases`、`/api/v1/mail/latest` 和 `/api/v1/mail/recent`
     保留原有路径、鉴权和响应语义。
@@ -194,7 +202,10 @@ paths:
         返回最新优先、持续累积的裸数组，每个邮箱最多 100 条。
         重复读取不会消费验证码，也不会修改邮件已读状态。没有验证码时返回 `200 []`。
         调用方必须二选一：使用 Bearer API Key，或传入管理端签发取码 URL 中的 OTP
-        专用派生 token。recent-mail token 和原 v1 直达 token 不授权此接口。
+        专用派生 token。迁移或轮换后 URL 路径仍为 `/api/v1/otp`；v2 alias 的 OTP
+        token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名。
+        这里的 v3 只表示 token 信封版本，不表示新的 alias credential mode。
+        recent-mail token 和原 v1 直达 token 不授权此接口。
       security:
         - aliasAPIKey: []
         - derivedToken: []
@@ -977,6 +988,102 @@ paths:
           $ref: "#/components/responses/AdminRequestTooLarge"
         "415":
           $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
+  /api/v1/aliases/rotate-all-credentials:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
+    post:
+      tags:
+        - Administration
+      operationId: rotateAllAliasCredentials
+      summary: 一键迁移并轮换所有 alias 凭据
+      description: |
+        高影响的显式管理操作。在单一事务中把所有 legacy alias 强制迁移为 v2，并为所有
+        现有 v2 alias 轮换整套凭据。存在 `pending_alias_api_keys` 的 alias 也会轮换：
+        pending 记录同步更新为新凭证包的 API Key，既有 Apple 目录确认与领取流程不变。
+        任何一步失败都会回滚全部轮换。
+
+        请求必须携带有效管理 Session、CSRF token、精确确认值和当前管理员密码；
+        当前密码重认证使用独立限流。`current_password` 与 `confirmation` 只用于本次
+        校验，不得写入访问日志、应用日志或审计详情，服务也不得记录该请求体。
+
+        成功后，legacy alias 的旧 API Key 与 v1 直达链接失效；v2 alias 的旧 API Key、
+        OTP 与 recent-mail 派生链接、IMAP 密码、client ID、refresh token 和已签发 access token
+        全部失效。OTP URL 路径仍为 `/api/v1/otp`，新 OTP token 继续使用用途隔离的
+        v3 公开信封版本。邮件归档、兼容消费记录、邮件已读状态和 IMAP Seen 任务保留。
+        响应的 `data` 只返回数量汇总，不返回任何新凭据；`rotated_pending` 是已轮换
+        alias 的子集。成功事务还会在不修改密码哈希的情况下提升执行管理员的
+        `password_version`、删除该管理员全部后台 Session，并清除随机管理路径与固定
+        `/admin` 路径的 Session Cookie，因此调用方必须重新登录。
+
+        本操作与会消费或返回 alias 凭据的公开 HTTP 请求线性化：`GET /api/v1/otp`、
+        `GET /api/v1/mail/latest`、`GET /api/v1/mail/recent[/]`、
+        `POST /oauth2/v2.0/token` 和外部 `POST /api/v1/aliases[/]` 从鉴权前一直保护到
+        响应写完。全量轮换等待这些已在途请求完成后才提交并返回成功；成功响应后，
+        使用任何旧 HTTP 凭据发起的新请求都会被拒绝，不引入新的错误码或状态码。
+
+        IMAPS 不受上述 HTTP 等待边界约束。轮换提交后，旧 IMAP 密码和旧 access token
+        立即不能建立新会话；已有会话会在下一条 SELECT、LIST、STATUS、FETCH、SEARCH
+        或轮询命令复验凭据版本并拒绝继续操作，IDLE 最迟在下一次轮询 tick 失效。
+        提交时已经通过复验并开始执行的单条命令可以完成。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminRotateAllCredentialsRequest"
+            example:
+              confirmation: ROTATE_ALL
+              current_password: CURRENT_ADMIN_PASSWORD
+      responses:
+        "200":
+          description: 全量迁移与轮换完成；只返回计数、不返回凭据，且执行管理员必须重新登录
+          headers:
+            Cache-Control:
+              description: 禁止缓存本次轮换结果。
+              schema:
+                type: string
+                const: no-store
+              example: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminRotateAllCredentialsResponse"
+              example:
+                data:
+                  total: 120
+                  rotated: 120
+                  migrated_legacy: 42
+                  rotated_v2: 78
+                  rotated_pending: 2
+                  reauthentication_required: true
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminRotationUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "409":
+          $ref: "#/components/responses/AdminCredentialsChanged"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "429":
+          $ref: "#/components/responses/AdminRateLimited"
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
@@ -1871,6 +1978,57 @@ components:
             type: integer
             format: int64
             minimum: 1
+    AdminRotateAllCredentialsRequest:
+      type: object
+      additionalProperties: false
+      required: [confirmation, current_password]
+      properties:
+        confirmation:
+          type: string
+          const: ROTATE_ALL
+          writeOnly: true
+          description: 防止误触的精确确认值；其他值均拒绝执行。只用于校验，不得写入任何日志或审计详情。
+        current_password:
+          type: string
+          format: password
+          writeOnly: true
+          description: 当前管理员密码，用于高风险操作的即时重认证；缺失或错误统一返回 `CURRENT_PASSWORD_INVALID`，不得记录或回显。
+    AdminRotateAllCredentialsResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminRotateAllCredentialsSummary"
+    AdminRotateAllCredentialsSummary:
+      type: object
+      additionalProperties: false
+      required: [total, rotated, migrated_legacy, rotated_v2, rotated_pending, reauthentication_required]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+          description: 本次检查并轮换的 alias 总数；成功响应中与 `rotated` 相等。
+        rotated:
+          type: integer
+          minimum: 0
+          description: 本次成功迁移或轮换的 alias 总数；等于 `total`，也等于 `migrated_legacy + rotated_v2`。
+        migrated_legacy:
+          type: integer
+          minimum: 0
+          description: 从 legacy 强制迁移为 v2 并签发全新凭据的 alias 数量。
+        rotated_v2:
+          type: integer
+          minimum: 0
+          description: 已是 v2 且完成整套凭据轮换的 alias 数量。
+        rotated_pending:
+          type: integer
+          minimum: 0
+          description: 存在 pending Key 且已在同一事务更新为新凭证包 API Key 的 alias 数量；是 `rotated` 的子集。
+        reauthentication_required:
+          type: boolean
+          const: true
+          description: 成功后执行管理员的全部 Session 已撤销，调用方必须重新登录。
     AdminRandomAliasRequest:
       type: object
       additionalProperties: false
@@ -2387,6 +2545,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminRotationUnauthorized:
+      description: 管理会话缺失或已过期，或当前管理员密码缺失/错误（`AUTH_REQUIRED`、`SESSION_EXPIRED` 或 `CURRENT_PASSWORD_INVALID`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
     AdminForbidden:
       description: CSRF token 或同源校验失败（`CSRF_INVALID`）。
       content:
@@ -2417,6 +2581,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminCredentialsChanged:
+      description: 全量轮换提交前发现管理员凭据版本已并发变化（`CREDENTIALS_CHANGED`）；轮换事务回滚并清除当前浏览器的管理 Session Cookie，调用方必须重新登录。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
     AdminMailGroupConflict:
       description: 邮箱分组名称已存在（`GROUP_EXISTS`）。
       content:
@@ -2431,6 +2601,12 @@ components:
             $ref: "#/components/schemas/APIErrorEnvelope"
     AdminUnsupportedMediaType:
       description: JSON 管理操作未使用 `application/json`（`UNSUPPORTED_MEDIA_TYPE`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminRateLimited:
+      description: 高风险凭据轮换或当前密码重认证请求过于频繁（`RATE_LIMITED`）。
       content:
         application/json:
           schema:

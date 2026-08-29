@@ -93,7 +93,11 @@ import AppBrand from "../components/AppBrand.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import { useAuth } from "../stores/auth.js";
 import { createActionLock } from "../utils/asyncState.js";
-import { loginNoticeMessage } from "../utils/authFlow.js";
+import {
+  loginNoticeMessage,
+  loginNoticeRequiresExplicitLogin,
+  loginNoticeType,
+} from "../utils/authFlow.js";
 
 const route = useRoute();
 const router = useRouter();
@@ -124,7 +128,7 @@ const noticeMessage = computed(() =>
 );
 
 const noticeType = computed(() =>
-  route.query.notice === "password_changed" ? "success" : "warning",
+  loginNoticeType(String(route.query.notice || "")),
 );
 
 function redirectTarget() {
@@ -157,13 +161,18 @@ async function prepareLogin() {
 }
 
 async function initialize() {
-  try {
-    if (await auth.ensureSession()) {
-      await router.replace(redirectTarget());
-      return;
+  const notice = String(route.query.notice || "");
+  if (loginNoticeRequiresExplicitLogin(notice)) {
+    auth.clearSession({ checked: false });
+  } else {
+    try {
+      if (await auth.ensureSession()) {
+        await router.replace(redirectTarget());
+        return;
+      }
+    } catch {
+      sessionCheckFailed.value = true;
     }
-  } catch {
-    sessionCheckFailed.value = true;
   }
 
   await prepareLogin();

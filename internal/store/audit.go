@@ -32,6 +32,26 @@ type AuditLogPage struct {
 }
 
 func (s *Store) CreateAuditLog(ctx context.Context, log domain.AuditLog) (domain.AuditLog, error) {
+	return s.insertAuditLog(ctx, s.db, log)
+}
+
+type auditLogQueryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (s *Store) createAuditLogTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	log domain.AuditLog,
+) (domain.AuditLog, error) {
+	return s.insertAuditLog(ctx, tx, log)
+}
+
+func (s *Store) insertAuditLog(
+	ctx context.Context,
+	queryRower auditLogQueryRower,
+	log domain.AuditLog,
+) (domain.AuditLog, error) {
 	log.Username = truncate(log.Username, 128)
 	log.Action = truncate(log.Action, 64)
 	log.ResourceType = truncate(log.ResourceType, 64)
@@ -44,12 +64,12 @@ func (s *Store) CreateAuditLog(ctx context.Context, log domain.AuditLog) (domain
 		log.CreatedAt = s.now()
 	}
 	var id int64
-	err := s.queryRowContext(ctx, `
+	err := queryRower.QueryRowContext(ctx, s.rebind(`
 		INSERT INTO audit_logs(
 			admin_id, username, action, resource_type, resource_id,
 			result, ip, request_id, detail, created_at
 		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		RETURNING id`,
+		RETURNING id`),
 		log.AdminID, log.Username, log.Action, log.ResourceType, log.ResourceID,
 		log.Result, log.IP, log.RequestID, log.Detail, timestamp(log.CreatedAt),
 	).Scan(&id)

@@ -25,6 +25,7 @@ import {
   moveAliasesToGroup,
   normalizeAutoCreation,
   rotateAlias,
+  rotateAllAliasCredentials,
   setAliasAutoCreation,
   syncAccount,
   syncAccountAliases,
@@ -505,6 +506,90 @@ test("legacy alias rotation uses the API-key-only compatibility endpoint", async
   assert.equal(result.alias.credentialMode, "legacy");
   assert.equal(result.alias.directLinkPath, "/api/v1/mail/recent?api_key=new-token");
   assert.equal(result.apiKey, "new-key-secret");
+});
+
+test("all-alias credential rotation requires explicit confirmation and normalizes its summary", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      total: 12,
+      rotated: 12,
+      migrated_legacy: 4,
+      rotated_v2: 8,
+      rotated_pending: 2,
+      reauthentication_required: true,
+    });
+  };
+
+  const result = await rotateAllAliasCredentials(
+    "current-password",
+    "csrf-token",
+  );
+
+  assert.equal(request.url, "/admin/api/v1/aliases/rotate-all-credentials");
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    confirmation: "ROTATE_ALL",
+    current_password: "current-password",
+  });
+  assert.deepEqual(result, {
+    total: 12,
+    rotated: 12,
+    migratedLegacy: 4,
+    rotatedV2: 8,
+    rotatedPending: 2,
+    reauthenticationRequired: true,
+  });
+});
+
+test("all-alias credential rotation rejects incomplete or inconsistent summaries", async () => {
+  const invalidSummaries = [
+    {
+      total: 12,
+      rotated: 12,
+      migrated_legacy: 4,
+      rotated_v2: 8,
+      reauthentication_required: true,
+    },
+    {
+      total: 12,
+      rotated: 12,
+      migrated_legacy: 4,
+      rotated_v2: 7,
+      rotated_pending: 2,
+      reauthentication_required: true,
+    },
+    {
+      total: 12,
+      rotated: 12,
+      migrated_legacy: 4,
+      rotated_v2: 8,
+      rotated_pending: 13,
+      reauthentication_required: true,
+    },
+    {
+      total: 12,
+      rotated: 12,
+      migrated_legacy: 4,
+      rotated_v2: 8,
+      rotated_pending: 2,
+      reauthentication_required: false,
+    },
+  ];
+
+  for (const summary of invalidSummaries) {
+    globalThis.fetch = async () => jsonResponse(summary);
+    await assert.rejects(
+      rotateAllAliasCredentials("current-password", "csrf-token"),
+      (error) => {
+        assert.equal(error.code, "ROTATION_RESULT_INVALID");
+        assert.match(error.message, /轮换已提交/);
+        return true;
+      },
+    );
+  }
 });
 
 test("alias directory forwards the optional primary-account filter", async () => {

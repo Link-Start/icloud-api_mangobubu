@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"icloud-api/internal/domain"
+	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
 )
 
@@ -56,5 +57,56 @@ func (s *Server) audit(c *gin.Context, adminID *int64, username, action, resourc
 	entry := domain.AuditLog{AdminID: adminID, Username: username, Action: action, ResourceType: resourceType, ResourceID: resourceID, Result: result, IP: c.ClientIP(), RequestID: requestID(c), Detail: detail, CreatedAt: time.Now().UTC()}
 	if _, err := s.store.CreateAuditLog(c.Request.Context(), entry); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.logger.Error("写入操作记录失败", "error", err, "request_id", requestID(c))
+	}
+}
+
+// credentialRotationReadGuard keeps public requests that consume or return
+// alias credentials on one side of a successful global credential rotation.
+// It must run before credential authentication and retains the read lock until
+// the response has been written.
+func (s *Server) credentialRotationReadGuard() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s.beforeCredentialRotationReadLock != nil {
+			s.beforeCredentialRotationReadLock()
+		}
+		s.credentialRotationMu.RLock()
+		defer s.credentialRotationMu.RUnlock()
+		c.Next()
+	}
+}
+
+// adminAPICredentialRotationReadGuard prevents an already authenticated
+// request from crossing a successful global credential-rotation commit. The
+// session is checked again only after acquiring the read lock, and the lock is
+// retained until the handler has completed writing its response.
+func (s *Server) adminAPICredentialRotationReadGuard() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		s.credentialRotationMu.RLock()
+		defer s.credentialRotationMu.RUnlock()
+
+		raw, err := c.Cookie(sessionCookie)
+		if err != nil || raw == "" {
+			s.clearSessionCookies(c)
+			writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已失效")
+			c.Abort()
+			return
+		}
+		previous := mustSession(c)
+		current, err := s.store.GetSessionByHash(c.Request.Context(), secure.HashToken(raw))
+		if errors.Is(err, store.ErrNotFound) ||
+			(err == nil && (current.AdminID != previous.AdminID ||
+				current.PasswordVersion != previous.PasswordVersion)) {
+			s.clearSessionCookies(c)
+			writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已失效")
+			c.Abort()
+			return
+		}
+		if err != nil {
+			s.writeAdminAPIInternalError(c, err)
+			c.Abort()
+			return
+		}
+		c.Set(sessionKey, current)
+		c.Next()
 	}
 }

@@ -919,6 +919,72 @@ export async function rotateAlias(id, csrfToken, credentialMode = "") {
   );
 }
 
+function invalidRotationSummaryError() {
+  const error = new Error(
+    "轮换已提交，但服务返回的汇总无效，请重新登录后检查操作记录。",
+  );
+  error.code = "ROTATION_RESULT_INVALID";
+  return error;
+}
+
+function requiredRotationSummaryCount(data, ...keys) {
+  const value = firstDefined(data, ...keys);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw invalidRotationSummaryError();
+  }
+  return value;
+}
+
+export async function rotateAllAliasCredentials(currentPassword, csrfToken) {
+  const data =
+    (await apiRequest("/aliases/rotate-all-credentials", {
+      method: "POST",
+      body: {
+        confirmation: "ROTATE_ALL",
+        current_password: currentPassword,
+      },
+      csrfToken,
+    })) || {};
+  const summary = {
+    total: requiredRotationSummaryCount(data, "total", "Total"),
+    rotated: requiredRotationSummaryCount(data, "rotated", "Rotated"),
+    migratedLegacy: requiredRotationSummaryCount(
+      data,
+      "migrated_legacy",
+      "migratedLegacy",
+      "MigratedLegacy",
+    ),
+    rotatedV2: requiredRotationSummaryCount(
+      data,
+      "rotated_v2",
+      "rotatedV2",
+      "RotatedV2",
+    ),
+    rotatedPending: requiredRotationSummaryCount(
+      data,
+      "rotated_pending",
+      "rotatedPending",
+      "RotatedPending",
+    ),
+    reauthenticationRequired:
+      firstDefined(
+        data,
+        "reauthentication_required",
+        "reauthenticationRequired",
+        "ReauthenticationRequired",
+      ) === true,
+  };
+  if (
+    summary.rotated !== summary.migratedLegacy + summary.rotatedV2 ||
+    summary.total !== summary.rotated ||
+    summary.rotatedPending > summary.rotated ||
+    !summary.reauthenticationRequired
+  ) {
+    throw invalidRotationSummaryError();
+  }
+  return summary;
+}
+
 export async function setAliasEnabled(id, enabled, csrfToken) {
   const data = await apiRequest(`/aliases/${encodeURIComponent(id)}`, {
     method: "PATCH",

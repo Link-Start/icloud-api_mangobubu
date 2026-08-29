@@ -47,10 +47,21 @@
           管理分组
         </el-button>
         <el-button
+          type="danger"
+          plain
+          :icon="RefreshLeft"
+          :loading="rotatingAllCredentials"
+          :disabled="rotatingAllCredentials || exportingAll"
+          aria-label="轮换所有隐私邮箱令牌与凭证"
+          @click="rotateAllCredentials"
+        >
+          轮换全部令牌
+        </el-button>
+        <el-button
           type="primary"
           :icon="CopyDocument"
           :loading="exportingAll"
-          :disabled="total === 0 || exportingAll"
+          :disabled="total === 0 || exportingAll || rotatingAllCredentials"
           @click="copyAllAliases(ALIAS_EXPORT_OTP)"
         >
           全部取码
@@ -60,7 +71,7 @@
           plain
           :icon="CopyDocument"
           :loading="exportingAll"
-          :disabled="total === 0 || exportingAll"
+          :disabled="total === 0 || exportingAll || rotatingAllCredentials"
           @click="copyAllAliases(ALIAS_EXPORT_IMAP)"
         >
           全部 IMAP
@@ -70,6 +81,7 @@
             :icon="Refresh"
             circle
             :loading="loading"
+            :disabled="rotatingAllCredentials"
             aria-label="刷新隐私邮箱列表"
             @click="loadAliases"
           />
@@ -551,6 +563,7 @@ import {
   getMailGroups,
   moveAliasToGroup,
   moveAliasesToGroup,
+  rotateAllAliasCredentials,
   updateMailGroup,
 } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
@@ -571,7 +584,11 @@ import {
   buildAliasExportText,
 } from "../utils/aliasExport.js";
 import { buildRecentMailDirectLink, copyText } from "../utils/clipboard.js";
-import { showRequestError, successMessage } from "../utils/feedback.js";
+import {
+  confirmationCancelled,
+  showRequestError,
+  successMessage,
+} from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
 import {
@@ -621,6 +638,7 @@ const loadError = ref(null);
 const accountsLoading = ref(false);
 const accountsLoadError = ref(null);
 const exportingAll = ref(false);
+const rotatingAllCredentials = ref(false);
 const copyLoading = reactive({});
 const copyLock = createActionLock();
 const aliasLoadGate = createLatestRequestGate();
@@ -796,6 +814,7 @@ async function loadGroups({ silent = false } = {}) {
 }
 
 async function loadAliases({ silent = false } = {}) {
+  if (rotatingAllCredentials.value) return;
   const accountId = selectedAccountId.value;
   const query = appliedAliasQuery.value;
   const groupId = appliedGroupId.value;
@@ -887,6 +906,7 @@ function beginAliasMutation() {
   aliasLoadGate.invalidate();
   groupsLoadGate.invalidate();
   aliasAbortController?.abort();
+  loading.value = false;
   groupsLoading.value = false;
 }
 
@@ -1009,7 +1029,7 @@ function copySelectedAliases(format) {
 }
 
 function copyAllAliases(format) {
-  if (exportingAll.value) return;
+  if (exportingAll.value || rotatingAllCredentials.value) return;
   exportingAll.value = true;
   getAllAliases(selectedAccountId.value, {
     query: appliedAliasQuery.value,
@@ -1030,6 +1050,117 @@ function copyAllAliases(format) {
     .finally(() => {
       exportingAll.value = false;
     });
+}
+
+function rotateAllCredentialsErrorMessage(error) {
+  if (error?.code === "CURRENT_PASSWORD_INVALID") {
+    return "当前管理员密码验证失败，请重新输入。";
+  }
+  if (error?.code === "RATE_LIMITED") {
+    return "安全验证尝试过于频繁，请 15 分钟后再试。";
+  }
+  return "全部令牌与凭证轮换请求失败，结果状态未知；自动刷新已暂停，请确认后再手动刷新。";
+}
+
+async function rotateAllCredentials() {
+  if (rotatingAllCredentials.value || exportingAll.value) return;
+  rotatingAllCredentials.value = true;
+  let currentPassword = "";
+  let rotationSubmitted = false;
+  try {
+    currentPassword = String(
+      (
+        await ElMessageBox.prompt(
+          "此操作会让所有旧 V1 直达链接，以及 V2 取码令牌、API Key、IMAP 密码和 OAuth 凭据立即失效；旧版邮箱会强制升级为 V2，Apple 确认中的邮箱也会同步轮换。成功后当前管理员的所有后台会话将被撤销。请输入当前管理员密码继续。",
+          "验证身份并轮换全部凭据",
+          {
+            type: "error",
+            inputType: "password",
+            inputPlaceholder: "当前管理员密码",
+            inputValidator: (value) =>
+              (typeof value === "string" && value.length > 0) ||
+              "请输入当前管理员密码",
+            confirmButtonText: "验证并继续",
+            cancelButtonText: "取消",
+            confirmButtonClass: "el-button--danger",
+            autofocus: false,
+          },
+        )
+      )?.value ?? "",
+    );
+    await ElMessageBox.prompt(
+      "该操作不可撤销。请输入 ROTATE_ALL 以最终确认轮换全部令牌与凭据。",
+      "最终确认",
+      {
+        type: "error",
+        inputPlaceholder: "ROTATE_ALL",
+        inputValidator: (value) =>
+          value === "ROTATE_ALL" || "请输入完整的 ROTATE_ALL",
+        confirmButtonText: "永久轮换全部",
+        cancelButtonText: "取消",
+        confirmButtonClass: "el-button--danger",
+        autofocus: false,
+      },
+    );
+    liveRefresh.stop();
+    beginAliasMutation();
+    rotationSubmitted = true;
+    const summary = await rotateAllAliasCredentials(
+      currentPassword,
+      auth.state.csrfToken,
+    );
+    currentPassword = "";
+    aliases.value = [];
+    total.value = 0;
+    clearAliasSelection();
+    successMessage(
+      `轮换完成：共检查 ${summary.total} 个，成功轮换 ${summary.rotated} 个（V1 升级 V2 ${summary.migratedLegacy} 个，现有 V2 已轮换 ${summary.rotatedV2} 个，Apple 确认中同步轮换 ${summary.rotatedPending} 个）。新凭据未自动加载，当前管理员的后台会话已撤销，请重新登录后仅在可信环境中按需显式获取。`,
+      10000,
+    );
+    auth.clearSession({ checked: false });
+    await router.replace({
+      name: "login",
+      query: { notice: "credentials_rotated" },
+    });
+  } catch (error) {
+    if (confirmationCancelled(error)) return;
+    if (!rotationSubmitted) {
+      if (viewActive) {
+        const message = rotateAllCredentialsErrorMessage(error);
+        showRequestError({ ...error, message }, message);
+      }
+      return;
+    }
+    if (
+      error?.code === "CURRENT_PASSWORD_INVALID" ||
+      error?.code === "RATE_LIMITED"
+    ) {
+      if (viewActive) {
+        liveRefresh.start({ immediate: false });
+        const message = rotateAllCredentialsErrorMessage(error);
+        showRequestError({ ...error, message }, message);
+      }
+      return;
+    }
+    aliases.value = [];
+    total.value = 0;
+    clearAliasSelection();
+    auth.clearSession({ checked: false });
+    await router.replace({
+      name: "login",
+      query: {
+        notice:
+          error?.code === "CREDENTIALS_CHANGED"
+            ? "credentials_changed"
+            : error?.code === "ROTATION_RESULT_INVALID"
+              ? "rotation_result_invalid"
+              : "rotation_status_unknown",
+      },
+    });
+  } finally {
+    currentPassword = "";
+    rotatingAllCredentials.value = false;
+  }
 }
 
 async function copyAliasLine(alias, format) {

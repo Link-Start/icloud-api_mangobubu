@@ -51,12 +51,16 @@ const addressNamespaceAdvisoryLock = int64(0x49434c4f55444144)
 
 // Store owns the application's persistence layer.
 type Store struct {
-	db                              *sql.DB
-	dialect                         dialect
-	now                             func() time.Time
-	credentialFactory               func(aliasID, version int64) (domain.AliasCredentialMaterial, error)
-	credentialReuseFactory          func(aliasID, version int64, pendingCiphertext string) (domain.AliasCredentialMaterial, error)
-	credentialRevealFactory         func(aliasID int64, credentialCiphertext string) (string, error)
+	db                                  *sql.DB
+	dialect                             dialect
+	now                                 func() time.Time
+	credentialFactory                   func(aliasID, version int64) (domain.AliasCredentialMaterial, error)
+	credentialReuseFactory              func(aliasID, version int64, pendingCiphertext string) (domain.AliasCredentialMaterial, error)
+	credentialRevealFactory             func(aliasID int64, credentialCiphertext string) (string, error)
+	credentialPendingKeyRotationFactory func(
+		aliasID int64,
+		credentialCiphertext string,
+	) (string, error)
 	credentialAPIKeyRotationFactory func(
 		aliasID, version int64,
 		credentialCiphertext, apiKey string,

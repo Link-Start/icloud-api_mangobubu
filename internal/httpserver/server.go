@@ -41,16 +41,24 @@ type Server struct {
 	ready           func() bool
 	adminSPA        *adminSPA
 
-	mailSyncWakeMu sync.Mutex
-	mailSyncWake   map[int64]time.Time
+	mailSyncWakeMu       sync.Mutex
+	mailSyncWake         map[int64]time.Time
+	credentialRotationMu sync.RWMutex
+	// beforeCredentialRotationLock is a deterministic test seam. Production
+	// leaves it nil.
+	beforeCredentialRotationLock func()
+	// beforeCredentialRotationReadLock is a deterministic test seam.
+	// Production leaves it nil.
+	beforeCredentialRotationReadLock func()
 
-	loginLimiter         *windowLimiter
-	loginRequestLimiter  *windowLimiter
-	apiLimiter           *windowLimiter
-	apiIPLimiter         *windowLimiter
-	externalAPILimiter   *windowLimiter
-	oauthTokenHash       []byte
-	oauthTokenConfigured bool
+	loginLimiter              *windowLimiter
+	loginRequestLimiter       *windowLimiter
+	credentialRotationLimiter *windowLimiter
+	apiLimiter                *windowLimiter
+	apiIPLimiter              *windowLimiter
+	externalAPILimiter        *windowLimiter
+	oauthTokenHash            []byte
+	oauthTokenConfigured      bool
 }
 
 // SetHMESyncService configures Apple Hide My Email authentication and
@@ -185,20 +193,21 @@ func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog
 	oauthTokenHash := secure.HashToken(cfg.OAuthToken)
 	cfg.OAuthToken = ""
 	return &Server{
-		store:                st,
-		cipher:               cipher,
-		cfg:                  cfg,
-		logger:               logger,
-		now:                  time.Now,
-		sync:                 syncFn,
-		adminSPA:             spa,
-		loginLimiter:         newWindowLimiter(8, 10*time.Minute),
-		loginRequestLimiter:  newWindowLimiter(60, time.Minute),
-		apiLimiter:           newWindowLimiter(120, time.Minute),
-		apiIPLimiter:         newWindowLimiter(300, time.Minute),
-		externalAPILimiter:   newWindowLimiter(300, time.Minute),
-		oauthTokenHash:       oauthTokenHash,
-		oauthTokenConfigured: oauthTokenConfigured,
+		store:                     st,
+		cipher:                    cipher,
+		cfg:                       cfg,
+		logger:                    logger,
+		now:                       time.Now,
+		sync:                      syncFn,
+		adminSPA:                  spa,
+		loginLimiter:              newWindowLimiter(8, 10*time.Minute),
+		loginRequestLimiter:       newWindowLimiter(60, time.Minute),
+		credentialRotationLimiter: newWindowLimiter(5, 15*time.Minute),
+		apiLimiter:                newWindowLimiter(120, time.Minute),
+		apiIPLimiter:              newWindowLimiter(300, time.Minute),
+		externalAPILimiter:        newWindowLimiter(300, time.Minute),
+		oauthTokenHash:            oauthTokenHash,
+		oauthTokenConfigured:      oauthTokenConfigured,
 	}, nil
 }
 
@@ -251,16 +260,17 @@ func (s *Server) Router() (*gin.Engine, error) {
 	router.GET("/docs/", s.publicDocs)
 	router.HEAD("/docs/", s.publicDocs)
 
-	router.GET("/api/v1/otp", s.otpHistory)
+	publicCredentialGuard := s.credentialRotationReadGuard()
+	router.GET("/api/v1/otp", publicCredentialGuard, s.otpHistory)
 	legacyAPI := router.Group("/api/v1")
-	legacyAPI.GET("/mail/latest", s.apiKeyAuth(), s.latestMail)
+	legacyAPI.GET("/mail/latest", publicCredentialGuard, s.apiKeyAuth(), s.latestMail)
 	recentAuth := s.apiKeyQueryAuth()
-	legacyAPI.GET("/mail/recent", recentAuth, s.recentMail)
-	legacyAPI.GET("/mail/recent/", recentAuth, s.recentMail)
+	legacyAPI.GET("/mail/recent", publicCredentialGuard, recentAuth, s.recentMail)
+	legacyAPI.GET("/mail/recent/", publicCredentialGuard, recentAuth, s.recentMail)
 	externalAuth := s.oauthTokenAuth()
-	legacyAPI.POST("/aliases", externalAuth, s.createExternalAlias)
-	legacyAPI.POST("/aliases/", externalAuth, s.createExternalAlias)
-	router.POST("/oauth2/v2.0/token", s.issueIMAPAccessToken)
+	legacyAPI.POST("/aliases", publicCredentialGuard, externalAuth, s.createExternalAlias)
+	legacyAPI.POST("/aliases/", publicCredentialGuard, externalAuth, s.createExternalAlias)
+	router.POST("/oauth2/v2.0/token", publicCredentialGuard, s.issueIMAPAccessToken)
 
 	adminAPI := router.Group(s.cfg.AdminPath + "/api/v1")
 	s.registerAdminAPIRoutes(adminAPI)

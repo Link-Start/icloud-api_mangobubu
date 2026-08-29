@@ -532,6 +532,17 @@ func openInitializedStore(
 		}
 		return credentials.APIKey, nil
 	})
+	db.ConfigureAliasPendingKeyRotationFactory(func(aliasID int64, credentialCiphertext string) (string, error) {
+		credentials, decryptErr := cipher.DecryptAliasCredentials(aliasID, credentialCiphertext)
+		if decryptErr != nil {
+			return "", fmt.Errorf("解密轮换后的隐私邮箱凭据: %w", decryptErr)
+		}
+		pendingCiphertext, encryptErr := cipher.EncryptPendingAliasAPIKey(credentials.APIKey)
+		if encryptErr != nil {
+			return "", fmt.Errorf("加密轮换后的待领取 API Key: %w", encryptErr)
+		}
+		return pendingCiphertext, nil
+	})
 	db.ConfigureAliasAPIKeyRotationFactory(func(aliasID, version int64, credentialCiphertext, apiKey string) (domain.AliasCredentialMaterial, error) {
 		credentials, decryptErr := cipher.DecryptAliasCredentials(aliasID, credentialCiphertext)
 		if decryptErr != nil {

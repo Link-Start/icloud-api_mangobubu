@@ -162,6 +162,7 @@ const actionLabels = {
   sync: "同步主号",
   rotate_key: "轮换 API Key",
   rotate_credentials: "轮换整套凭证",
+  rotate_all_credentials: "轮换全部令牌",
   toggle: "切换启用状态",
 };
 

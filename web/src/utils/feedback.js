@@ -1,7 +1,7 @@
 import { ElMessage, ElNotification } from "element-plus";
 
-export function successMessage(message) {
-  ElMessage({ type: "success", message, duration: 2400 });
+export function successMessage(message, duration = 2400) {
+  ElMessage({ type: "success", message, duration });
 }
 
 export function showRequestError(error, fallback = "请求处理失败，请稍后重试。") {
