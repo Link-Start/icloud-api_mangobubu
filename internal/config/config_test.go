@@ -25,6 +25,7 @@ var configEnvironment = []string{
 	"ICLOUD_API_MAX_MESSAGE_BYTES",
 	"ICLOUD_API_MAX_BODY_BYTES",
 	"ICLOUD_API_OTP_RETURN_LAST_ONLY",
+	"ICLOUD_API_OTP_RETURN_LATEST_ONLY",
 	"ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS",
 	"ICLOUD_API_TRUSTED_PROXIES",
 	"GIN_MODE",
@@ -279,14 +280,14 @@ func TestTimezoneDefault(t *testing.T) {
 	}
 }
 
-func TestOTPReturnLastOnlyConfiguration(t *testing.T) {
+func TestOTPReturnLatestOnlyConfiguration(t *testing.T) {
 	clearConfigEnvironment(t)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.OTPReturnLastOnly {
-		t.Fatal("默认不应只返回 OTP 数组最后一条")
+	if cfg.OTPReturnLatestOnly {
+		t.Fatal("默认不应只返回最新 OTP")
 	}
 
 	t.Setenv("ICLOUD_API_OTP_RETURN_LAST_ONLY", "true")
@@ -294,17 +295,51 @@ func TestOTPReturnLastOnlyConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.OTPReturnLastOnly {
-		t.Fatal("ICLOUD_API_OTP_RETURN_LAST_ONLY=true 未生效")
+	if !cfg.OTPReturnLatestOnly {
+		t.Fatal("旧配置 ICLOUD_API_OTP_RETURN_LAST_ONLY=true 未兼容")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LATEST_ONLY", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OTPReturnLatestOnly {
+		t.Fatal("正式配置 false 应覆盖旧配置 true")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LATEST_ONLY", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OTPReturnLatestOnly {
+		t.Fatal("ICLOUD_API_OTP_RETURN_LATEST_ONLY=true 未生效")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LAST_ONLY", "not-a-bool")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("正式配置已设置时不应解析旧配置: %v", err)
+	}
+	if !cfg.OTPReturnLatestOnly {
+		t.Fatal("正式配置 true 应覆盖无效旧配置")
 	}
 }
 
-func TestOTPReturnLastOnlyValidation(t *testing.T) {
-	clearConfigEnvironment(t)
-	t.Setenv("ICLOUD_API_OTP_RETURN_LAST_ONLY", "not-a-bool")
-	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_OTP_RETURN_LAST_ONLY") {
-		t.Fatalf("无效 OTP 最后一条开关错误 = %v, want 包含环境变量名", err)
+func TestOTPReturnLatestOnlyValidation(t *testing.T) {
+	for _, name := range []string{
+		"ICLOUD_API_OTP_RETURN_LAST_ONLY",
+		"ICLOUD_API_OTP_RETURN_LATEST_ONLY",
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv(name, "not-a-bool")
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("无效 OTP 单条开关错误 = %v, want 包含 %s", err, name)
+			}
+		})
 	}
 }
 

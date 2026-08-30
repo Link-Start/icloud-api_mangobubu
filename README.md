@@ -112,13 +112,13 @@ curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN'
 [{"otp":"876543","time":"2026-08-11T12:00:00+08:00"},{"otp":"123456","time":"2026-08-11T11:00:00+08:00"}]
 ```
 
-设置 `ICLOUD_API_OTP_RETURN_LAST_ONLY=true` 后，有记录时只返回上述数组最后一项的裸 JSON 对象；由于默认数组按时间倒序排列，该项是当前最多 100 条记录中时间最早的一条：
+设置 `ICLOUD_API_OTP_RETURN_LATEST_ONLY=true` 后，有记录时只返回上述数组第一项的裸 JSON 对象，也就是真正最新的有效 OTP：
 
 ```json
-{"otp":"123456","time":"2026-08-11T11:00:00+08:00"}
+{"otp":"876543","time":"2026-08-11T12:00:00+08:00"}
 ```
 
-两种模式在没有验证码时都返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。迁移和轮换后 OTP URL 仍使用 `/api/v1/otp`；v2 alias 的 OTP token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名，不能通过改写 URL 路径或信封版本互换。这里的 v3 仅指 OTP token 信封版本，不是新的 alias credential mode。原 v1 直达 token 只继续用于尚未执行全量迁移的 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，只接受未与字母或数字相邻的 6 位 ASCII 数字；每封邮件最多保存一个候选，升级前保存的非 6 位历史值也会在读取时忽略。
+旧变量 `ICLOUD_API_OTP_RETURN_LAST_ONLY` 继续作为兼容别名，开启后同样返回最新 OTP；同时配置两个变量时，以 `ICLOUD_API_OTP_RETURN_LATEST_ONLY` 为准。两种模式在没有验证码时都返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。迁移和轮换后 OTP URL 仍使用 `/api/v1/otp`；v2 alias 的 OTP token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名，不能通过改写 URL 路径或信封版本互换。这里的 v3 仅指 OTP token 信封版本，不是新的 alias credential mode。原 v1 直达 token 只继续用于尚未执行全量迁移的 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，只接受未与字母或数字相邻的 6 位 ASCII 数字；每封邮件最多保存一个候选，升级前保存的非 6 位历史值也会在读取时忽略。
 
 ## 旧接口兼容
 
@@ -240,7 +240,8 @@ location / {
 | `ICLOUD_API_MAIL_CONTENT_LIMIT_BYTES` | `10737418240` | 全局 MIME 内容容量 |
 | `ICLOUD_API_MAX_MESSAGE_BYTES` | `104857600` | 单封邮件硬上限，最大 100 MiB |
 | `ICLOUD_API_MAX_BODY_BYTES` | `524288` | OTP/MIME 元数据解析时的正文预算 |
-| `ICLOUD_API_OTP_RETURN_LAST_ONLY` | `false` | 有 OTP 时只返回默认数组的最后一项对象；空历史仍返回 `[]` |
+| `ICLOUD_API_OTP_RETURN_LATEST_ONLY` | `false` | 有 OTP 时只返回最新一项对象；空历史仍返回 `[]` |
+| `ICLOUD_API_OTP_RETURN_LAST_ONLY` | `false` | 旧配置兼容别名；未设置正式变量时同样启用最新单条模式 |
 | `ICLOUD_API_PUBLIC_IMAP_ADDR` | `127.0.0.1:1993` | IMAPS 监听地址；Compose 中为 `0.0.0.0:1993` |
 | `ICLOUD_API_PUBLIC_IMAP_SERVER_NAME` | `localhost` | IMAPS TLS 名称 |
 | `ICLOUD_API_PUBLIC_IMAP_TLS_CERT_FILE` | 空（自动生成） | 生产证书在容器中的路径；证书和私钥需同时配置 |

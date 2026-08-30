@@ -125,44 +125,44 @@ func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
 		t.Fatalf("empty OTP response = status %d body %q", empty.Code, empty.Body.String())
 	}
 
-	env.server.cfg.OTPReturnLastOnly = true
-	lastOnlyBearer := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{
+	env.server.cfg.OTPReturnLatestOnly = true
+	latestOnlyBearer := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{
 		"Authorization": "Bearer " + credentials.APIKey,
 	})
-	if lastOnlyBearer.Code != http.StatusOK {
-		t.Fatalf("last-only Bearer OTP status = %d; body=%s", lastOnlyBearer.Code, lastOnlyBearer.Body.String())
+	if latestOnlyBearer.Code != http.StatusOK {
+		t.Fatalf("latest-only Bearer OTP status = %d; body=%s", latestOnlyBearer.Code, latestOnlyBearer.Body.String())
 	}
-	var lastOnly otpResponse
-	if err := json.Unmarshal(lastOnlyBearer.Body.Bytes(), &lastOnly); err != nil {
-		t.Fatalf("decode last-only OTP response: %v", err)
+	var latestOnly otpResponse
+	if err := json.Unmarshal(latestOnlyBearer.Body.Bytes(), &latestOnly); err != nil {
+		t.Fatalf("decode latest-only OTP response: %v", err)
 	}
-	if lastOnly.OTP != "123456" || lastOnly.Time != "2026-08-11T11:00:00+08:00" {
-		t.Fatalf("last-only OTP = %#v", lastOnly)
+	if latestOnly.OTP != "876543" || latestOnly.Time != "2026-08-11T12:00:00+08:00" {
+		t.Fatalf("latest-only OTP = %#v", latestOnly)
 	}
-	if !strings.HasPrefix(lastOnlyBearer.Body.String(), "{") {
-		t.Fatalf("last-only OTP response is not a bare object: %s", lastOnlyBearer.Body.String())
+	if !strings.HasPrefix(latestOnlyBearer.Body.String(), "{") {
+		t.Fatalf("latest-only OTP response is not a bare object: %s", latestOnlyBearer.Body.String())
 	}
 
-	lastOnlyDerived := serveV2Request(
+	latestOnlyDerived := serveV2Request(
 		router,
 		http.MethodGet,
 		"/api/v1/otp?token="+url.QueryEscape(derived),
 		"",
 		nil,
 	)
-	if lastOnlyDerived.Code != http.StatusOK || lastOnlyDerived.Body.String() != lastOnlyBearer.Body.String() {
+	if latestOnlyDerived.Code != http.StatusOK || latestOnlyDerived.Body.String() != latestOnlyBearer.Body.String() {
 		t.Fatalf(
-			"last-only derived OTP response = status %d body %s",
-			lastOnlyDerived.Code,
-			lastOnlyDerived.Body.String(),
+			"latest-only derived OTP response = status %d body %s",
+			latestOnlyDerived.Code,
+			latestOnlyDerived.Body.String(),
 		)
 	}
 
-	lastOnlyEmpty := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{
+	latestOnlyEmpty := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{
 		"Authorization": "Bearer " + emptyCredentials.APIKey,
 	})
-	if lastOnlyEmpty.Code != http.StatusOK || strings.TrimSpace(lastOnlyEmpty.Body.String()) != "[]" {
-		t.Fatalf("last-only empty OTP response = status %d body %q", lastOnlyEmpty.Code, lastOnlyEmpty.Body.String())
+	if latestOnlyEmpty.Code != http.StatusOK || strings.TrimSpace(latestOnlyEmpty.Body.String()) != "[]" {
+		t.Fatalf("latest-only empty OTP response = status %d body %q", latestOnlyEmpty.Code, latestOnlyEmpty.Body.String())
 	}
 }
 

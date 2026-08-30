@@ -44,7 +44,7 @@ type Config struct {
 	ShutdownTimeout           time.Duration
 	MaxMessageBytes           int64
 	MaxBodyBytes              int64
-	OTPReturnLastOnly         bool
+	OTPReturnLatestOnly       bool
 	AllowWeakRecipientHeaders bool
 	TrustedProxies            []string
 	GinMode                   string
@@ -90,7 +90,11 @@ func Load() (Config, error) {
 	if cfg.CookieSecure, err = envBool("ICLOUD_API_COOKIE_SECURE", false); err != nil {
 		return Config{}, err
 	}
-	if cfg.OTPReturnLastOnly, err = envBool("ICLOUD_API_OTP_RETURN_LAST_ONLY", false); err != nil {
+	otpReturnLatestOnlyName := "ICLOUD_API_OTP_RETURN_LAST_ONLY"
+	if strings.TrimSpace(os.Getenv("ICLOUD_API_OTP_RETURN_LATEST_ONLY")) != "" {
+		otpReturnLatestOnlyName = "ICLOUD_API_OTP_RETURN_LATEST_ONLY"
+	}
+	if cfg.OTPReturnLatestOnly, err = envBool(otpReturnLatestOnlyName, false); err != nil {
 		return Config{}, err
 	}
 	if cfg.AllowWeakRecipientHeaders, err = envBool("ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS", false); err != nil {
