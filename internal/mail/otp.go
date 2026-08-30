@@ -7,6 +7,8 @@ import (
 	"unicode/utf8"
 
 	xhtml "golang.org/x/net/html"
+
+	"icloud-api/internal/domain"
 )
 
 var otpKeywords = []string{
@@ -20,8 +22,8 @@ type otpCandidate struct {
 	order int
 }
 
-// ExtractOTP returns one bounded numeric code. A candidate must contain four
-// through eight ASCII digits and must not touch another ASCII letter or digit.
+// ExtractOTP returns one bounded numeric code. A candidate must contain exactly
+// six ASCII digits and must not touch another letter or number.
 func ExtractOTP(subject, textBody, htmlBody string) string {
 	sources := []string{subject, textBody}
 	if strings.TrimSpace(htmlBody) != "" {
@@ -45,8 +47,7 @@ func ExtractOTP(subject, textBody, htmlBody string) string {
 			for index < len(source) && source[index] >= '0' && source[index] <= '9' {
 				index++
 			}
-			length := index - start
-			if length < 4 || length > 8 || adjacentLetterOrNumber(source, start, index) {
+			if !domain.IsSixDigitOTP(source[start:index]) || adjacentLetterOrNumber(source, start, index) {
 				continue
 			}
 			windowStart := start - 64

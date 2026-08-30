@@ -66,6 +66,10 @@ func (s *Server) otpHistory(c *gin.Context) {
 	for _, record := range records {
 		result = append(result, otpResponse{OTP: record.OTP, Time: record.Time.In(location).Format(time.RFC3339)})
 	}
+	if s.cfg.OTPReturnLastOnly && len(result) > 0 {
+		c.JSON(http.StatusOK, result[len(result)-1])
+		return
+	}
 	c.JSON(http.StatusOK, result)
 }
 

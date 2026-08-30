@@ -146,6 +146,50 @@ func TestArchiveKeepsOneHundredNewestOTPsButEveryTitle(t *testing.T) {
 	}
 }
 
+func TestArchiveRejectsNewInvalidOTPAndFiltersLegacyInvalidHistory(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db, _ := openArchiveV2Store(t, 1<<20)
+	account := createAccount(t, ctx, db, "OTP validation", "otp-validation@icloud.com")
+	alias := createAlias(t, ctx, db, account.ID, "otp-validation-alias@icloud.com", bytes.Repeat([]byte{0x32}, 32))
+	base := time.Date(2026, 8, 11, 2, 0, 0, 0, time.UTC)
+	applyArchiveV2Batch(t, ctx, db, account.ID, []domain.Alias{alias}, []domain.ArchivedMessage{
+		{
+			AccountID: account.ID, UIDValidity: 42, UID: 1, InternalDate: base,
+			Subject: "valid OTP", ContentState: domain.ArchiveContentMetadata,
+			OTP: "654321", AliasIDs: []int64{alias.ID},
+		},
+		{
+			AccountID: account.ID, UIDValidity: 42, UID: 2, InternalDate: base.Add(time.Minute),
+			Subject: "year is not an OTP", ContentState: domain.ArchiveContentMetadata,
+			OTP: "2026", AliasIDs: []int64{alias.ID},
+		},
+	}, 42, 2, true)
+
+	archived, err := db.ListArchivedMailboxMessages(ctx, alias.ID)
+	if err != nil || len(archived) != 2 {
+		t.Fatalf("archived OTP validation messages = %#v, %v", archived, err)
+	}
+	if archived[0].OTP != "654321" || archived[1].OTP != "" {
+		t.Fatalf("stored OTP values = first:%q second:%q", archived[0].OTP, archived[1].OTP)
+	}
+
+	if _, err := db.DB().ExecContext(
+		ctx,
+		`UPDATE alias_messages SET otp = ? WHERE alias_id = ? AND mailbox_uid = ?`,
+		"2026",
+		alias.ID,
+		2,
+	); err != nil {
+		t.Fatalf("seed legacy invalid OTP: %v", err)
+	}
+	otps, err := db.ListAliasOTPs(ctx, alias.ID, 1)
+	if err != nil || len(otps) != 1 || otps[0].OTP != "654321" {
+		t.Fatalf("filtered legacy OTP history = %#v, %v", otps, err)
+	}
+}
+
 func TestLegacySnapshotExpungeProjectionDoesNotDeleteV2Archive(t *testing.T) {
 	t.Parallel()
 

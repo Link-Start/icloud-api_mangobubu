@@ -10,9 +10,12 @@ func TestExtractOTPBoundariesKeywordsAndReadableHTML(t *testing.T) {
 		subject, text, html string
 		want                string
 	}{
-		{name: "four digits", subject: "Code: 1234", want: "1234"},
-		{name: "eight digits", text: "验证码 12345678", want: "12345678"},
+		{name: "six digits", subject: "Code: 123456", want: "123456"},
 		{name: "three digits rejected", subject: "Code 123"},
+		{name: "four-digit year rejected", subject: "账单年份 2026"},
+		{name: "five digits rejected", subject: "Code 12345"},
+		{name: "seven digits rejected", subject: "Code 1234567"},
+		{name: "eight digits rejected", text: "验证码 12345678"},
 		{name: "nine digits rejected", subject: "Code 123456789"},
 		{name: "ASCII letter adjacency rejected", subject: "code A123456Z"},
 		{name: "ASCII digit adjacency rejected", subject: "code 912345678"},
@@ -24,15 +27,20 @@ func TestExtractOTPBoundariesKeywordsAndReadableHTML(t *testing.T) {
 			want:    "654321",
 		},
 		{
+			name:    "four-digit year ignored before code",
+			subject: "Date 2026; verification code 135790",
+			want:    "135790",
+		},
+		{
 			name: "nearest keyword wins",
 			text: "reference 111111 then a long description; verification code 222222",
 			want: "222222",
 		},
 		{
 			name:    "subject wins equal score",
-			subject: "1234",
-			text:    "5678",
-			want:    "1234",
+			subject: "123456",
+			text:    "567890",
+			want:    "123456",
 		},
 		{
 			name: "HTML readable text and ignored script",

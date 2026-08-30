@@ -287,6 +287,19 @@ type OTPRecord struct {
 	Time time.Time
 }
 
+// IsSixDigitOTP reports whether value is exactly six ASCII digits.
+func IsSixDigitOTP(value string) bool {
+	if len(value) != 6 {
+		return false
+	}
+	for index := range value {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // SnapshotState describes the confidence of a legacy latest-mail snapshot.
 // The v1 API only exposes snapshots that are found; the other states are kept
 // for callers that need to distinguish an authoritative empty mailbox from an

@@ -27,6 +27,7 @@ func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
 	alias, credentials := createV2AliasFixture(t, env, account.ID, "otp-alias@icloud.com")
 
 	older := time.Date(2026, 8, 11, 3, 0, 0, 0, time.UTC)
+	middle := older.Add(30 * time.Minute)
 	newer := older.Add(time.Hour)
 	account, err := env.store.GetAccount(context.Background(), account.ID)
 	if err != nil {
@@ -46,18 +47,32 @@ func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
 				},
 				{
 					AccountID: account.ID, UIDValidity: 77, UID: 2,
+					InternalDate: middle, Subject: "legacy invalid", RawMIME: []byte("Subject: legacy invalid\r\n\r\n654321"),
+					OTP: "654321", AliasIDs: []int64{alias.ID},
+				},
+				{
+					AccountID: account.ID, UIDValidity: 77, UID: 3,
 					InternalDate: newer, Subject: "newer", RawMIME: []byte("Subject: newer\r\n\r\n876543"),
 					OTP: "876543", AliasIDs: []int64{alias.ID},
 				},
 			},
 			State: domain.IMAPSyncState{
-				AccountID: account.ID, UIDValidity: 77, LastUID: 2, UpdatedAt: newer,
+				AccountID: account.ID, UIDValidity: 77, LastUID: 3, UpdatedAt: newer,
 			},
 			Reset: true,
 		},
 		newer,
 	); err != nil {
 		t.Fatalf("archive OTP fixtures: %v", err)
+	}
+	if _, err := env.store.DB().ExecContext(
+		context.Background(),
+		`UPDATE alias_messages SET otp = ? WHERE alias_id = ? AND mailbox_uid = ?`,
+		"2026",
+		alias.ID,
+		2,
+	); err != nil {
+		t.Fatalf("seed legacy invalid OTP: %v", err)
 	}
 
 	router, err := env.server.Router()
@@ -108,6 +123,46 @@ func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
 	})
 	if empty.Code != http.StatusOK || strings.TrimSpace(empty.Body.String()) != "[]" {
 		t.Fatalf("empty OTP response = status %d body %q", empty.Code, empty.Body.String())
+	}
+
+	env.server.cfg.OTPReturnLastOnly = true
+	lastOnlyBearer := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{
+		"Authorization": "Bearer " + credentials.APIKey,
+	})
+	if lastOnlyBearer.Code != http.StatusOK {
+		t.Fatalf("last-only Bearer OTP status = %d; body=%s", lastOnlyBearer.Code, lastOnlyBearer.Body.String())
+	}
+	var lastOnly otpResponse
+	if err := json.Unmarshal(lastOnlyBearer.Body.Bytes(), &lastOnly); err != nil {
+		t.Fatalf("decode last-only OTP response: %v", err)
+	}
+	if lastOnly.OTP != "123456" || lastOnly.Time != "2026-08-11T11:00:00+08:00" {
+		t.Fatalf("last-only OTP = %#v", lastOnly)
+	}
+	if !strings.HasPrefix(lastOnlyBearer.Body.String(), "{") {
+		t.Fatalf("last-only OTP response is not a bare object: %s", lastOnlyBearer.Body.String())
+	}
+
+	lastOnlyDerived := serveV2Request(
+		router,
+		http.MethodGet,
+		"/api/v1/otp?token="+url.QueryEscape(derived),
+		"",
+		nil,
+	)
+	if lastOnlyDerived.Code != http.StatusOK || lastOnlyDerived.Body.String() != lastOnlyBearer.Body.String() {
+		t.Fatalf(
+			"last-only derived OTP response = status %d body %s",
+			lastOnlyDerived.Code,
+			lastOnlyDerived.Body.String(),
+		)
+	}
+
+	lastOnlyEmpty := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{
+		"Authorization": "Bearer " + emptyCredentials.APIKey,
+	})
+	if lastOnlyEmpty.Code != http.StatusOK || strings.TrimSpace(lastOnlyEmpty.Body.String()) != "[]" {
+		t.Fatalf("last-only empty OTP response = status %d body %q", lastOnlyEmpty.Code, lastOnlyEmpty.Body.String())
 	}
 }
 

@@ -24,6 +24,7 @@ var configEnvironment = []string{
 	"ICLOUD_API_SHUTDOWN_TIMEOUT",
 	"ICLOUD_API_MAX_MESSAGE_BYTES",
 	"ICLOUD_API_MAX_BODY_BYTES",
+	"ICLOUD_API_OTP_RETURN_LAST_ONLY",
 	"ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS",
 	"ICLOUD_API_TRUSTED_PROXIES",
 	"GIN_MODE",
@@ -275,6 +276,35 @@ func TestTimezoneDefault(t *testing.T) {
 	}
 	if cfg.Timezone != time.Local {
 		t.Fatalf("默认时区 = %v, want time.Local", cfg.Timezone)
+	}
+}
+
+func TestOTPReturnLastOnlyConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OTPReturnLastOnly {
+		t.Fatal("默认不应只返回 OTP 数组最后一条")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LAST_ONLY", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OTPReturnLastOnly {
+		t.Fatal("ICLOUD_API_OTP_RETURN_LAST_ONLY=true 未生效")
+	}
+}
+
+func TestOTPReturnLastOnlyValidation(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_OTP_RETURN_LAST_ONLY", "not-a-bool")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_OTP_RETURN_LAST_ONLY") {
+		t.Fatalf("无效 OTP 最后一条开关错误 = %v, want 包含环境变量名", err)
 	}
 }
 

@@ -399,6 +399,10 @@ func (s *Store) persistArchivedMessagesTx(
 		}
 		aliasIDs := append([]int64(nil), message.AliasIDs...)
 		sort.Slice(aliasIDs, func(i, j int) bool { return aliasIDs[i] < aliasIDs[j] })
+		otp := strings.TrimSpace(message.OTP)
+		if !domain.IsSixDigitOTP(otp) {
+			otp = ""
+		}
 		for index, aliasID := range aliasIDs {
 			if aliasID < 1 || index > 0 && aliasIDs[index-1] == aliasID {
 				return errors.New("archive message contains invalid or duplicate alias ID")
@@ -424,11 +428,11 @@ func (s *Store) persistArchivedMessagesTx(
 			if _, err := s.txExecContext(ctx, tx, `
 				INSERT INTO alias_messages(alias_id, message_id, mailbox_uid, otp, created_at)
 				VALUES(?, ?, ?, ?, ?)`,
-				aliasID, archivedID, nextUID, strings.TrimSpace(message.OTP), timestamp(message.InternalDate),
+				aliasID, archivedID, nextUID, otp, timestamp(message.InternalDate),
 			); err != nil {
 				return fmt.Errorf("link archived message to alias: %w", err)
 			}
-			if strings.TrimSpace(message.OTP) != "" {
+			if otp != "" {
 				if _, err := s.txExecContext(ctx, tx, `
 					UPDATE alias_messages SET otp = ''
 					WHERE alias_id = ? AND otp <> '' AND message_id NOT IN (
@@ -766,7 +770,7 @@ func (s *Store) ListAliasOTPs(ctx context.Context, aliasID int64, limit int) ([]
 		FROM alias_messages am
 		JOIN archived_messages m ON m.id = am.message_id
 		WHERE am.alias_id = ? AND am.otp <> ''
-		ORDER BY m.internal_date DESC, m.id DESC LIMIT ?`, aliasID, limit,
+		ORDER BY m.internal_date DESC, m.id DESC LIMIT ?`, aliasID, maxOTPHistory,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list alias OTP history: %w", err)
@@ -778,6 +782,9 @@ func (s *Store) ListAliasOTPs(ctx context.Context, aliasID int64, limit int) ([]
 		var timestampValue int64
 		if err := rows.Scan(&record.OTP, &timestampValue); err != nil {
 			return nil, fmt.Errorf("scan alias OTP history: %w", err)
+		}
+		if !domain.IsSixDigitOTP(record.OTP) || len(result) >= limit {
+			continue
 		}
 		record.Time = timeFromTimestamp(timestampValue)
 		result = append(result, record)
