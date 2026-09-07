@@ -238,14 +238,13 @@ func adminAPIBatchAliasDeleteError(err error) adminAPIAppleError {
 			Message: "该隐私邮箱正在等待 Apple 目录确认，暂时不能批量删除",
 		}
 	}
-	if errors.Is(err, store.ErrNotFound) {
-		return adminAPIAppleError{
-			Status:  http.StatusNotFound,
-			Code:    "NOT_FOUND",
-			Message: "隐私邮箱不存在",
-		}
+	// A missing Apple session also wraps store.ErrNotFound. Preserve the
+	// Apple classification before specializing a genuine missing-record error.
+	apiErr := classifyAdminAPIAppleError(err)
+	if apiErr.Code == "NOT_FOUND" {
+		apiErr.Message = "隐私邮箱不存在"
 	}
-	return classifyAdminAPIAppleError(err)
+	return apiErr
 }
 
 func (s *Server) adminAPIFinishBatchAliasDeleteFailure(

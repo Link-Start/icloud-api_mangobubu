@@ -1877,6 +1877,46 @@ func TestDeleteAliasesUsesAppleFirstWorkflowForEachAlias(t *testing.T) {
 	}
 }
 
+func TestDeleteAliasesSessionExpiresDuringBatch(t *testing.T) {
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "one@icloud.com", Enabled: true})
+	repo.addAlias(domain.Alias{ID: 42, AccountID: 3, Address: "two@icloud.com", Enabled: true})
+	validateCalls := 0
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			validateCalls++
+			return session, apple.ErrInvalidSession
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{
+		AppleID: "owner@example.com", Region: apple.RegionGlobal, SessionToken: "initial-session",
+	})
+	info, err := service.GetSession(context.Background(), 3)
+	if err != nil || info.Status != StatusAuthenticated {
+		t.Fatalf("initial session = %#v, err=%v", info, err)
+	}
+
+	outcomes, err := service.DeleteAliases(context.Background(), []int64{41, 42})
+	if err != nil || len(outcomes) != 2 {
+		t.Fatalf("batch outcomes = %#v, err=%v", outcomes, err)
+	}
+	if outcomes[0].AliasID != 41 || !errors.Is(outcomes[0].Err, ErrSessionExpired) || Code(outcomes[0].Err) != CodeSessionExpired {
+		t.Fatalf("first deletion outcome = %#v", outcomes[0])
+	}
+	if outcomes[1].AliasID != 42 || !errors.Is(outcomes[1].Err, ErrLoginRequired) || Code(outcomes[1].Err) != CodeLoginRequired ||
+		!errors.Is(outcomes[1].Err, store.ErrNotFound) {
+		t.Fatalf("second deletion must preserve login-required classification and missing-session cause: %#v", outcomes[1])
+	}
+	if validateCalls != 1 || client.deactivateCalls.Load() != 0 || client.deleteCalls.Load() != 0 {
+		t.Fatalf("Apple calls after session loss: validate=%d deactivate=%d delete=%d", validateCalls, client.deactivateCalls.Load(), client.deleteCalls.Load())
+	}
+	if !repo.hasAlias(41) || !repo.hasAlias(42) || repo.aliasDeletes.Load() != 0 {
+		t.Fatal("session loss removed local aliases")
+	}
+}
+
 func TestDeleteAliasRejectsPendingConfirmationBeforeApple(t *testing.T) {
 	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)

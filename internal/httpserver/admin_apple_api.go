@@ -444,6 +444,7 @@ func (s *Server) auditAppleAliasDeleteFailure(
 ) {
 	s.logger.Warn("Apple alias deletion failed",
 		"action", "delete",
+		"alias_id", aliasID,
 		"code", apiErr.Code,
 		"request_id", requestID(c),
 	)
