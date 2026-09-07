@@ -693,7 +693,11 @@ test("alias directory forwards the optional primary-account filter", async () =>
   assert.equal(all[0].address, "private@icloud.com");
 });
 
-test("alias pages apply search and primary-account filters before server pagination", async () => {
+for (const [option, parameter] of [
+  ["withoutLatestMail", "without_latest_mail"],
+  ["withLatestMail", "with_latest_mail"],
+]) {
+test(`alias pages apply ${parameter}, search and account filters before pagination`, async () => {
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
@@ -714,7 +718,8 @@ test("alias pages apply search and primary-account filters before server paginat
     limit: 50,
     offset: 50,
     query: "  private+box  ",
-    withoutLatestMail: true,
+    groupId: 7,
+    [option]: true,
   });
   const url = new URL(request.url, "https://admin.invalid");
 
@@ -722,14 +727,33 @@ test("alias pages apply search and primary-account filters before server paginat
     limit: "50",
     offset: "50",
     account_id: "12",
+    group_id: "7",
     query: "private+box",
-    without_latest_mail: "true",
+    [parameter]: "true",
   });
   assert.equal(page.items[0].accountId, 12);
   assert.deepEqual(
     { total: page.total, limit: page.limit, offset: page.offset, hasMore: page.hasMore },
     { total: 81, limit: 50, offset: 50, hasMore: false },
   );
+});
+}
+
+test("alias pages omit disabled latest-mail filters", async () => {
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    requests.push(new URL(url, "https://admin.invalid"));
+    return jsonResponse({ items: [], pagination: { total: 0, limit: 20, offset: 0 } });
+  };
+
+  await getAliasPage();
+  await getAliasPage("", { withoutLatestMail: false, withLatestMail: false });
+
+  assert.equal(requests.length, 2);
+  for (const url of requests) {
+    assert.equal(url.searchParams.has("without_latest_mail"), false);
+    assert.equal(url.searchParams.has("with_latest_mail"), false);
+  }
 });
 
 test("mail groups normalize counts and send authenticated mutations", async () => {
@@ -801,7 +825,11 @@ test("alias group filters and moves preserve explicit ungrouping", async () => {
   });
 });
 
-test("full alias export preserves search across every server page", async () => {
+for (const [option, parameter] of [
+  ["withoutLatestMail", "without_latest_mail"],
+  ["withLatestMail", "with_latest_mail"],
+]) {
+test(`full alias export preserves search and ${parameter} across every page`, async () => {
   const requests = [];
   const pages = [
     {
@@ -820,7 +848,8 @@ test("full alias export preserves search across every server page", async () => 
 
   const aliases = await getAllAliases(12, {
     query: "receipt",
-    withoutLatestMail: true,
+    groupId: "none",
+    [option]: true,
   });
 
   assert.deepEqual(aliases.map((alias) => alias.id), [2, 1]);
@@ -830,10 +859,16 @@ test("full alias export preserves search across every server page", async () => 
   for (const request of requests) {
     assert.equal(request.searchParams.get("limit"), "1000");
     assert.equal(request.searchParams.get("account_id"), "12");
+    assert.equal(request.searchParams.get("group_id"), "none");
     assert.equal(request.searchParams.get("query"), "receipt");
-    assert.equal(request.searchParams.get("without_latest_mail"), "true");
+    assert.equal(request.searchParams.get(parameter), "true");
+    assert.equal(
+      request.searchParams.has(option === "withLatestMail" ? "without_latest_mail" : "with_latest_mail"),
+      false,
+    );
   }
 });
+}
 
 test("audit pages preserve total, limit, offset, and has-more metadata", async () => {
   let request;

@@ -236,7 +236,8 @@
           @change="handleLatestMailFilterChange"
         >
           <el-option label="全部" value="" />
-          <el-option label="无最新邮件" value="none" />
+          <el-option label="无" value="none" />
+          <el-option label="是" value="yes" />
         </el-select>
       </label>
 
@@ -273,14 +274,14 @@
     <EmptyState
       v-else-if="aliases.length === 0"
       :title="
-        appliedAliasQuery || appliedGroupId || withoutLatestMail
+        appliedAliasQuery || appliedGroupId || selectedLatestMailFilter
           ? '没有匹配的隐私邮箱'
           : selectedAccountId
             ? '该主号暂无隐私邮箱'
             : '还没有隐私邮箱'
       "
       :description="
-        appliedAliasQuery || appliedGroupId || withoutLatestMail
+        appliedAliasQuery || appliedGroupId || selectedLatestMailFilter
           ? '请尝试其他关键词，或调整所属主号、邮箱分组和最新邮件筛选。'
           : selectedAccountId
             ? '请选择其他主号，或进入该主号详情页添加地址。'
@@ -288,7 +289,7 @@
       "
     >
       <el-button
-        v-if="appliedAliasQuery || appliedGroupId || withoutLatestMail"
+        v-if="appliedAliasQuery || appliedGroupId || selectedLatestMailFilter"
         :icon="RefreshLeft"
         @click="resetAliasFilters"
       >
@@ -689,12 +690,15 @@ const someExportableAliasesSelected = computed(() => {
 const withoutLatestMail = computed(
   () => selectedLatestMailFilter.value === "none",
 );
+const withLatestMail = computed(
+  () => selectedLatestMailFilter.value === "yes",
+);
 
 const hasActiveFilters = computed(() =>
   Boolean(
     selectedAccountId.value ||
       selectedGroupFilter.value ||
-      withoutLatestMail.value ||
+      selectedLatestMailFilter.value ||
       keywordDraft.value.trim(),
   ),
 );
@@ -703,7 +707,7 @@ const hasAppliedFilters = computed(() =>
   Boolean(
     selectedAccountId.value ||
       appliedGroupId.value ||
-      withoutLatestMail.value ||
+      selectedLatestMailFilter.value ||
       appliedAliasQuery.value,
   ),
 );
@@ -838,10 +842,12 @@ async function loadAliases({ silent = false } = {}) {
   const accountId = selectedAccountId.value;
   const query = appliedAliasQuery.value;
   const groupId = appliedGroupId.value;
+  const latestMailFilter = selectedLatestMailFilter.value;
   const withoutLatestMailOnly = withoutLatestMail.value;
+  const withLatestMailOnly = withLatestMail.value;
   const page = currentPage.value;
   const selectedPageSize = pageSize.value;
-  const requestKey = `${accountId}\u0000${groupId}\u0000${query}\u0000${withoutLatestMailOnly}\u0000${page}\u0000${selectedPageSize}`;
+  const requestKey = `${accountId}\u0000${groupId}\u0000${query}\u0000${latestMailFilter}\u0000${page}\u0000${selectedPageSize}`;
   const ticket = aliasLoadGate.begin(requestKey);
   aliasAbortController?.abort();
   const abortController = new AbortController();
@@ -857,6 +863,7 @@ async function loadAliases({ silent = false } = {}) {
             query,
             groupId,
             withoutLatestMail: withoutLatestMailOnly,
+            withLatestMail: withLatestMailOnly,
             signal: abortController.signal,
           }),
         }
@@ -866,9 +873,10 @@ async function loadAliases({ silent = false } = {}) {
           query,
           groupId,
           withoutLatestMail: withoutLatestMailOnly,
+          withLatestMail: withLatestMailOnly,
           signal: abortController.signal,
         });
-    const currentKey = `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${withoutLatestMail.value}\u0000${currentPage.value}\u0000${pageSize.value}`;
+    const currentKey = `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${selectedLatestMailFilter.value}\u0000${currentPage.value}\u0000${pageSize.value}`;
     if (!aliasLoadGate.isCurrent(ticket, currentKey)) return;
     const nextTotal = Math.max(0, Number(result?.total) || 0);
     const nextAliases = Array.isArray(result?.items) ? result.items : [];
@@ -896,7 +904,7 @@ async function loadAliases({ silent = false } = {}) {
       error?.name !== "AbortError" &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${withoutLatestMail.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
+        `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${selectedLatestMailFilter.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       ) &&
       !silent
     ) {
@@ -907,7 +915,7 @@ async function loadAliases({ silent = false } = {}) {
       aliasAbortController === abortController &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${withoutLatestMail.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
+        `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${selectedLatestMailFilter.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       )
     ) {
       loading.value = false;
@@ -960,7 +968,7 @@ function handleGroupFilterChange(value) {
 }
 
 function handleLatestMailFilterChange(value) {
-  selectedLatestMailFilter.value = value === "none" ? "none" : "";
+  selectedLatestMailFilter.value = value === "none" || value === "yes" ? value : "";
   appliedAliasQuery.value = keywordDraft.value.trim();
   reloadAliasesForFilters();
 }
@@ -1181,6 +1189,7 @@ function copyAllAliases(format) {
     query: appliedAliasQuery.value,
     groupId: appliedGroupId.value === "none" ? "none" : appliedGroupId.value,
     withoutLatestMail: withoutLatestMail.value,
+    withLatestMail: withLatestMail.value,
   })
     .then((items) => {
       if (viewActive) {

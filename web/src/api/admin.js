@@ -874,6 +874,7 @@ export async function getAliasPage(accountId = "", options = {}) {
     group_id: options.groupId,
     query: options.query,
     without_latest_mail: options.withoutLatestMail === true ? "true" : "",
+    with_latest_mail: options.withLatestMail === true ? "true" : "",
   });
   const data = await apiRequest(`/aliases?${query}`, {
     signal: options.signal,

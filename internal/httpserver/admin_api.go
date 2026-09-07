@@ -1543,14 +1543,27 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 	if !ok {
 		return
 	}
+	withLatestMail := false
+	if c.Request.URL.Query().Has("with_latest_mail") {
+		parsed, parseErr := strconv.ParseBool(strings.TrimSpace(c.Query("with_latest_mail")))
+		if parseErr != nil {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "with_latest_mail 必须是布尔值")
+			return
+		}
+		withLatestMail = parsed
+	}
 	withoutLatestMail := false
-	if rawWithoutLatestMail, present := c.GetQuery("without_latest_mail"); present {
+	if rawWithoutLatestMail := c.Query("without_latest_mail"); c.Request.URL.Query().Has("without_latest_mail") {
 		parsed, parseErr := strconv.ParseBool(strings.TrimSpace(rawWithoutLatestMail))
 		if parseErr != nil {
 			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "without_latest_mail 必须是布尔值")
 			return
 		}
 		withoutLatestMail = parsed
+	}
+	if withLatestMail && withoutLatestMail {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "with_latest_mail 和 without_latest_mail 不可同时为 true")
+		return
 	}
 	query := strings.TrimSpace(c.Query("query"))
 	if len([]rune(query)) > adminAPIMaxListQueryRunes {
@@ -1584,6 +1597,7 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 		AccountID:         accountID,
 		GroupID:           groupID,
 		Ungrouped:         groupUngrouped,
+		WithLatestMail:    withLatestMail,
 		WithoutLatestMail: withoutLatestMail,
 		Query:             query,
 		Limit:             limit,

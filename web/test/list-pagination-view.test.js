@@ -87,8 +87,11 @@ test("alias paging resets on filters and supports full batched display/export", 
   assert.match(source, /placeholder="邮箱地址或用途备注"/);
   assert.match(source, /aria-label="关键词：模糊搜索隐私邮箱"/);
   assert.match(source, /v-model="selectedLatestMailFilter"/);
-  assert.match(source, /<el-option label="无最新邮件" value="none"/);
+  assert.match(source, /<el-option label="无" value="none"/);
+  assert.match(source, /<el-option label="是" value="yes"/);
+  assert.doesNotMatch(source, /label="无最新邮件"/);
   assert.match(source, /withoutLatestMail:\s*withoutLatestMailOnly/);
+  assert.equal((source.match(/withLatestMail:\s*withLatestMailOnly/g) || []).length, 2);
   assert.match(source, /function handleLatestMailFilterChange/);
   assert.match(
     source,
@@ -108,7 +111,8 @@ test("alias paging resets on filters and supports full batched display/export", 
   );
   assert.match(source, /query:\s*appliedAliasQuery\.value/);
   assert.match(source, /withoutLatestMail:\s*withoutLatestMail\.value/);
-  assert.match(source, /appliedAliasQuery \|\| appliedGroupId \|\| withoutLatestMail/);
+  assert.match(source, /withLatestMail:\s*withLatestMail\.value/);
+  assert.match(source, /appliedAliasQuery \|\| appliedGroupId \|\| selectedLatestMailFilter/);
   assert.match(source, /没有匹配的隐私邮箱/);
   assert.match(source, /:remote-method="searchAccounts"/);
   assert.match(source, /getAccountPage\(\{/);
@@ -134,6 +138,77 @@ test("alias paging resets on filters and supports full batched display/export", 
   assert.match(source, /DELETE_APPLE_ALIASES/);
   assert.match(source, /await deleteAliases\(selectedIds, auth\.state\.csrfToken\)/);
   assert.match(source, /本地记录已保留/);
+});
+
+test("latest-mail choices update both filter flags and reset cleanly", async () => {
+  const source = await readFile(aliasesPath, "utf8");
+  const filterState = source.slice(
+    source.indexOf("const withoutLatestMail = computed("),
+    source.indexOf("function isAliasConfirmationPending("),
+  );
+  const filterHandlers = source.slice(
+    source.indexOf("function handleLatestMailFilterChange("),
+    source.indexOf("function handlePageChange("),
+  );
+  const selectedLatestMailFilter = { value: "" };
+  const keywordDraft = { value: "" };
+  const appliedAliasQuery = { value: "" };
+  let reloads = 0;
+  const filters = Function(
+    "computed", "selectedLatestMailFilter", "keywordDraft", "appliedAliasQuery",
+    "reloadAliasesForFilters",
+    `
+      const selectedAccountId = { value: "" };
+      const selectedGroupFilter = { value: "" };
+      const appliedGroupId = { value: "" };
+      ${filterState}
+      ${filterHandlers}
+      return {
+        withoutLatestMail, withLatestMail, hasActiveFilters, hasAppliedFilters,
+        handleLatestMailFilterChange, resetAliasFilters,
+      };
+    `,
+  )(
+    (get) => ({ get value() { return get(); } }),
+    selectedLatestMailFilter, keywordDraft, appliedAliasQuery,
+    () => { reloads += 1; },
+  );
+
+  for (const [value, withoutMail, withMail] of [
+    ["none", true, false],
+    ["yes", false, true],
+    ["", false, false],
+    [undefined, false, false],
+  ]) {
+    filters.handleLatestMailFilterChange(value);
+    assert.equal(filters.withoutLatestMail.value, withoutMail);
+    assert.equal(filters.withLatestMail.value, withMail);
+    assert.equal(filters.hasActiveFilters.value, withoutMail || withMail);
+    assert.equal(filters.hasAppliedFilters.value, withoutMail || withMail);
+  }
+  assert.equal(reloads, 4);
+
+  filters.handleLatestMailFilterChange("yes");
+  filters.resetAliasFilters();
+  assert.equal(selectedLatestMailFilter.value, "");
+  assert.equal(filters.withLatestMail.value, false);
+  assert.equal(filters.hasAppliedFilters.value, false);
+  assert.equal(reloads, 6);
+
+  keywordDraft.value = "  campaign  ";
+  filters.handleLatestMailFilterChange("yes");
+  assert.equal(appliedAliasQuery.value, "campaign");
+});
+
+test("latest-mail request guards distinguish yes, none and all", async () => {
+  const source = await readFile(aliasesPath, "utf8");
+  assert.match(source, /const latestMailFilter = selectedLatestMailFilter\.value/);
+  assert.match(source, /const requestKey = `[^`]*\$\{latestMailFilter\}/);
+  assert.equal(
+    (source.match(/`[^`]*\$\{selectedLatestMailFilter\.value\}[^`]*`/g) || []).length,
+    3,
+    "success, error and loading-state guards must use the full filter value",
+  );
 });
 
 test("account detail aliases use the shared server-backed pagination contract", async () => {

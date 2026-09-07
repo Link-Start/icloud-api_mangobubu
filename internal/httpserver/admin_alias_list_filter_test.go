@@ -129,6 +129,79 @@ func TestAdminAPIListAliasesRejectsInvalidWithoutLatestMail(t *testing.T) {
 	}
 }
 
+func TestAdminAPIListAliasesFiltersWithLatestMail(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	cookie, csrf, _ := env.createSession(t, "with-mail-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "with-mail-filter-api@icloud.com")
+	addresses := []string{
+		"alpha-api-with-mail@icloud.com",
+		"bravo-api-empty@icloud.com",
+		"charlie-api-with-mail@icloud.com",
+	}
+	aliases := make(map[string]domain.Alias, len(addresses))
+	for _, address := range addresses {
+		alias, err := env.store.CreateAlias(context.Background(), domain.Alias{
+			AccountID: account.ID,
+			Address:   address,
+			Label:     "Campaign target",
+			Enabled:   true,
+		})
+		if err != nil {
+			t.Fatalf("create with-mail API fixture %q: %v", address, err)
+		}
+		aliases[address] = alias
+	}
+	for _, address := range []string{addresses[0], addresses[2]} {
+		adminAPITestSeedAliasArchivedMail(t, env, aliases[address],
+			time.Date(2026, 8, 24, 10, 30, 0, 0, time.UTC))
+	}
+
+	target := fmt.Sprintf("/admin/api/v1/aliases?with_latest_mail=true&account_id=%d&query=campaign&limit=1&offset=1", account.ID)
+	response := decodeAdminAPIAliasListTestEnvelope(t, env.request(
+		t, http.MethodGet, target, nil, "", []*http.Cookie{cookie}, csrf,
+	))
+	if response.Data.Pagination.Total != 2 || response.Data.Pagination.Limit != 1 ||
+		response.Data.Pagination.Offset != 1 || response.Data.Pagination.HasMore {
+		t.Fatalf("with-mail pagination = %#v", response.Data.Pagination)
+	}
+	if len(response.Data.Items) != 1 || response.Data.Items[0].Address != addresses[2] {
+		t.Fatalf("with-mail page items = %#v", response.Data.Items)
+	}
+	if response.Data.Items[0].LatestReceivedAt == nil {
+		t.Fatal("with-mail response has nil latest timestamp")
+	}
+
+	for _, query := range []string{
+		"with_latest_mail=false&account_id=" + fmt.Sprint(account.ID),
+		"account_id=" + fmt.Sprint(account.ID),
+	} {
+		all := decodeAdminAPIAliasListTestEnvelope(t, env.request(
+			t, http.MethodGet, "/admin/api/v1/aliases?limit=20&"+query, nil, "", []*http.Cookie{cookie}, csrf,
+		))
+		if all.Data.Pagination.Total != 3 || len(all.Data.Items) != 3 {
+			t.Fatalf("unfiltered with-mail query %q = %#v", query, all.Data)
+		}
+	}
+}
+
+func TestAdminAPIListAliasesRejectsInvalidOrConflictingLatestMail(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	cookie, csrf, _ := env.createSession(t, "with-mail-validation-admin", "unused-password")
+	for _, target := range []string{
+		"/admin/api/v1/aliases?with_latest_mail=",
+		"/admin/api/v1/aliases?with_latest_mail=yes",
+		"/admin/api/v1/aliases?with_latest_mail=true&without_latest_mail=true",
+	} {
+		response := env.request(t, http.MethodGet, target, nil, "", []*http.Cookie{cookie}, csrf)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("latest-mail query %q status = %d, body=%s", target, response.Code, response.Body.String())
+		}
+		if code := adminAPITestErrorCode(t, response); code != "VALIDATION_FAILED" {
+			t.Fatalf("latest-mail query %q error code = %q, want VALIDATION_FAILED", target, code)
+		}
+	}
+}
+
 func decodeAdminAPIAliasListTestEnvelope(
 	t *testing.T,
 	response *httptest.ResponseRecorder,
@@ -158,8 +231,8 @@ func adminAPITestSeedAliasArchivedMail(
 		INSERT INTO archived_messages(
 			account_id, uid_validity, upstream_uid, message_id,
 			internal_date, synced_at, created_at
-		) VALUES(?, 1, 1, '<admin-filter@example.test>', ?, ?, ?)
-		RETURNING id`, alias.AccountID, timestamp, timestamp, timestamp,
+		) VALUES(?, ?, 1, ?, ?, ?, ?)
+		RETURNING id`, alias.AccountID, alias.ID, fmt.Sprintf("<admin-filter-%s>", alias.Address), timestamp, timestamp, timestamp,
 	).Scan(&messageID); err != nil {
 		t.Fatalf("seed admin API archived message: %v", err)
 	}

@@ -192,7 +192,7 @@ test("all aliases view hides credential fields and supports single, checked, and
   assert.match(source, /copyAllAliases\(ALIAS_EXPORT_IMAP\)/);
   assert.match(
     functionBody(source, "function copyAllAliases"),
-    /getAllAliases\(selectedAccountId\.value,\s*\{[\s\S]*query:\s*appliedAliasQuery\.value[\s\S]*withoutLatestMail:\s*withoutLatestMail\.value/,
+    /getAllAliases\(selectedAccountId\.value,\s*\{[\s\S]*query:\s*appliedAliasQuery\.value[\s\S]*withoutLatestMail:\s*withoutLatestMail\.value[\s\S]*withLatestMail:\s*withLatestMail\.value/,
   );
 });
 

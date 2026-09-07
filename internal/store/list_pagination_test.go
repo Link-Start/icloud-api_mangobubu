@@ -326,6 +326,128 @@ func TestListAliasesPageFiltersWithoutLatestMailBeforePagination(t *testing.T) {
 	}
 }
 
+func TestListAliasesPageFiltersWithLatestMailBeforePagination(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	first := createAccount(t, ctx, db, "First", "first-with-mail@icloud.com")
+	second := createAccount(t, ctx, db, "Second", "second-with-mail@icloud.com")
+	group, err := db.CreateMailGroup(ctx, "Campaign")
+	if err != nil {
+		t.Fatalf("create with-mail group: %v", err)
+	}
+	fixtures := []struct {
+		accountID int64
+		address   string
+		label     string
+		groupID   *int64
+		hasMail   bool
+	}{
+		{first.ID, "alpha-empty@icloud.com", "Campaign", &group.ID, false},
+		{first.ID, "bravo-with-mail@icloud.com", "Campaign", &group.ID, true},
+		{first.ID, "charlie-with-mail@icloud.com", "Campaign", &group.ID, true},
+		{first.ID, "delta-with-mail@icloud.com", "Personal", &group.ID, true},
+		{first.ID, "echo-with-mail@icloud.com", "Campaign", nil, true},
+		{second.ID, "foxtrot-with-mail@icloud.com", "Campaign", &group.ID, true},
+	}
+	for index, fixture := range fixtures {
+		alias, err := db.CreateAlias(ctx, domain.Alias{
+			AccountID:  fixture.accountID,
+			Address:    fixture.address,
+			Label:      fixture.label,
+			GroupID:    fixture.groupID,
+			APIKeyHash: []byte(fmt.Sprintf("with-mail-hash-%d", index)),
+			Enabled:    true,
+		})
+		if err != nil {
+			t.Fatalf("create with-mail fixture %q: %v", fixture.address, err)
+		}
+		if fixture.hasMail {
+			seedAliasArchivedMail(t, ctx, db, alias, uint32(index+1),
+				time.Date(2026, 8, 24, 9, 30, 0, 0, time.UTC))
+		}
+	}
+
+	tests := []struct {
+		name      string
+		filter    store.AliasListFilter
+		wantTotal int
+		want      []string
+	}{
+		{
+			name:      "all with mail before pagination",
+			filter:    store.AliasListFilter{WithLatestMail: true, Limit: 2, Offset: 1},
+			wantTotal: 5,
+			want:      []string{"charlie-with-mail@icloud.com", "delta-with-mail@icloud.com"},
+		},
+		{
+			name: "account group and query intersect before pagination",
+			filter: store.AliasListFilter{
+				WithLatestMail: true, AccountID: &first.ID, GroupID: &group.ID,
+				Query: "CAMPAIGN", Limit: 1, Offset: 1,
+			},
+			wantTotal: 2,
+			want:      []string{"charlie-with-mail@icloud.com"},
+		},
+		{
+			name: "ungrouped with mail",
+			filter: store.AliasListFilter{
+				WithLatestMail: true, Ungrouped: true, Limit: 10,
+			},
+			wantTotal: 1,
+			want:      []string{"echo-with-mail@icloud.com"},
+		},
+		{
+			name:      "offset beyond filtered total",
+			filter:    store.AliasListFilter{WithLatestMail: true, Limit: 2, Offset: 5},
+			wantTotal: 5,
+		},
+		{
+			name: "false leaves mail presence unfiltered",
+			filter: store.AliasListFilter{
+				WithLatestMail: false, AccountID: &first.ID, GroupID: &group.ID,
+				Query: "campaign", Limit: 10,
+			},
+			wantTotal: 3,
+			want: []string{
+				"alpha-empty@icloud.com", "bravo-with-mail@icloud.com", "charlie-with-mail@icloud.com",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			page, err := db.ListAliasesPage(ctx, test.filter)
+			if err != nil {
+				t.Fatalf("list aliases with latest mail: %v", err)
+			}
+			if page.Total != test.wantTotal {
+				t.Fatalf("with-mail total = %d, want %d", page.Total, test.wantTotal)
+			}
+			assertStringsEqual(t, aliasAddresses(page.Items), test.want)
+			if test.filter.WithLatestMail {
+				for _, alias := range page.Items {
+					if alias.LatestReceivedAt == nil {
+						t.Fatalf("with-mail alias %q has nil latest timestamp", alias.Address)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestListAliasesPageRejectsConflictingLatestMailFilters(t *testing.T) {
+	t.Parallel()
+
+	// Validation must run before any database access.
+	db := &store.Store{}
+	if _, err := db.ListAliasesPage(context.Background(), store.AliasListFilter{
+		WithLatestMail: true, WithoutLatestMail: true, Limit: 10,
+	}); err == nil {
+		t.Fatal("alias page accepted conflicting latest-mail filters")
+	}
+}
+
 func TestListPagesRejectInvalidBounds(t *testing.T) {
 	t.Parallel()
 

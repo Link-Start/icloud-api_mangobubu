@@ -34,6 +34,7 @@ type AliasListFilter struct {
 	AccountID         *int64
 	GroupID           *int64
 	Ungrouped         bool
+	WithLatestMail    bool
 	WithoutLatestMail bool
 	Query             string
 	Limit             int
@@ -207,12 +208,15 @@ func (s *Store) ListAliases(ctx context.Context, accountIDs ...int64) ([]domain.
 }
 
 // ListAliasesPage returns one administrator-facing page and the total number
-// of aliases matching the optional primary-account, no-latest-mail, and
+// of aliases matching the optional primary-account, group, latest-mail, and
 // literal substring filters. Query matches alias address and label
 // case-insensitively.
 func (s *Store) ListAliasesPage(ctx context.Context, filter AliasListFilter) (AliasPage, error) {
 	if err := validateListPage(filter.Limit, filter.Offset); err != nil {
 		return AliasPage{}, fmt.Errorf("list aliases page: %w", err)
+	}
+	if filter.WithLatestMail && filter.WithoutLatestMail {
+		return AliasPage{}, errors.New("list aliases page: latest-mail filters are mutually exclusive")
 	}
 
 	var predicates []string
@@ -236,6 +240,11 @@ func (s *Store) ListAliasesPage(ctx context.Context, filter AliasListFilter) (Al
 			return AliasPage{}, errors.New("list aliases page: group ID and ungrouped filter are mutually exclusive")
 		}
 		predicates = append(predicates, `al.group_id IS NULL`)
+	}
+	if filter.WithLatestMail {
+		predicates = append(predicates, `EXISTS (
+			SELECT 1 FROM alias_messages am WHERE am.alias_id = al.id
+		)`)
 	}
 	if filter.WithoutLatestMail {
 		predicates = append(predicates, `NOT EXISTS (
