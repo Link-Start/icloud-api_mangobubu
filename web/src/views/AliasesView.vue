@@ -29,8 +29,8 @@
           v-if="selectedAliasIds.length"
           v-model="moveTargetGroupId"
           class="alias-group-bulk-select"
-          :loading="groupsLoading || movingAliases"
-          :disabled="movingAliases"
+          :loading="groupsLoading || movingAliases || deletingAliases"
+          :disabled="movingAliases || deletingAliases"
           placeholder="移动到分组"
           aria-label="将勾选的隐私邮箱移动到分组"
           @change="moveSelectedAliases"
@@ -43,6 +43,23 @@
             :value="String(group.id)"
           />
         </el-select>
+        <el-button
+          v-if="selectedAliasIds.length"
+          type="danger"
+          plain
+          :icon="Delete"
+          :loading="deletingAliases"
+          :disabled="
+            deletingAliases ||
+            movingAliases ||
+            exportingAll ||
+            rotatingAllCredentials
+          "
+          aria-label="从 Apple 永久删除勾选的隐私邮箱"
+          @click="deleteSelectedAliases"
+        >
+          从 Apple 删除（{{ selectedAliasIds.length }}）
+        </el-button>
         <el-button :icon="FolderAdd" @click="openGroupDialog()">
           管理分组
         </el-button>
@@ -556,7 +573,9 @@ import { useRouter } from "vue-router";
 
 import {
   createMailGroup,
+  deleteAliases,
   deleteMailGroup,
+  getAccount,
   getAccountPage,
   getAliasPage,
   getAllAliases,
@@ -639,6 +658,7 @@ const accountsLoading = ref(false);
 const accountsLoadError = ref(null);
 const exportingAll = ref(false);
 const rotatingAllCredentials = ref(false);
+const deletingAliases = ref(false);
 const copyLoading = reactive({});
 const copyLock = createActionLock();
 const aliasLoadGate = createLatestRequestGate();
@@ -1005,6 +1025,132 @@ function setAllAliasesSelected(selected) {
   selectedAliasIds.value = selected ? aliases.value.map((alias) => alias.id) : [];
 }
 
+function batchDeleteAccountState(detail) {
+  const account = detail?.account;
+  const mailboxType = String(account?.mailboxType || "")
+    .trim()
+    .toLowerCase();
+  const status = String(account?.lastSyncStatus || "")
+    .trim()
+    .toLowerCase();
+  const syncError = String(account?.lastSyncError || "").trim();
+  if (mailboxType !== "icloud") return "custom";
+  if (status === "error" || syncError) return "error";
+  if (detail?.appleSession?.status !== "authenticated") return "login";
+  return "ok";
+}
+
+async function deleteSelectedAliases() {
+  if (
+    deletingAliases.value ||
+    movingAliases.value ||
+    exportingAll.value ||
+    rotatingAllCredentials.value ||
+    !selectedAliasIds.value.length
+  ) {
+    return;
+  }
+
+  const selectedIds = [...selectedAliasIds.value];
+  const selected = aliases.value.filter((alias) => selectedIds.includes(alias.id));
+  if (selected.length !== selectedIds.length) {
+    clearAliasSelection();
+    showRequestError(
+      { message: "列表已发生变化，请刷新后重新选择隐私邮箱。" },
+      "批量删除未执行。",
+    );
+    return;
+  }
+  if (selected.some(isAliasConfirmationPending)) {
+    ElMessage.warning("等待 Apple 目录确认的隐私邮箱暂时不能批量删除。");
+    return;
+  }
+
+  deletingAliases.value = true;
+  liveRefresh.stop();
+  beginAliasMutation();
+  try {
+    const accountIds = [...new Set(selected.map((alias) => String(alias.accountId)))];
+    const details = await Promise.all(
+      accountIds.map((accountId) => getAccount(accountId, { limit: 1, offset: 0 })),
+    );
+    const states = details.map(batchDeleteAccountState);
+    if (states.includes("custom")) {
+      ElMessage.warning("批量删除仅支持 Apple 已登录的 iCloud 主号。");
+      return;
+    }
+    if (states.includes("error")) {
+      ElMessage.warning("所选 iCloud 主号存在同步错误，请先处理错误后再批量删除。");
+      return;
+    }
+    if (states.includes("login")) {
+      ElMessage.warning("请先让所选 iCloud 主号完成 Apple 登录，再批量删除隐私邮箱。");
+      return;
+    }
+
+    await ElMessageBox.confirm(
+      `将从 Apple 永久删除所选的 ${selected.length} 个隐私邮箱，并清除本项目中的对应记录。Apple 端删除不可恢复，继续吗？`,
+      "从 Apple 批量永久删除隐私邮箱",
+      {
+        type: "warning",
+        confirmButtonText: "继续删除",
+        cancelButtonText: "取消",
+        confirmButtonClass: "el-button--danger",
+        autofocus: false,
+      },
+    );
+    await ElMessageBox.prompt(
+      "这是 Apple 端不可恢复的操作。请输入 DELETE_APPLE_ALIASES 以确认。",
+      "最终确认批量删除",
+      {
+        type: "error",
+        inputPlaceholder: "DELETE_APPLE_ALIASES",
+        inputValidator: (value) =>
+          value === "DELETE_APPLE_ALIASES" || "请输入完整的 DELETE_APPLE_ALIASES",
+        confirmButtonText: "永久删除",
+        cancelButtonText: "取消",
+        confirmButtonClass: "el-button--danger",
+        autofocus: false,
+      },
+    );
+
+    const result = await deleteAliases(selectedIds, auth.state.csrfToken);
+    clearAliasSelection();
+    await Promise.all([
+      loadAliases(),
+      loadAccounts({ silent: true }),
+    ]);
+    const failed = Math.max(
+      Number(result?.failed) || 0,
+      Array.isArray(result?.results)
+        ? result.results.filter((item) => !item.deleted).length
+        : 0,
+    );
+    const deleted = Math.max(
+      Number(result?.deleted) || 0,
+      selected.length - failed,
+    );
+    if (failed > 0) {
+      ElMessage.warning(
+        `Apple 已永久删除 ${deleted} 个隐私邮箱，${failed} 个失败；失败邮箱的本地记录已保留，请处理错误后重试。`,
+      );
+    } else {
+      successMessage(`已从 Apple 和本项目永久删除 ${deleted} 个隐私邮箱。`);
+    }
+  } catch (error) {
+    if (confirmationCancelled(error)) return;
+    showRequestError(
+      error,
+      "批量删除未完成，本地记录已保留，请稍后重试。",
+    );
+  } finally {
+    deletingAliases.value = false;
+    if (viewActive) {
+      liveRefresh.start({ immediate: false });
+    }
+  }
+}
+
 async function copyAliases(items, format, scope) {
   const exportableItems = items.filter(isAliasExportable);
   if (!exportableItems.length) return;
@@ -1324,7 +1470,13 @@ async function removeGroup(group) {
 }
 
 async function moveSelectedAliases(groupValue) {
-  if (!selectedAliasIds.value.length || movingAliases.value) return;
+  if (
+    !selectedAliasIds.value.length ||
+    movingAliases.value ||
+    deletingAliases.value
+  ) {
+    return;
+  }
   beginAliasMutation();
   movingAliases.value = true;
   moveTargetGroupId.value = groupValue == null ? "" : String(groupValue);

@@ -87,6 +87,7 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 
 	protected.GET("/aliases", s.adminAPIListAliases)
 	protected.PATCH("/aliases/group", s.adminAPIMoveAliasesToGroup)
+	protected.DELETE("/aliases/batch", s.adminAPIDeleteAliases)
 	protected.GET("/aliases/:id", s.adminAPIGetAlias)
 	protected.POST("/aliases/:id/rotate-key", s.adminAPIRotateAliasKey)
 	protected.POST("/aliases/:id/rotate-credentials", s.adminAPIRotateAliasCredentials)

@@ -173,11 +173,6 @@ func (s *Server) apiKeyAuthWithToken(
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
-		if s.apiIPLimiter != nil && !s.apiIPLimiter.Allow(c.ClientIP()) {
-			s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
-			c.Abort()
-			return
-		}
 		token, ok := tokenFromRequest(c)
 		if !ok || !validAPIKey(token) {
 			s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
@@ -193,11 +188,6 @@ func (s *Server) apiKeyAuthWithToken(
 		if err != nil {
 			s.logger.Error("查询 API Key 绑定失败", "error", err, "request_id", requestID(c))
 			s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
-			c.Abort()
-			return
-		}
-		if s.apiLimiter != nil && !s.apiLimiter.Allow(string(binding.Alias.APIKeyHash)) {
-			s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
 			c.Abort()
 			return
 		}

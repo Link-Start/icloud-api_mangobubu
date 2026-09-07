@@ -1810,6 +1810,73 @@ func TestDeleteAliasSynchronizesAppleBeforeLocalDeletion(t *testing.T) {
 	}
 }
 
+func TestDeleteAliasesUsesAppleFirstWorkflowForEachAlias(t *testing.T) {
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "one@icloud.com", Enabled: true})
+	repo.addAlias(domain.Alias{ID: 42, AccountID: 3, Address: "two@icloud.com", Enabled: true})
+
+	var listCalls atomic.Int32
+	var events []string
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			events = append(events, "validate")
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			call := listCalls.Add(1)
+			address := "one@icloud.com"
+			remoteID := "remote-one"
+			if call == 2 {
+				address = "two@icloud.com"
+				remoteID = "remote-two"
+			}
+			events = append(events, "list:"+remoteID)
+			result := aliasDeletionDirectory()
+			result.Aliases = []apple.Alias{{
+				AnonymousID: remoteID, HME: address,
+				ForwardToEmail: "primary@icloud.com", IsActive: true,
+			}}
+			return result, session, nil
+		},
+		deactivate: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+			events = append(events, "deactivate:"+anonymousID)
+			return session, nil
+		},
+		deleteRemote: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+			events = append(events, "delete:"+anonymousID)
+			return session, nil
+		},
+	}
+	repo.deleteAliasFn = func(_ context.Context, id int64) error {
+		events = append(events, fmt.Sprintf("local:%d", id))
+		return nil
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{
+		AppleID: "owner@example.com", Region: apple.RegionGlobal, SessionToken: "initial-session",
+	})
+
+	outcomes, err := service.DeleteAliases(context.Background(), []int64{41, 42})
+	if err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+	if len(outcomes) != 2 || outcomes[0].AliasID != 41 || outcomes[1].AliasID != 42 ||
+		outcomes[0].Err != nil || outcomes[1].Err != nil {
+		t.Fatalf("batch outcomes = %#v", outcomes)
+	}
+	if repo.hasAlias(41) || repo.hasAlias(42) || repo.aliasDeletes.Load() != 2 {
+		t.Fatalf("local aliases after batch: one=%v two=%v deletes=%d", repo.hasAlias(41), repo.hasAlias(42), repo.aliasDeletes.Load())
+	}
+	if client.deactivateCalls.Load() != 2 || client.deleteCalls.Load() != 2 {
+		t.Fatalf("Apple calls: deactivate=%d delete=%d", client.deactivateCalls.Load(), client.deleteCalls.Load())
+	}
+	wantEvents := "validate,list:remote-one,deactivate:remote-one,delete:remote-one,local:41,validate,list:remote-two,deactivate:remote-two,delete:remote-two,local:42"
+	if got := strings.Join(events, ","); got != wantEvents {
+		t.Fatalf("batch operation order = %q, want %q", got, wantEvents)
+	}
+}
+
 func TestDeleteAliasRejectsPendingConfirmationBeforeApple(t *testing.T) {
 	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)

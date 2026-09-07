@@ -62,6 +62,14 @@ type AliasDeletionRepository interface {
 	DeleteAlias(context.Context, int64) error
 }
 
+// AliasDeletionOutcome records one item in a batch deletion. Err is kept as a
+// typed error for the management API to classify without exposing upstream
+// details to the caller.
+type AliasDeletionOutcome struct {
+	AliasID int64
+	Err     error
+}
+
 type SessionCipher interface {
 	EncryptAppleSession(string) (string, error)
 	DecryptAppleSession(string) (string, error)

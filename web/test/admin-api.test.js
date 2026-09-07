@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createMailGroup,
   deleteAlias,
+  deleteAliases,
   deleteMailGroup,
   deleteAppleSession,
   getAutoCreateLogRun,
@@ -432,6 +433,59 @@ test("alias deletion sends an authenticated DELETE without a request body", asyn
   assert.equal(request.options.method, "DELETE");
   assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
   assert.equal(request.options.body, undefined);
+});
+
+test("batch alias deletion sends IDs and normalizes per-item Apple results", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      requested: 2,
+      deleted: 1,
+      failed: 1,
+      results: [
+        { id: 91, address: "removed@icloud.com", deleted: true },
+        {
+          id: 92,
+          address: "retained@icloud.com",
+          deleted: false,
+          code: "APPLE_RATE_LIMITED",
+          message: "Apple 请求过于频繁；本地记录已保留，可稍后重试",
+          local_retained: true,
+        },
+      ],
+    });
+  };
+
+  const result = await deleteAliases([91, 92], "csrf-token");
+
+  assert.equal(request.url, "/admin/api/v1/aliases/batch");
+  assert.equal(request.options.method, "DELETE");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.deepEqual(JSON.parse(request.options.body), { alias_ids: [91, 92] });
+  assert.deepEqual(result, {
+    requested: 2,
+    deleted: 1,
+    failed: 1,
+    results: [
+      {
+        id: 91,
+        address: "removed@icloud.com",
+        deleted: true,
+        code: "",
+        message: "",
+        localRetained: false,
+      },
+      {
+        id: 92,
+        address: "retained@icloud.com",
+        deleted: false,
+        code: "APPLE_RATE_LIMITED",
+        message: "Apple 请求过于频繁；本地记录已保留，可稍后重试",
+        localRetained: true,
+      },
+    ],
+  });
 });
 
 test("v2 alias rotation uses the complete bundle endpoint", async () => {

@@ -127,6 +127,13 @@ test("alias paging resets on filters and supports full batched display/export", 
   );
   assert.match(source, /<ListPagination/);
   assert.match(source, /@size-change="handlePageSizeChange"/);
+  assert.match(source, /从 Apple 删除/);
+  assert.match(source, /async function deleteSelectedAliases/);
+  assert.match(source, /getAccount\(accountId, \{ limit: 1, offset: 0 \}\)/);
+  assert.match(source, /Apple 已登录的 iCloud 主号/);
+  assert.match(source, /DELETE_APPLE_ALIASES/);
+  assert.match(source, /await deleteAliases\(selectedIds, auth\.state\.csrfToken\)/);
+  assert.match(source, /本地记录已保留/);
 });
 
 test("account detail aliases use the shared server-backed pagination contract", async () => {

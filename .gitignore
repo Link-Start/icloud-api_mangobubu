@@ -12,6 +12,7 @@
 /.env.*
 !/.env.example
 /.cache/
+/.codex-tmp/
 /.gocache-review/
 /.review-cache/
 /.tmp-gocache*/

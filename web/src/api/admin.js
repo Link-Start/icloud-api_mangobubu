@@ -1010,6 +1010,42 @@ export function deleteAlias(id, csrfToken) {
   });
 }
 
+export async function deleteAliases(ids, csrfToken) {
+  const data = await apiRequest("/aliases/batch", {
+    method: "DELETE",
+    body: { alias_ids: ids },
+    csrfToken,
+  });
+  const rawResults = listFrom(data, "results", "items");
+  return {
+    requested: integerAtLeast(
+      firstDefined(data, "requested", "Requested"),
+      0,
+      ids.length,
+    ),
+    deleted: integerAtLeast(
+      firstDefined(data, "deleted", "Deleted"),
+      0,
+      0,
+    ),
+    failed: integerAtLeast(
+      firstDefined(data, "failed", "Failed"),
+      0,
+      0,
+    ),
+    results: rawResults.map((raw) => ({
+      id: firstDefined(raw, "id", "ID"),
+      address: firstDefined(raw, "address", "Address") || "",
+      deleted: Boolean(firstDefined(raw, "deleted", "Deleted")),
+      code: firstDefined(raw, "code", "Code") || "",
+      message: firstDefined(raw, "message", "Message") || "",
+      localRetained: Boolean(
+        firstDefined(raw, "local_retained", "localRetained", "LocalRetained"),
+      ),
+    })),
+  };
+}
+
 export async function getAuditLogs(options = {}) {
   const query = listQuery(options);
   const data = await apiRequest(`/audit?${query}`, {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -18,12 +19,13 @@ import (
 )
 
 type fakeHMESyncService struct {
-	startAuth   func(context.Context, int64, int64, string, string, apple.Region) (hmesync.AuthResult, error)
-	verifyAuth  func(context.Context, int64, int64, string, string) (hmesync.AuthResult, error)
-	getSession  func(context.Context, int64) (hmesync.SessionInfo, error)
-	clearAuth   func(context.Context, int64) error
-	syncAliases func(context.Context, int64) (hmesync.SyncResult, error)
-	deleteAlias func(context.Context, int64) error
+	startAuth     func(context.Context, int64, int64, string, string, apple.Region) (hmesync.AuthResult, error)
+	verifyAuth    func(context.Context, int64, int64, string, string) (hmesync.AuthResult, error)
+	getSession    func(context.Context, int64) (hmesync.SessionInfo, error)
+	clearAuth     func(context.Context, int64) error
+	syncAliases   func(context.Context, int64) (hmesync.SyncResult, error)
+	deleteAlias   func(context.Context, int64) error
+	deleteAliases func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error)
 }
 
 func (f *fakeHMESyncService) StartAuth(
@@ -75,6 +77,13 @@ func (f *fakeHMESyncService) DeleteAlias(ctx context.Context, aliasID int64) err
 		return errors.New("unexpected DeleteAlias call")
 	}
 	return f.deleteAlias(ctx, aliasID)
+}
+
+func (f *fakeHMESyncService) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]hmesync.AliasDeletionOutcome, error) {
+	if f.deleteAliases == nil {
+		return nil, errors.New("unexpected DeleteAliases call")
+	}
+	return f.deleteAliases(ctx, aliasIDs)
 }
 
 func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
@@ -290,6 +299,206 @@ func TestAdminAPIDeleteAliasUsesAppleServiceAndAuditsSuccess(t *testing.T) {
 		t.Fatalf("deleted alias lookup error = %v, want not found", err)
 	}
 	assertAdminAliasDeleteAudit(t, env.store, alias.ID, "success", "")
+}
+
+func TestAdminAPIBatchDeleteAliasesUsesAppleServiceAndAuditsEachSuccess(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-delete-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-success@icloud.com")
+	first := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-first@icloud.com")
+	second := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-second@icloud.com")
+
+	deleteCalls := 0
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
+		},
+		deleteAliases: func(ctx context.Context, aliasIDs []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalls++
+			if !reflect.DeepEqual(aliasIDs, []int64{first.ID, second.ID}) {
+				t.Fatalf("batch delete IDs = %#v", aliasIDs)
+			}
+			for _, aliasID := range aliasIDs {
+				if err := env.store.DeleteAlias(ctx, aliasID); err != nil {
+					return nil, err
+				}
+			}
+			return []hmesync.AliasDeletionOutcome{
+				{AliasID: first.ID},
+				{AliasID: second.ID},
+			}, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{first.ID, second.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusOK || deleteCalls != 1 {
+		t.Fatalf("batch delete response = %d; calls=%d; body=%s", response.Code, deleteCalls, response.Body.String())
+	}
+	var payload struct {
+		Data adminAPIAliasBatchDeleteDTO `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode batch delete response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Data.Requested != 2 || payload.Data.Deleted != 2 || payload.Data.Failed != 0 ||
+		len(payload.Data.Results) != 2 || !payload.Data.Results[0].Deleted || !payload.Data.Results[1].Deleted {
+		t.Fatalf("batch delete payload = %#v", payload.Data)
+	}
+	for _, alias := range []domain.Alias{first, second} {
+		if _, err := env.store.GetAlias(context.Background(), alias.ID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("batch deleted alias %d lookup error = %v", alias.ID, err)
+		}
+		assertAdminAliasDeleteAudit(t, env.store, alias.ID, "success", "batch")
+	}
+}
+
+func TestAdminAPIBatchDeleteAliasesReturnsPartialAppleFailures(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-partial-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-partial@icloud.com")
+	deleted := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-removed@icloud.com")
+	failed := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-retained@icloud.com")
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
+		},
+		deleteAliases: func(ctx context.Context, aliasIDs []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			if err := env.store.DeleteAlias(ctx, deleted.ID); err != nil {
+				return nil, err
+			}
+			return []hmesync.AliasDeletionOutcome{
+				{AliasID: deleted.ID},
+				{AliasID: failed.ID, Err: hmesync.ErrRateLimited},
+			}, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{deleted.ID, failed.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusOK {
+		t.Fatalf("partial batch delete response = %d; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data adminAPIAliasBatchDeleteDTO `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode partial batch delete response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Data.Deleted != 1 || payload.Data.Failed != 1 || len(payload.Data.Results) != 2 ||
+		payload.Data.Results[1].Deleted || payload.Data.Results[1].Code != hmesync.CodeRateLimited ||
+		!payload.Data.Results[1].LocalRetained || !strings.Contains(payload.Data.Results[1].Message, "本地记录已保留") {
+		t.Fatalf("partial batch delete payload = %#v", payload.Data)
+	}
+	if _, err := env.store.GetAlias(context.Background(), deleted.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("successfully deleted alias remains: %v", err)
+	}
+	if _, err := env.store.GetAlias(context.Background(), failed.ID); err != nil {
+		t.Fatalf("failed alias was removed: %v", err)
+	}
+	assertAdminAliasDeleteAudit(t, env.store, failed.ID, "failed", hmesync.CodeRateLimited)
+}
+
+func TestAdminAPIBatchDeleteAliasesRequiresHealthyAppleSession(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-login-required-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-login-required@icloud.com")
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-login-required-alias@icloud.com")
+	deleteCalled := false
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalled = true
+			return nil, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{alias.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != hmesync.CodeLoginRequired || deleteCalled {
+		t.Fatalf("batch delete without Apple login = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("preflight failure removed local alias: %v", err)
+	}
+}
+
+func TestAdminAPIBatchDeleteAliasesRejectsCustomMailbox(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-custom-admin", "unused-password")
+	encrypted, err := env.cipher.Encrypt("app-specific-password")
+	if err != nil {
+		t.Fatalf("encrypt custom account password: %v", err)
+	}
+	account, err := env.store.CreateAccount(context.Background(), domain.Account{
+		Name:               "Custom batch delete",
+		Email:              "custom-batch@identity.invalid",
+		MailboxType:        domain.MailboxTypeCustom,
+		EmailSuffix:        "example.test",
+		IMAPHost:           "imap.example.test",
+		IMAPPort:           993,
+		IMAPUsername:       "custom-batch@example.test",
+		PasswordCiphertext: encrypted,
+		Enabled:            true,
+	})
+	if err != nil {
+		t.Fatalf("create custom batch account: %v", err)
+	}
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "custom-alias@example.test")
+	deleteCalled := false
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			t.Fatal("custom mailbox reached Apple session preflight")
+			return hmesync.SessionInfo{}, nil
+		},
+		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalled = true
+			return nil, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{alias.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "CUSTOM_MAILBOX_NO_APPLE" || deleteCalled {
+		t.Fatalf("custom batch delete = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("custom preflight removed local alias: %v", err)
+	}
+}
+
+func TestAdminAPIBatchDeleteAliasesRejectsSyncError(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-sync-error-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-sync-error@icloud.com")
+	if err := env.store.UpdateAccountSyncStatus(context.Background(), account.ID, domain.SyncStatusError, "sync failed", nil); err != nil {
+		t.Fatalf("set sync error: %v", err)
+	}
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-sync-error-alias@icloud.com")
+	deleteCalled := false
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			t.Fatal("sync-error account reached Apple session preflight")
+			return hmesync.SessionInfo{}, nil
+		},
+		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalled = true
+			return nil, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{alias.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "BATCH_DELETE_NOT_ELIGIBLE" || deleteCalled {
+		t.Fatalf("sync-error batch delete = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("sync-error preflight removed local alias: %v", err)
+	}
 }
 
 func TestAdminAPIDeleteAliasAppleFailuresKeepLocalRecord(t *testing.T) {

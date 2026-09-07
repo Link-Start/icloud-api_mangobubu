@@ -26,6 +26,13 @@ type HMESyncService interface {
 	DeleteAlias(context.Context, int64) error
 }
 
+// HMEBatchDeletionService is optional so existing embedders that implement
+// HMESyncService remain source-compatible. The production HME service
+// implements it and reports each item's result independently.
+type HMEBatchDeletionService interface {
+	DeleteAliases(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error)
+}
+
 type adminAPIAppleAuthRequest struct {
 	AppleID  string `json:"apple_id"`
 	Password string `json:"password"`

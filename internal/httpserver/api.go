@@ -24,10 +24,6 @@ type otpResponse struct {
 // form consumes a code or changes upstream/local message flags.
 func (s *Server) otpHistory(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	if !s.apiIPLimiter.Allow(c.ClientIP()) {
-		s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
-		return
-	}
 	binding, ok := s.authenticateOTPRequest(c)
 	if !ok {
 		return
@@ -38,10 +34,6 @@ func (s *Server) otpHistory(c *gin.Context) {
 	if binding.Alias.CredentialMode != domain.AliasCredentialModeV2 ||
 		!binding.Alias.Enabled || !binding.Account.Enabled {
 		s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
-		return
-	}
-	if !s.apiLimiter.Allow(string(binding.Alias.APIKeyHash)) {
-		s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
 		return
 	}
 	now := time.Now().UTC()

@@ -472,6 +472,35 @@ func (s *Service) DeleteAlias(ctx context.Context, aliasID int64) error {
 	return s.locker.WithAccountLock(ctx, initial.AccountID, operation)
 }
 
+// DeleteAliases applies the same Apple-first deletion workflow to each alias
+// in order. The caller can inspect every outcome, so a transient Apple failure
+// does not make already completed deletions look unsuccessful.
+func (s *Service) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]AliasDeletionOutcome, error) {
+	if len(aliasIDs) == 0 {
+		return nil, errors.New("at least one alias ID is required")
+	}
+
+	outcomes := make([]AliasDeletionOutcome, 0, len(aliasIDs))
+	seen := make(map[int64]struct{}, len(aliasIDs))
+	for _, aliasID := range aliasIDs {
+		outcome := AliasDeletionOutcome{AliasID: aliasID}
+		if aliasID < 1 {
+			outcome.Err = errors.New("alias ID must be positive")
+		} else if _, exists := seen[aliasID]; exists {
+			outcome.Err = errors.New("duplicate alias ID")
+		} else {
+			seen[aliasID] = struct{}{}
+			if err := ctx.Err(); err != nil {
+				outcome.Err = err
+			} else {
+				outcome.Err = s.DeleteAlias(ctx, aliasID)
+			}
+		}
+		outcomes = append(outcomes, outcome)
+	}
+	return outcomes, nil
+}
+
 func (s *Service) deleteAliasLocked(
 	ctx context.Context,
 	deleteRepo AliasDeletionRepository,

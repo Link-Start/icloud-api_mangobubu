@@ -761,6 +761,75 @@ paths:
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
+  /api/v1/aliases/batch:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
+    delete:
+      tags: [Administration]
+      operationId: deleteAliasesFromApple
+      summary: 从 Apple 批量永久删除隐私邮箱
+      description: |
+        仅接受已经完成 Apple 登录、邮箱模式为 `icloud` 且主号没有同步错误的隐私邮箱。
+        服务会先检查本次请求中的全部邮箱和主号，在第一项远端变更前完成资格校验；随后对每个
+        邮箱调用 Apple 的停用（必要时）和永久删除流程。只有 Apple 端确认该地址已经删除后，
+        才删除本地记录。返回结果按邮箱逐项报告；某一项失败时其本地记录保留，已成功删除的
+        其他项目不会回滚。等待 Apple 目录确认的邮箱和自定义邮箱不能使用此接口。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminDeleteAliasesRequest"
+            example:
+              alias_ids: [101, 102, 103]
+      responses:
+        "200":
+          description: Apple 删除结果及本地记录处理结果
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAliasBatchDeleteResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAliasOrMailGroupNotFound"
+        "409":
+          $ref: "#/components/responses/AdminBatchAliasDeleteConflict"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "429":
+          $ref: "#/components/responses/AdminRateLimited"
+        "502":
+          description: Apple 远端服务异常；本地记录保留
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "503":
+          $ref: "#/components/responses/AdminInternalError"
+
   /api/v1/aliases/{id}/group:
     servers:
       - url: https://HOST/{admin_path}
@@ -1485,6 +1554,7 @@ components:
             - ALIAS_LIMIT_REACHED
             - CUSTOM_MAILBOX_NO_APPLE
             - CUSTOM_MAILBOX_REQUIRED
+            - BATCH_DELETE_NOT_ELIGIBLE
             - SYNC_FAILED
             - INTERNAL_ERROR
           description: |
@@ -2136,6 +2206,71 @@ components:
       properties:
         data:
           $ref: "#/components/schemas/AdminAlias"
+    AdminDeleteAliasesRequest:
+      type: object
+      additionalProperties: false
+      required: [alias_ids]
+      properties:
+        alias_ids:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          uniqueItems: true
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+          description: 需要从 Apple 永久删除的本地隐私邮箱 ID。
+    AdminAliasBatchDeleteResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAliasBatchDelete"
+    AdminAliasBatchDelete:
+      type: object
+      additionalProperties: false
+      required: [requested, deleted, failed, results]
+      properties:
+        requested:
+          type: integer
+          minimum: 1
+        deleted:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        results:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/AdminAliasBatchDeleteItem"
+    AdminAliasBatchDeleteItem:
+      type: object
+      additionalProperties: false
+      required: [id, address, deleted]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        address:
+          type: string
+          format: email
+        deleted:
+          type: boolean
+          description: Apple 端删除成功且本地记录已清理。
+        code:
+          type: string
+          description: 失败时的稳定错误码。
+        message:
+          type: string
+          description: 失败时的可展示错误；失败项的本地记录会保留。
+        local_retained:
+          type: boolean
+          description: Apple 删除未确认成功，因此本地记录仍保留。
     AdminAlias:
       type: object
       additionalProperties: true
@@ -2592,6 +2727,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminBatchAliasDeleteConflict:
+      description: |
+        批量删除的邮箱不满足 Apple 删除条件，例如主号尚未完成 Apple 登录、存在同步错误、
+        使用自定义邮箱模式，或邮箱仍在等待 Apple 目录确认。
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
     AdminCredentialsChanged:
       description: 全量轮换提交前发现管理员凭据版本已并发变化（`CREDENTIALS_CHANGED`）；轮换事务回滚并清除当前浏览器的管理 Session Cookie，调用方必须重新登录。
       content:
