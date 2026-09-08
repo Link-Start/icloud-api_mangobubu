@@ -10,6 +10,7 @@ import {
   MAX_PAGE_SIZE,
 } from "../utils/pagination.js";
 import { normalizeIMAPEndpoint } from "../utils/imap.js";
+import { ALIAS_DELETION_OPERATION_LABELS } from "../utils/aliasDeletionJob.js";
 
 function firstDefined(object, ...keys) {
   for (const key of keys) {
@@ -1047,6 +1048,37 @@ export async function deleteAliases(ids, csrfToken) {
   };
 }
 
+function normalizeAliasDeletionWait(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const accountId = firstDefined(raw, "account_id", "accountId", "AccountID");
+  const aliasId = firstDefined(raw, "alias_id", "aliasId", "AliasID");
+  const operation = firstDefined(raw, "operation", "Operation");
+  const retryAt = firstDefined(raw, "retry_at", "retryAt", "RetryAt");
+  const attempt = firstDefined(raw, "attempt", "Attempt");
+  const maxAttempts = firstDefined(raw, "max_attempts", "maxAttempts", "MaxAttempts");
+  if (![accountId, aliasId].every((id) => Number.isSafeInteger(id) && id >= 0) ||
+      (accountId === 0 && aliasId === 0) ||
+      typeof operation !== "string" || !Object.hasOwn(ALIAS_DELETION_OPERATION_LABELS, operation) ||
+      typeof retryAt !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(retryAt) ||
+      !Number.isFinite(Date.parse(retryAt)) ||
+      !Number.isSafeInteger(attempt) || attempt < 1 || attempt > 3 || maxAttempts !== 3) {
+    return null;
+  }
+
+  // Optional metadata is allowlisted; never carry upstream bodies into the view.
+  const wait = { accountId, aliasId, operation, retryAt, attempt, maxAttempts };
+  const httpStatus = firstDefined(raw, "http_status", "httpStatus", "HTTPStatus");
+  const serviceCode = firstDefined(raw, "service_code", "serviceCode", "ServiceCode");
+  if (Number.isSafeInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) {
+    wait.httpStatus = httpStatus;
+  }
+  if (typeof serviceCode === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(serviceCode)) {
+    wait.serviceCode = serviceCode;
+  }
+  return wait;
+}
+
 export function normalizeAliasDeletionJob(raw) {
   if (raw === null) return null;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -1061,13 +1093,18 @@ export function normalizeAliasDeletionJob(raw) {
     const value = firstDefined(job, ...keys);
     return Number.isSafeInteger(value) && value >= 0 ? value : null;
   };
+  const failed = count("failed", "Failed");
+  const deferred = count("deferred", "Deferred");
+  const waits = firstDefined(job, "waits", "Waits");
   return {
     jobId: firstDefined(job, "job_id", "jobId", "JobID") || "",
     status: firstDefined(job, "status", "Status") || "",
     requested: count("requested", "Requested"),
     processed: count("processed", "Processed"),
     deleted: count("deleted", "Deleted"),
-    failed: count("failed", "Failed"),
+    failed,
+    deferred: deferred !== null && failed !== null && deferred <= failed ? deferred : 0,
+    waits: Array.isArray(waits) ? waits.map(normalizeAliasDeletionWait).filter(Boolean) : [],
     results: rawResults.map((rawResult) => ({
       id: firstDefined(rawResult, "id", "ID"),
       address: firstDefined(rawResult, "address", "Address") || "",

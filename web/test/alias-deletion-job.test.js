@@ -2,11 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  getAliasDeletionJob,
+  getLatestAliasDeletionJob,
+  startAliasDeletionJob,
+} from "../src/api/admin.js";
+import {
   ALIAS_DELETION_POLL_INTERVAL_MS,
   ALIAS_DELETION_REQUEST_TIMEOUT_MS,
   createAliasDeletionController,
   createAliasDeletionOperationId,
   createAliasDeletionStorage,
+  formatAliasDeletionResultMessage,
   isAliasDeletionJobActive,
   isAliasDeletionJobTerminal,
 } from "../src/utils/aliasDeletionJob.js";
@@ -173,6 +179,111 @@ test("two-second polling is serial, deduplicates manual refresh, and keeps backe
   assert.equal(controller.getState().job.deleted, 0);
   assert.deepEqual(timers.delays(), [2_000]);
   controller.stop();
+});
+
+test("rate-limit waits resume the original job with zero outcomes and never send another DELETE", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const raw = {
+    job_id: operationId, status: "running", requested: 2, processed: 0,
+    deleted: 0, failed: 0, results: [],
+  };
+  const snapshots = [
+    ...[1, 2, 3].map((attempt) => ({ ...raw, waits: [{
+      account_id: 12, alias_id: 91, operation: "delete", attempt, max_attempts: 3,
+      retry_at: `2026-09-08T01:0${attempt}:00Z`, http_status: 429,
+    }] })),
+    new Error("offline"),
+    { ...raw, waits: [null, { operation: "<script>secret</script>" }], deferred: "secret" },
+    { ...raw },
+    { ...raw, processed: 1, deleted: 1, results: [{ id: 91, deleted: true }] },
+    { ...raw, status: "completed", processed: 2, deleted: 1, failed: 1, deferred: 1,
+      results: [{ id: 91, deleted: true }, { id: 92, deleted: false, code: "APPLE_BATCH_DEFERRED", local_retained: true }] },
+  ];
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    const snapshot = url.endsWith("/latest") ? null
+      : options.method === "DELETE" ? { ...raw, status: "queued" } : snapshots.shift();
+    if (snapshot instanceof Error) throw snapshot;
+    return new Response(JSON.stringify({ data: snapshot }), {
+      status: options.method === "DELETE" ? 202 : 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  const { controller, timers, storage, changes } = harness({
+    startJob: startAliasDeletionJob, getJob: getAliasDeletionJob, getLatestJob: getLatestAliasDeletionJob,
+  });
+  t.after(() => controller.stop());
+  await controller.start();
+  await controller.submit([91, 92], "csrf");
+  for (let index = 0; index < 8; index += 1) {
+    const previous = controller.getState().job;
+    assert.equal(timers.fireNext(), 2_000);
+    await controller.refresh();
+    const state = controller.getState();
+    assert.equal(state.job.jobId, operationId);
+    if (index < 6) {
+      assert.deepEqual([state.job.processed, state.job.deleted, state.job.failed, state.job.deferred], [0, 0, 0, 0]);
+      assert.equal(isAliasDeletionJobTerminal(state.job), false);
+    }
+    if (index < 3) assert.equal(state.job.waits[0].attempt, index + 1);
+    if (index === 3) {
+      assert.equal(state.uncertain, true);
+      assert.equal(state.job, previous);
+    } else {
+      assert.equal(state.uncertain, false);
+    }
+    if (index >= 4) assert.deepEqual(state.job.waits, []);
+    if (index < 7) {
+      assert.equal(state.blocked, true);
+      assert.equal(await controller.submit([91, 92], "csrf"), false);
+      assert.deepEqual(storage.read(), { operationId });
+      assert.deepEqual(timers.delays(), [2_000]);
+    }
+  }
+  assert.deepEqual([controller.getState().job.processed, controller.getState().job.failed, controller.getState().job.deferred], [2, 1, 1]);
+  assert.equal(controller.getState().blocked, false);
+  assert.equal(storage.read(), null);
+  assert.deepEqual(timers.delays(), []);
+  assert.equal(requests.filter(({ options }) => options.method === "DELETE").length, 1);
+  assert.equal(requests.filter(({ url }) => url.endsWith("/latest")).length, 1);
+  for (const { url, options } of requests.slice(2)) {
+    assert.equal(url, `/admin/api/v1/aliases/batch/jobs/${operationId}`);
+    assert.equal(options.method, "GET");
+    assert.equal(options.body, undefined);
+  }
+  assert.ok(changes.filter(({ job: snapshot }) => snapshot?.waits.length).every(({ job: snapshot }) =>
+    snapshot.processed === 0 && snapshot.failed === 0 && !isAliasDeletionJobTerminal(snapshot)));
+});
+
+test("result messages deduplicate retention notices and distinguish deferred and unknown outcomes", () => {
+  const rateLimited = { deleted: false, code: "APPLE_RATE_LIMITED", localRetained: true };
+  for (const message of [
+    "Apple 限流", "Apple 限流；本地记录已保留", "Apple 限流，本地记录已保留。",
+    "Apple 限流；本地记录已保留；本地记录已保留",
+  ]) {
+    const formatted = formatAliasDeletionResultMessage({ ...rateLimited, message });
+    assert.equal(formatted.match(/本地记录已保留/g).length, 1);
+    assert.match(formatted, /Apple 限流/);
+  }
+  const completeMessage = "Apple 请求受限，本地记录已保留。请稍后核对。";
+  assert.equal(formatAliasDeletionResultMessage({ ...rateLimited, message: completeMessage }), completeMessage);
+  for (const message of [undefined, "主号持续限流", "未执行；本地记录已保留"]) {
+    const formatted = formatAliasDeletionResultMessage({ ...rateLimited, code: "APPLE_BATCH_DEFERRED", message });
+    assert.match(formatted, /^未执行/);
+    assert.doesNotMatch(formatted, /失败|APPLE_BATCH_DEFERRED/);
+    assert.equal(formatted.match(/本地记录已保留/g).length, 1);
+  }
+  for (const result of [null, {}, { code: "UNKNOWN" }, { code: "UNKNOWN", message: { raw_body: "secret" } }]) {
+    assert.equal(formatAliasDeletionResultMessage(result), "删除结果待确认；Apple / 本地状态待核对");
+  }
+  for (const localRetained of [false, undefined, "true"]) {
+    assert.equal(formatAliasDeletionResultMessage({ ...rateLimited, localRetained, message: "Apple 限流；本地记录已保留" }),
+      "Apple 限流；Apple / 本地状态待核对");
+  }
+  assert.equal(formatAliasDeletionResultMessage({ message: "Apple / 本地状态待核对" }), "Apple / 本地状态待核对");
+  assert.equal(formatAliasDeletionResultMessage({ deleted: true, message: "本地记录已保留" }), "已删除");
 });
 
 test("lost submit responses query operationId even when latest has an unrelated completed job", async () => {

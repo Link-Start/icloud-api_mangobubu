@@ -259,6 +259,7 @@ func (c *Client) VerifyCode(ctx context.Context, session Session, code string) (
 			StatusCode:  response.status,
 			ServiceCode: responseServiceCode(response.body),
 			Retryable:   response.status == http.StatusTooManyRequests || response.status >= 500,
+			RetryAfter:  parseRetryAfter(response.header.Get("Retry-After"), time.Now()),
 		}
 	}
 	if err := op.trust(ctx); err != nil {
@@ -330,37 +331,37 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 		Result  json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(response.body, &envelope); err != nil {
-		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, err)
+		return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, err)
 	}
 	if !envelope.Success {
 		return list, result, responseError("list Hide My Email aliases", ErrService, response)
 	}
 	if containsPaginationMarker(response.body) || containsPaginationMarker(envelope.Result) {
-		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, errors.New("unexpected pagination marker"))
+		return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, errors.New("unexpected pagination marker"))
 	}
 	var resultFields map[string]json.RawMessage
 	if err := json.Unmarshal(envelope.Result, &resultFields); err != nil {
-		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, err)
+		return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, err)
 	}
 	rawAliases, present := resultFields["hmeEmails"]
 	trimmedAliases := bytes.TrimSpace(rawAliases)
 	if !present || len(trimmedAliases) == 0 || trimmedAliases[0] != '[' {
-		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, errors.New("hmeEmails must be an array"))
+		return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, errors.New("hmeEmails must be an array"))
 	}
 	var rawAliasEntries []json.RawMessage
 	if err := json.Unmarshal(rawAliases, &rawAliasEntries); err != nil {
-		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, errors.New("hmeEmails must be an array"))
+		return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, errors.New("hmeEmails must be an array"))
 	}
 	if err := validateListCounts(response.body, len(rawAliasEntries)); err != nil {
-		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, err)
+		return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, err)
 	}
 	for index, rawAlias := range rawAliasEntries {
 		if err := validateAliasFields(rawAlias); err != nil {
-			return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, fmt.Errorf("hmeEmails[%d]: %w", index, err))
+			return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, fmt.Errorf("hmeEmails[%d]: %w", index, err))
 		}
 	}
 	if err := json.Unmarshal(envelope.Result, &list); err != nil {
-		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, err)
+		return list, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, err)
 	}
 	if list.Aliases == nil {
 		list.Aliases = []Alias{}
@@ -370,16 +371,16 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 	for _, alias := range list.Aliases {
 		address := strings.ToLower(strings.TrimSpace(alias.HME))
 		if address == "" {
-			return ListResult{}, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, errors.New("empty alias address"))
+			return ListResult{}, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, errors.New("empty alias address"))
 		}
 		if _, duplicate := seen[address]; duplicate {
-			return ListResult{}, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, errors.New("duplicate alias address"))
+			return ListResult{}, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, errors.New("duplicate alias address"))
 		}
 		seen[address] = struct{}{}
 		anonymousID := strings.ToLower(strings.TrimSpace(alias.AnonymousID))
 		if anonymousID != "" {
 			if _, duplicate := seenAnonymousIDs[anonymousID]; duplicate {
-				return ListResult{}, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, errors.New("duplicate anonymous ID"))
+				return ListResult{}, result, response.operationError("decode Hide My Email list", ErrInvalidResponse, errors.New("duplicate anonymous ID"))
 			}
 			seenAnonymousIDs[anonymousID] = struct{}{}
 		}
@@ -521,7 +522,7 @@ func (c *Client) CreateAlias(ctx context.Context, session Session, label, note s
 	}
 	candidate, err := decodeGeneratedHME(generatedResult)
 	if err != nil {
-		return created, result, operationError("decode generated Hide My Email alias", ErrInvalidResponse, response.status, err)
+		return created, result, response.operationError("decode generated Hide My Email alias", ErrInvalidResponse, err)
 	}
 
 	reserveURL, err := c.premiumMailSettingsRequestURL(result, "/v1/hme/reserve")
@@ -553,7 +554,7 @@ func (c *Client) CreateAlias(ctx context.Context, session Session, label, note s
 	}
 	created, err = decodeReservedAlias(reservedResult, candidate)
 	if err != nil {
-		err = operationError("decode reserved Hide My Email alias", ErrInvalidResponse, response.status, err)
+		err = response.operationError("decode reserved Hide My Email alias", ErrInvalidResponse, err)
 		return reserveCandidate(candidate, label, note), result, nonRetryableAppleError(err)
 	}
 	return created, result, nil
@@ -615,17 +616,17 @@ func decodeHMEResult(operation string, response responseData) (json.RawMessage, 
 		Result  json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(response.body, &envelope); err != nil {
-		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, err)
+		return nil, response.operationError("decode "+operation, ErrInvalidResponse, err)
 	}
 	if envelope.Success == nil {
-		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, errors.New("success must be a boolean"))
+		return nil, response.operationError("decode "+operation, ErrInvalidResponse, errors.New("success must be a boolean"))
 	}
 	if !*envelope.Success {
 		return nil, responseError(operation, ErrService, response)
 	}
 	trimmed := bytes.TrimSpace(envelope.Result)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, errors.New("result is required"))
+		return nil, response.operationError("decode "+operation, ErrInvalidResponse, errors.New("result is required"))
 	}
 	return envelope.Result, nil
 }
@@ -644,10 +645,10 @@ func decodeHMEMutation(operation string, response responseData) error {
 		Success *bool `json:"success"`
 	}
 	if err := json.Unmarshal(response.body, &envelope); err != nil {
-		return operationError("decode "+operation, ErrInvalidResponse, response.status, err)
+		return response.operationError("decode "+operation, ErrInvalidResponse, err)
 	}
 	if envelope.Success == nil {
-		return operationError("decode "+operation, ErrInvalidResponse, response.status,
+		return response.operationError("decode "+operation, ErrInvalidResponse,
 			errors.New("success must be a boolean"))
 	}
 	if !*envelope.Success {
@@ -781,9 +782,11 @@ func normalizeHMEAddress(value string) (string, error) {
 
 func nonRetryableAppleError(err error) error {
 	var typed *Error
-	if !errors.As(err, &typed) {
+	if !errors.As(err, &typed) || typed == nil {
 		return err
 	}
+	// Preserve all metadata, including RetryAfter; the hint does not authorize
+	// automatic replay of a mutation whose outcome may be uncertain.
 	copy := *typed
 	copy.Retryable = false
 	return &copy
@@ -801,6 +804,12 @@ type responseData struct {
 	status int
 	header http.Header
 	body   []byte
+}
+
+func (response responseData) operationError(operation string, kind error, cause error) *Error {
+	err := operationError(operation, kind, response.status, cause)
+	err.RetryAfter = parseRetryAfter(response.header.Get("Retry-After"), time.Now())
+	return err
 }
 
 func (c *Client) newOperation(session *Session) (*operation, error) {
@@ -869,7 +878,7 @@ func (op *operation) authorize(ctx context.Context) error {
 		return err
 	}
 	if response.status != http.StatusOK {
-		return operationError("initialize sign in", ErrAuthentication, response.status, nil)
+		return response.operationError("initialize sign in", ErrAuthentication, nil)
 	}
 	return nil
 }
@@ -887,7 +896,7 @@ func (op *operation) federate(ctx context.Context, appleID string) error {
 		if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden {
 			kind = ErrAuthentication
 		}
-		return operationError("federate Apple ID", kind, response.status, nil)
+		return response.operationError("federate Apple ID", kind, nil)
 	}
 	return nil
 }
@@ -914,7 +923,7 @@ func (op *operation) srpInit(ctx context.Context, appleID string, public []byte)
 		if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden {
 			kind = ErrAuthentication
 		}
-		return srpChallenge{}, operationError("initialize SRP", kind, response.status, nil)
+		return srpChallenge{}, response.operationError("initialize SRP", kind, nil)
 	}
 	var body struct {
 		Salt      string `json:"salt"`
@@ -924,18 +933,18 @@ func (op *operation) srpInit(ctx context.Context, appleID string, public []byte)
 		Protocol  string `json:"protocol"`
 	}
 	if err := json.Unmarshal(response.body, &body); err != nil {
-		return srpChallenge{}, operationError("decode SRP challenge", ErrInvalidResponse, response.status, err)
+		return srpChallenge{}, response.operationError("decode SRP challenge", ErrInvalidResponse, err)
 	}
 	salt, err := base64.StdEncoding.Strict().DecodeString(body.Salt)
 	if err != nil || len(salt) == 0 || len(salt) > 1024 {
-		return srpChallenge{}, operationError("decode SRP salt", ErrInvalidResponse, response.status, err)
+		return srpChallenge{}, response.operationError("decode SRP salt", ErrInvalidResponse, err)
 	}
 	serverPublic, err := base64.StdEncoding.Strict().DecodeString(body.B)
 	if err != nil || len(serverPublic) == 0 || len(serverPublic) > appleSRPSize {
-		return srpChallenge{}, operationError("decode SRP public value", ErrInvalidResponse, response.status, err)
+		return srpChallenge{}, response.operationError("decode SRP public value", ErrInvalidResponse, err)
 	}
 	if body.C == "" {
-		return srpChallenge{}, operationError("decode SRP challenge", ErrInvalidResponse, response.status, nil)
+		return srpChallenge{}, response.operationError("decode SRP challenge", ErrInvalidResponse, nil)
 	}
 	return srpChallenge{salt: salt, serverPublic: serverPublic, challenge: body.C, iterations: body.Iteration, protocol: body.Protocol}, nil
 }
@@ -960,11 +969,11 @@ func (op *operation) srpComplete(ctx context.Context, appleID, challenge string,
 	case http.StatusOK, http.StatusConflict:
 		return response.status, nil
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return 0, operationError("complete SRP sign in", ErrAuthentication, response.status, nil)
+		return 0, response.operationError("complete SRP sign in", ErrAuthentication, nil)
 	case http.StatusPreconditionFailed:
-		return 0, operationError("complete SRP sign in", ErrTermsRequired, response.status, nil)
+		return 0, response.operationError("complete SRP sign in", ErrTermsRequired, nil)
 	default:
-		return 0, operationError("complete SRP sign in", ErrService, response.status, nil)
+		return 0, response.operationError("complete SRP sign in", ErrService, nil)
 	}
 }
 
@@ -972,6 +981,9 @@ func (op *operation) requestTrustedDeviceCode(ctx context.Context) (int, error) 
 	response, err := op.request(ctx, "request two-factor code", http.MethodPut, op.endpoints.Auth+"/verify/trusteddevice/securitycode", nil, op.authHeaders())
 	if err != nil {
 		return 0, err
+	}
+	if response.status != http.StatusOK && response.status != http.StatusNoContent && response.status != http.StatusMethodNotAllowed {
+		return response.status, response.operationError("request two-factor code", ErrService, nil)
 	}
 	return response.status, nil
 }
@@ -982,7 +994,7 @@ func (op *operation) trust(ctx context.Context) error {
 		return err
 	}
 	if response.status != http.StatusOK && response.status != http.StatusNoContent {
-		return operationError("trust Apple session", ErrService, response.status, nil)
+		return response.operationError("trust Apple session", ErrService, nil)
 	}
 	return nil
 }
@@ -1006,14 +1018,14 @@ func (op *operation) accountLogin(ctx context.Context) (accountResponse, error) 
 			continue
 		}
 		if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == 450 {
-			return accountResponse{}, operationError("exchange Apple session token", ErrInvalidSession, response.status, nil)
+			return accountResponse{}, response.operationError("exchange Apple session token", ErrInvalidSession, nil)
 		}
 		if response.status < 200 || response.status >= 300 {
-			return accountResponse{}, operationError("exchange Apple session token", ErrService, response.status, nil)
+			return accountResponse{}, response.operationError("exchange Apple session token", ErrService, nil)
 		}
 		account, err := decodeAccountResponse(response.body)
 		if err != nil {
-			return accountResponse{}, operationError("decode Apple account", ErrInvalidResponse, response.status, err)
+			return accountResponse{}, response.operationError("decode Apple account", ErrInvalidResponse, err)
 		}
 		return account, nil
 	}
@@ -1031,17 +1043,17 @@ func (op *operation) validate(ctx context.Context) (accountResponse, error) {
 			continue
 		}
 		if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == 450 || response.status == http.StatusMisdirectedRequest {
-			return accountResponse{}, operationError("validate Apple session", ErrInvalidSession, response.status, nil)
+			return accountResponse{}, response.operationError("validate Apple session", ErrInvalidSession, nil)
 		}
 		if response.status < 200 || response.status >= 300 {
-			return accountResponse{}, operationError("validate Apple session", ErrService, response.status, nil)
+			return accountResponse{}, response.operationError("validate Apple session", ErrService, nil)
 		}
 		account, err := decodeAccountResponse(response.body)
 		if err != nil {
-			return accountResponse{}, operationError("decode Apple session", ErrInvalidResponse, response.status, err)
+			return accountResponse{}, response.operationError("decode Apple session", ErrInvalidResponse, err)
 		}
 		if account.Success != nil && !*account.Success && string(account.DSInfo.DSID) == "" {
-			return accountResponse{}, operationError("validate Apple session", ErrInvalidSession, response.status, nil)
+			return accountResponse{}, response.operationError("validate Apple session", ErrInvalidSession, nil)
 		}
 		return account, nil
 	}
@@ -1128,11 +1140,14 @@ func (op *operation) requestRaw(ctx context.Context, operation, method, rawURL s
 	}
 	request.Header = headers.Clone()
 	response, err := op.http.Do(request)
+	var data responseData
+	if response != nil {
+		data.status = response.StatusCode
+		data.header = response.Header.Clone()
+		op.capture(response.Header)
+	}
 	if err != nil {
-		status := 0
 		if response != nil {
-			status = response.StatusCode
-			op.capture(response.Header)
 			if response.Body != nil {
 				_ = response.Body.Close()
 			}
@@ -1140,22 +1155,22 @@ func (op *operation) requestRaw(ctx context.Context, operation, method, rawURL s
 		if requestContext.Err() != nil {
 			err = requestContext.Err()
 		}
-		return responseData{}, operationError(operation, ErrService, status, err)
+		return responseData{}, data.operationError(operation, ErrService, err)
 	}
 	if response.Body == nil {
-		return responseData{}, operationError(operation, ErrInvalidResponse, response.StatusCode, errors.New("empty response body"))
+		return responseData{}, data.operationError(operation, ErrInvalidResponse, errors.New("empty response body"))
 	}
 	defer response.Body.Close()
-	op.capture(response.Header)
 	limited := io.LimitReader(response.Body, op.owner.maxResponseBytes+1)
 	responseBody, err := io.ReadAll(limited)
 	if err != nil {
-		return responseData{}, operationError(operation, ErrInvalidResponse, response.StatusCode, err)
+		return responseData{}, data.operationError(operation, ErrInvalidResponse, err)
 	}
 	if int64(len(responseBody)) > op.owner.maxResponseBytes {
-		return responseData{}, operationError(operation, ErrResponseTooLarge, response.StatusCode, nil)
+		return responseData{}, data.operationError(operation, ErrResponseTooLarge, nil)
 	}
-	return responseData{status: response.StatusCode, header: response.Header.Clone(), body: responseBody}, nil
+	data.body = responseBody
+	return data, nil
 }
 
 func (op *operation) capture(headers http.Header) {
@@ -1243,13 +1258,9 @@ func serviceCodeValue(raw json.RawMessage) string {
 }
 
 func responseError(operation string, kind error, response responseData) error {
-	return &Error{
-		Op:          operation,
-		Kind:        kind,
-		StatusCode:  response.status,
-		ServiceCode: responseServiceCode(response.body),
-		Retryable:   retryableStatus(response.status),
-	}
+	err := response.operationError(operation, kind, nil)
+	err.ServiceCode = responseServiceCode(response.body)
+	return err
 }
 
 func containsPaginationMarker(body []byte) bool {

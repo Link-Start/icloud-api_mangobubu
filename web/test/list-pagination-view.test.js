@@ -140,7 +140,8 @@ test("alias paging resets on filters and supports full batched display/export", 
   assert.doesNotMatch(source, /await deleteAliases\(/);
   assert.match(source, /startJob: startAliasDeletionJob/);
   assert.match(source, /deletionJob\.processed/);
-  assert.match(source, /v-if="failure\.localRetained"/);
+  assert.match(source, /formatAliasDeletionResultMessage\(failure\)/);
+  assert.match(source, /formatAliasDeletionResultMessage\(result\)/);
 });
 
 test("latest-mail choices update both filter flags and reset cleanly", async () => {

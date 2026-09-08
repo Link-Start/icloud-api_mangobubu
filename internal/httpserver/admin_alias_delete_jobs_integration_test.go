@@ -103,7 +103,20 @@ func TestAliasDeletionJobTwentyAndThousandContinuePastFourteenAfterDisconnect(t 
 			if err != nil {
 				t.Fatal(err)
 			}
-			service, err := hmesync.New(env.store, env.cipher, client, batchDeletionTestLocker{})
+			// Advance a virtual clock for production pacing; no test sends a
+			// real network request or waits a thousand real-world seconds.
+			clockBase := time.Now().UTC()
+			var clockOffset atomic.Int64
+			service, err := hmesync.New(env.store, env.cipher, client, batchDeletionTestLocker{},
+				hmesync.WithClock(func() time.Time { return clockBase.Add(time.Duration(clockOffset.Load())) }),
+				hmesync.WithAliasDeletionWaiter(func(ctx context.Context, delay time.Duration) error {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					clockOffset.Add(int64(delay))
+					return nil
+				}),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}

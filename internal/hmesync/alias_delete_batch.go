@@ -55,6 +55,11 @@ func (s *Service) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]AliasD
 	if len(aliasIDs) == 0 {
 		return nil, errors.New("at least one alias ID is required")
 	}
+	if _, enabled := ctx.Value(aliasDeletionRecoveryKey{}).(func(AliasDeletionWait)); enabled {
+		var cancelRecovery context.CancelFunc
+		ctx, cancelRecovery = context.WithTimeout(ctx, aliasDeletionRecoveryLimit)
+		defer cancelRecovery()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var failureMu sync.Mutex
@@ -157,6 +162,7 @@ func (s *Service) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]AliasD
 					err, panicked := runAliasDeletionSafely(func() error {
 						return s.withAliasDeletionAccount(ctx, group.accountID, func() error {
 							batch := aliasDeletionBatch{s: s, repo: deleteRepo, client: deleteClient, accountID: group.accountID}
+							batch.recovery = newAliasDeletionRecovery(ctx)
 							for _, item := range group.items {
 								complete(item, batch.delete(ctx, item.aliasID))
 							}
@@ -244,6 +250,7 @@ type aliasDeletionBatch struct {
 	stopped   error
 	directory map[string]apple.Alias // Includes foreign aliases for ownership checks.
 	valid     bool
+	recovery  *aliasDeletionRecovery // Only opt-in DeleteAliases, never DeleteAlias.
 }
 
 func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
@@ -262,6 +269,14 @@ func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
 	}
 	if b.stopped != nil {
 		return b.stopped
+	}
+	if b.recovery != nil {
+		if b.recovery.aliasID == aliasID && b.recovery.address != domain.NormalizeEmail(alias.Address) {
+			b.stopped = wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+			return b.stopped
+		}
+		b.recovery.aliasID = aliasID
+		b.recovery.address = domain.NormalizeEmail(alias.Address)
 	}
 	account, err := b.s.repo.GetAccount(ctx, b.accountID)
 	if err != nil {
@@ -310,7 +325,7 @@ func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
 		return wrapError(CodeUpstreamError, ErrUpstream, errors.New("Apple alias omitted its remote ID"))
 	}
 	if remote.IsActive {
-		if err := ctx.Err(); err != nil {
+		if err := b.beforeRequest(ctx, "deactivate"); err != nil {
 			return err
 		}
 		returned, remoteErr := b.client.DeactivateAlias(ctx, b.session, remoteID)
@@ -319,6 +334,15 @@ func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
 			b.valid = false
 			if fatal {
 				return mapped
+			}
+			if b.canRecover(mapped) {
+				if err := b.recoverThrottle(ctx, "deactivate", mapped); err != nil {
+					return err
+				}
+				// Re-enter with an invalid directory, not by replaying the mutation.
+				// The shared three-recovery budget bounds this re-entry. A fresh read
+				// decides whether deactivation succeeded and supplies the current ID.
+				return b.delete(ctx, aliasID)
 			}
 			reconciled, present, err := b.reconcile(ctx, alias.Address)
 			if err != nil {
@@ -343,7 +367,7 @@ func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
 	// Even when read-only reconciliation finishes after cancellation, do not
 	// start another irreversible request. Checkpoints/local confirmed cleanup
 	// still use their bounded, cancellation-independent persistence contexts.
-	if err := ctx.Err(); err != nil {
+	if err := b.beforeRequest(ctx, "delete"); err != nil {
 		return err
 	}
 	returned, remoteErr := b.client.DeleteAlias(ctx, b.session, remoteID)
@@ -352,6 +376,12 @@ func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
 		b.valid = false
 		if fatal {
 			return mapped
+		}
+		if b.canRecover(mapped) {
+			if err := b.recoverThrottle(ctx, "delete", mapped); err != nil {
+				return err
+			}
+			return b.delete(ctx, aliasID)
 		}
 		_, present, err := b.reconcile(ctx, alias.Address)
 		if err != nil {
@@ -375,12 +405,21 @@ func (b *aliasDeletionBatch) initialize(ctx context.Context) error {
 		}
 		return err
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	returned, remoteErr := b.s.client.Validate(ctx, b.session)
-	if err, _ := b.acceptResponse(ctx, returned, remoteErr); err != nil {
-		return err
+	for {
+		if err := b.beforeRequest(ctx, "validate"); err != nil {
+			return err
+		}
+		returned, remoteErr := b.s.client.Validate(ctx, b.session)
+		if err, _ := b.acceptResponse(ctx, returned, remoteErr); err != nil {
+			if !b.canRecover(err) {
+				return err
+			}
+			if err := b.recoverThrottle(ctx, "validate", err); err != nil {
+				return err
+			}
+			continue // Keep the rolling session; never reload its initial record.
+		}
+		break
 	}
 	b.ready = true
 	return nil
@@ -391,6 +430,24 @@ func (b *aliasDeletionBatch) initialize(ctx context.Context) error {
 // no subsequent item reloads an older session and sends it back to Apple.
 func (b *aliasDeletionBatch) acceptResponse(ctx context.Context, returned apple.Session, remoteErr error) (error, bool) {
 	mapped := mapAppleError(remoteErr, false)
+	if b.recovery != nil && apple.IsRateLimited(remoteErr) {
+		// A 429 header is authoritative even when reading its body timed out.
+		// mapAppleError preserves context-shaped transport causes for legacy
+		// callers; recovery must retain the throttle and its Retry-After instead.
+		// Explicit session/account-fatal classifications still take precedence.
+		switch {
+		case errors.Is(remoteErr, apple.ErrInvalidSession):
+			mapped = wrapError(CodeSessionExpired, ErrSessionExpired, remoteErr)
+		case errors.Is(remoteErr, apple.ErrAuthentication):
+			mapped = wrapError(CodeCredentialsInvalid, ErrCredentialsInvalid, remoteErr)
+		case errors.Is(remoteErr, apple.ErrTermsRequired):
+			mapped = wrapError(CodeAccountActionRequired, ErrAccountActionRequired, remoteErr)
+		case errors.Is(remoteErr, apple.ErrTwoFactorCode):
+			mapped = wrapError(CodeVerificationInvalid, ErrVerificationInvalid, remoteErr)
+		default:
+			mapped = wrapError(CodeRateLimited, ErrRateLimited, remoteErr)
+		}
+	}
 	if errors.Is(mapped, ErrSessionExpired) {
 		return b.expire(ctx, mapped), true
 	}
@@ -403,7 +460,11 @@ func (b *aliasDeletionBatch) acceptResponse(ctx context.Context, returned apple.
 		b.stopped = errors.Join(err, mapped)
 		return b.stopped, true
 	}
-	if errors.Is(mapped, ErrRateLimited) || errors.Is(mapped, ErrCredentialsInvalid) || errors.Is(mapped, ErrAccountActionRequired) {
+	if b.recovery != nil {
+		b.recovery.nextServerDelay = apple.RetryDelay(remoteErr)
+		b.recovery.lastError = remoteErr
+	}
+	if (errors.Is(mapped, ErrRateLimited) && b.recovery == nil) || errors.Is(mapped, ErrCredentialsInvalid) || errors.Is(mapped, ErrAccountActionRequired) {
 		// Reconcile an already-started mutation, but do not hammer a blocked
 		// account with the rest of the batch. Other accounts remain independent.
 		b.stopped = mapped
@@ -425,13 +486,47 @@ func (b *aliasDeletionBatch) expire(ctx context.Context, mapped error) error {
 }
 
 func (b *aliasDeletionBatch) refresh(ctx context.Context) error {
+	return b.refreshDirectory(ctx, false)
+}
+
+func (b *aliasDeletionBatch) refreshDirectory(ctx context.Context, reconcile bool) error {
 	b.valid = false
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	directory, returned, remoteErr := b.s.client.ListAliases(ctx, b.session)
-	if err, _ := b.acceptResponse(ctx, returned, remoteErr); err != nil {
-		return err
+	var directory apple.ListResult
+	for {
+		// Consume an existing server hint under the original job context before
+		// detaching a bounded reconciliation read from cancellation below.
+		if err := b.waitServerDelay(ctx, "list"); err != nil {
+			return err
+		}
+		err := func() error {
+			requestContext := ctx
+			if reconcile {
+				// Preserve bounded, cancellation-independent confirmation of an
+				// ambiguous mutation. Only the request is detached, never a cooldown.
+				var cancel context.CancelFunc
+				requestContext, cancel = context.WithTimeout(context.WithoutCancel(ctx), aliasDeletePersistTimeout)
+				defer cancel()
+			}
+			if err := b.beforeRequest(requestContext, "list"); err != nil {
+				return err
+			}
+			var returned apple.Session
+			var remoteErr error
+			directory, returned, remoteErr = b.s.client.ListAliases(requestContext, b.session)
+			err, _ := b.acceptResponse(requestContext, returned, remoteErr)
+			return err
+		}()
+		if err == nil {
+			break
+		}
+		if !b.canRecover(err) {
+			return err
+		}
+		// Use the original job context and shared recovery budget, outside the
+		// short request deadline. No reconciliation request can skip this wait.
+		if err := b.recoverThrottle(ctx, "list", err); err != nil {
+			return err
+		}
 	}
 	if _, _, err := filterAliases(directory, b.account.Email); err != nil {
 		return err
@@ -453,12 +548,10 @@ func (b *aliasDeletionBatch) find(address string) (apple.Alias, bool, error) {
 }
 
 func (b *aliasDeletionBatch) reconcile(ctx context.Context, address string) (apple.Alias, bool, error) {
-	reconcileContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), aliasDeletePersistTimeout)
-	defer cancel()
 	// Refresh the whole directory, not only the current alias: another cached
 	// alias may also have changed. A failed read leaves the cache invalid and
 	// still checkpoints any returned session for the next item's fresh read.
-	if err := b.refresh(reconcileContext); err != nil {
+	if err := b.refreshDirectory(ctx, true); err != nil {
 		return apple.Alias{}, false, err
 	}
 	return b.find(address)

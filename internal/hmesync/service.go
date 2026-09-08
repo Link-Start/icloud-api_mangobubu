@@ -101,6 +101,7 @@ type Service struct {
 	challengeTTL                 time.Duration
 	maxAttempts                  int
 	autoCreateConfirmationDelays []time.Duration
+	aliasDeletionWaiter          func(context.Context, time.Duration) error
 	challengeMu                  sync.Mutex
 	challenges                   map[string]challenge
 	accountFlows                 map[int64]string

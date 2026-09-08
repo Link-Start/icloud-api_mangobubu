@@ -1,6 +1,36 @@
 export const ALIAS_DELETION_POLL_INTERVAL_MS = 2_000;
 export const ALIAS_DELETION_REQUEST_TIMEOUT_MS = 10_000;
 
+export const ALIAS_DELETION_OPERATION_LABELS = Object.freeze({
+  validate: "校验",
+  list: "获取邮箱列表",
+  deactivate: "停用邮箱",
+  delete: "删除邮箱",
+});
+
+export function formatAliasDeletionResultMessage(result) {
+  if (result?.deleted === true) return "已删除";
+  const retained = result?.localRetained === true;
+  const code = typeof result?.code === "string" ? result.code.trim() : "";
+  let message = typeof result?.message === "string" ? result.message.trim() : "";
+  let retentionNoticeSeen = false;
+  // Keep one confirmed notice, and do not repeat an unconfirmed retention claim.
+  message = message.replace(/(?:[；;，,]\s*)?本地记录已保留/g, (notice) => {
+    if (!retained || retentionNoticeSeen) return "";
+    retentionNoticeSeen = true;
+    return notice;
+  }).replace(/^[；;，,。\s]+|[；;，,\s]+$/g, "");
+
+  if (code === "APPLE_BATCH_DEFERRED") {
+    message ||= "主号持续限流，尚未向 Apple 发送请求";
+    if (!message.includes("未执行")) message = `未执行：${message}`;
+  } else {
+    message ||= code && code !== "UNKNOWN" ? code : "删除结果待确认";
+  }
+  const notice = retained ? "本地记录已保留" : "Apple / 本地状态待核对";
+  return message.includes(notice) ? message : `${message}；${notice}`;
+}
+
 export function isAliasDeletionJobActive(job) {
   return job?.status === "queued" || job?.status === "running";
 }

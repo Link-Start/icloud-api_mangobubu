@@ -819,6 +819,11 @@ paths:
         同一账号逐条处理并复用 validate/directory，沿用响应更新后的滚动会话；
         每个任务内不同账号最多 2 路并发，与全局最多 2 个 active 任务是两层限制。
         异常时重新读取并验证远端状态，不以直接删除本地记录替代 Apple 确认。
+        后台模式同账号请求至少间隔 1 秒；出现限流按 60、120、240 秒退避等待，
+        Apple Retry-After 指定更长等待时尊重该值。每个主号在整批最多恢复 3 次，
+        等待保持 running 并返回 waits，不计为已处理或失败；结束等待后用新目录核对再继续，
+        不盲目重放停用或删除。持续受限时后续未执行项返回 APPLE_BATCH_DEFERRED，
+        可选 deferred 是 failed 的子集。同步兼容接口及单条删除不启用此后台等待策略。
         同账号、无异常且 N 个地址均需先停用的模拟调用计数可从 4N 降为 2N+2；这不是
         固定加速比。实际时长和成功数仍取决于 Apple，单次 1000 项上限不是全部成功承诺。
       security:
@@ -2508,6 +2513,20 @@ components:
           description: |
             results 中 deleted=false 的项目数；interrupted 时包含为未完成项合成的结果未知项，
             不等于已确认远端删除失败的数量。此时 deleted+failed 可能大于 processed。
+        deferred:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: 因主号限流预算耗尽而尚未执行的 APPLE_BATCH_DEFERRED 项目数，是 failed 的子集；零时可省略。
+        waits:
+          type: array
+          maxItems: 2
+          description: |
+            当前进程中等待限流恢复的主号，按 account_id 排序；仅 active 任务返回，空时省略。
+            等待不产生项目结果或增加 processed/failed，结束等待后清除。重启后任务为 interrupted，
+            不恢复这些临时计时状态。客户端继续 GET 原任务，不应另建删除请求。
+          items:
+            $ref: "#/components/schemas/AdminAliasDeletionWait"
         results:
           type: array
           minItems: 0
@@ -2532,6 +2551,44 @@ components:
           type: string
           format: date-time
           description: 任务最近一次持久化更新时间，UTC RFC 3339 格式，可含小数秒。
+    AdminAliasDeletionWait:
+      type: object
+      additionalProperties: false
+      required: [account_id, alias_id, operation, retry_at, attempt, max_attempts]
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          minimum: 1
+        alias_id:
+          type: integer
+          format: int64
+          minimum: 1
+        operation:
+          type: string
+          enum: [validate, list, deactivate, delete, ""]
+          description: 触发等待的固定步骤名；适配器未提供已知步骤时为空。
+        retry_at:
+          type: string
+          format: date-time
+          description: UTC 预计重试时间；由本地退避及 Apple Retry-After 的较长者决定，不是成功保证。
+        attempt:
+          type: integer
+          minimum: 1
+          maximum: 3
+        max_attempts:
+          type: integer
+          const: 3
+        http_status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: 已知的 Apple HTTP 状态码；可能为 200，业务限流通过 service_code 表达。
+        service_code:
+          type: string
+          maxLength: 64
+          pattern: '^[A-Za-z0-9_.-]*$'
+          description: 已知的非敏感业务码；不包含上游正文、URL 或登录凭据。
     AdminAliasBatchDeleteResponse:
       type: object
       additionalProperties: false
@@ -2575,7 +2632,7 @@ components:
           description: Apple 已确认删除或新目录确认地址缺失，且本地记录已清理；中断项的 false 不证明远端仍存在。
         code:
           type: string
-          description: 错误项的稳定错误码；BATCH_DELETE_INTERRUPTED 表示中断、远端结果待核查。
+          description: 错误项的稳定错误码；BATCH_DELETE_INTERRUPTED 表示中断、远端结果待核查；APPLE_BATCH_DEFERRED 表示主号持续限流后尚未执行。
         message:
           type: string
           description: 错误项的可展示说明；本地记录保留情况应结合 local_retained 判断，中断结果不承诺保留。

@@ -274,7 +274,8 @@
       <template v-if="deletionJob">
         <p role="status" aria-live="polite" aria-atomic="true">
           已处理 {{ deletionJob.processed }} / {{ deletionJob.requested }}；
-          成功删除 {{ deletionJob.deleted }}；失败 {{ deletionJob.failed }}
+          成功删除 {{ deletionJob.deleted }}；失败/未执行 {{ deletionJob.failed }}
+          <span v-if="deletionJob.deferred > 0">（其中未执行 {{ deletionJob.deferred }}）</span>
         </p>
         <el-progress
           :percentage="deletionPercentage"
@@ -288,6 +289,17 @@
         <p v-if="isAliasDeletionJobActive(deletionJob)" class="alias-deletion-progress__hint">
           任务在服务端持续执行，每 2 秒串行查询进度；离开或刷新页面不会取消任务。
         </p>
+        <div v-if="deletionWaits.length" class="alias-deletion-progress__waits" role="status" aria-live="polite">
+          <strong>Apple限流，正在等待后继续</strong>
+          <div v-for="(wait, index) in deletionWaits" :key="`${wait.accountId}:${wait.aliasId}:${wait.operation}:${index}`">
+            <span v-if="wait.accountId">主号 ID {{ wait.accountId }}</span>
+            <span v-if="wait.aliasId">{{ wait.accountId ? " · " : "" }}邮箱 ID {{ wait.aliasId }}</span>
+            · {{ ALIAS_DELETION_OPERATION_LABELS[wait.operation] }}
+            · 预计重试时间：{{ formatTime(wait.retryAt, { seconds: true }) }}
+            · 第 {{ wait.attempt }} 次重试（最多 {{ wait.maxAttempts }} 次）
+          </div>
+          <span class="alias-deletion-progress__hint">等待中的邮箱及剩余项尚未计为已处理或失败；到时由服务端继续原任务。</span>
+        </div>
       </template>
       <p v-if="deletionState.recovering" role="status">
         正在恢复当前管理员的最近任务，查询确认前暂停新建删除任务。
@@ -314,9 +326,7 @@
       <div v-if="deletionRecentFailures.length" class="alias-deletion-progress__failures">
         <strong>近期未删除或待确认结果（最近 {{ deletionRecentFailures.length }} 项）</strong>
         <div v-for="failure in deletionRecentFailures" :key="failure.id">
-          {{ failure.address || `ID ${failure.id}` }}：{{ failure.message || failure.code || "删除结果待确认" }}
-          <span v-if="failure.localRetained">；本地记录已保留</span>
-          <span v-else>；Apple / 本地状态待核对</span>
+          {{ failure.address || `ID ${failure.id}` }}：{{ formatAliasDeletionResultMessage(failure) }}
         </div>
       </div>
       <details v-if="deletionJob?.results.length" @toggle="deletionResultsExpanded = $event.target.open">
@@ -324,8 +334,7 @@
         <ul v-if="deletionResultsExpanded" class="alias-deletion-progress__results">
           <li v-for="result in deletionJob.results" :key="result.id">
             {{ result.address || `ID ${result.id}` }}：
-            {{ result.deleted ? "已删除" : result.message || result.code || "删除结果待确认" }}
-            <span v-if="!result.deleted && result.localRetained">；本地记录已保留</span>
+            {{ formatAliasDeletionResultMessage(result) }}
           </li>
         </ul>
       </details>
@@ -672,8 +681,10 @@ import SyncStatus from "../components/SyncStatus.vue";
 import VirtualDataTable from "../components/VirtualDataTable.vue";
 import { useAuth } from "../stores/auth.js";
 import {
+  ALIAS_DELETION_OPERATION_LABELS,
   createAliasDeletionController,
   createAliasDeletionStorage,
+  formatAliasDeletionResultMessage,
   isAliasDeletionJobActive,
   isAliasDeletionJobTerminal,
 } from "../utils/aliasDeletionJob.js";
@@ -766,14 +777,18 @@ const deletionPercentage = computed(() => deletionJob.value?.requested
 const deletionRecentFailures = computed(() =>
   (deletionJob.value?.results || []).filter((item) => !item.deleted).slice(-5).reverse(),
 );
+const deletionWaits = computed(() => deletionJob.value?.status === "running"
+  ? deletionJob.value.waits || []
+  : []);
 const deletionJobType = computed(() => {
-  if (deletionState.value.uncertain || deletionJob.value?.failed || deletionJob.value?.status === "interrupted") return "warning";
+  if (deletionState.value.uncertain || deletionWaits.value.length || deletionJob.value?.failed || deletionJob.value?.status === "interrupted") return "warning";
   return deletionJob.value?.status === "completed" ? "success" : "info";
 });
 const deletionStatusLabel = computed(() => {
   if (deletionState.value.submitting) return "正在提交";
   if (deletionState.value.uncertain) return "结果待确认";
   if (deletionState.value.recovering) return "恢复任务中";
+  if (deletionWaits.value.length) return "限流等待中";
   return { queued: "排队中", running: "执行中", completed: "已完成", interrupted: "已中断" }[deletionJob.value?.status] || "查询中";
 });
 
@@ -1737,7 +1752,8 @@ onBeforeUnmount(() => {
   line-height: 1.6;
 }
 
-.alias-deletion-progress__failures {
+.alias-deletion-progress__failures,
+.alias-deletion-progress__waits {
   display: grid;
   gap: 6px;
   font-size: 13px;

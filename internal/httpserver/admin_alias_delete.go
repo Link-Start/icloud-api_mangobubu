@@ -242,6 +242,18 @@ func (s *Server) adminAPIRunAliasBatchDelete(
 }
 
 func adminAPIBatchAliasDeleteError(err error) adminAPIAppleError {
+	if hmesync.Code(err) == hmesync.CodeBatchDeferred || errors.Is(err, hmesync.ErrBatchDeferred) {
+		return adminAPIAppleError{
+			Status: http.StatusConflict, Code: hmesync.CodeBatchDeferred,
+			Message: "该主号持续受到 Apple 限流，此邮箱尚未执行删除，请稍后重新选择",
+		}
+	}
+	// A known throttle response can also wrap a timeout while reading its
+	// body. Preserve the explicit recovery classification; an expired job's
+	// own context is handled separately by its runner as an interruption.
+	if hmesync.Code(err) == hmesync.CodeRateLimited {
+		return classifyAdminAPIAppleError(hmesync.ErrRateLimited)
+	}
 	if errors.Is(err, context.Canceled) && hmesync.Code(err) == "" {
 		return adminAPIAppleError{
 			Status: http.StatusConflict, Code: "BATCH_DELETE_INTERRUPTED",

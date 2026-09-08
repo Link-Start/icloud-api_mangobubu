@@ -775,6 +775,7 @@ test("async alias deletion sends the operation ID once and maps the 202 snapshot
   assert.deepEqual(result, {
     jobId: operationId, status: "running", requested: 9, processed: 2,
     deleted: 1, failed: 1, requestId: "request-42",
+    waits: [], deferred: 0,
     createdAt: raw.created_at, updatedAt: raw.updated_at,
     results: [
       { id: 91, address: "deleted@icloud.com", deleted: true, code: "", message: "", localRetained: false },
@@ -805,6 +806,106 @@ test("job reads encode IDs, forward cancellation, and preserve latest null", asy
     assert.equal(options.body, undefined);
     assert.equal(options.signal, controller.signal);
   }
+});
+
+test("all job endpoints map wait DTOs and deferred counts without changing the mutation", async () => {
+  const rawWaits = ["validate", "list", "deactivate", "delete"].map((operation, index) => ({
+    account_id: index === 3 ? 0 : 12, alias_id: index === 0 ? 0 : 91 + index,
+    operation, retry_at: "2026-09-08T09:02:00.123456789+08:00",
+    attempt: index % 3 + 1, max_attempts: 3, http_status: 429, service_code: "-21669",
+    raw_body: "upstream-secret", rawBody: "upstream-secret", message: "upstream-secret",
+  }));
+  const raw = {
+    job_id: "waiting-job", status: "running", requested: 416, processed: 2,
+    deleted: 0, failed: 2, deferred: 1, waits: rawWaits,
+    results: [{ id: 90, deleted: false, code: "APPLE_BATCH_DEFERRED", local_retained: true }],
+  };
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return jsonResponse({ job: raw }, options.method === "DELETE" ? 202 : 200);
+  };
+
+  const submitted = await startAliasDeletionJob([91, 92], "waiting-job", "csrf");
+  const polled = await getAliasDeletionJob("waiting-job");
+  const latest = await getLatestAliasDeletionJob();
+  assert.deepEqual(submitted, polled);
+  assert.deepEqual(latest, polled);
+  assert.deepEqual(polled.waits, rawWaits.map((wait) => ({
+    accountId: wait.account_id, aliasId: wait.alias_id, operation: wait.operation,
+    retryAt: wait.retry_at, attempt: wait.attempt, maxAttempts: 3,
+    httpStatus: 429, serviceCode: "-21669",
+  })));
+  assert.equal(polled.status, "running");
+  assert.deepEqual([polled.requested, polled.processed, polled.deleted, polled.failed, polled.deferred], [416, 2, 0, 2, 1]);
+  assert.equal(polled.results[0].code, "APPLE_BATCH_DEFERRED");
+  assert.equal(polled.results[0].localRetained, true);
+  assert.doesNotMatch(JSON.stringify(polled), /upstream-secret|raw_body|rawBody/);
+  assert.deepEqual(requests.map(({ options }) => options.method), ["DELETE", "GET", "GET"]);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { alias_ids: [91, 92], operation_id: "waiting-job" });
+  assert.equal(requests[1].options.body, undefined);
+  assert.equal(requests[2].options.body, undefined);
+});
+
+test("optional malformed wait metadata is isolated from the original job and valid waits", () => {
+  const raw = {
+    job_id: "job", status: "running", requested: 416, processed: 0,
+    deleted: 0, failed: 0, results: [],
+  };
+  const validWait = {
+    account_id: 12, alias_id: 91, operation: "delete",
+    retry_at: "2026-09-08T01:01:00Z", attempt: 1, max_attempts: 3,
+  };
+  const expected = normalizeAliasDeletionJob(raw);
+  assert.deepEqual(expected.waits, []);
+  assert.equal(expected.deferred, 0);
+  for (const waits of [undefined, null, false, 42, "upstream-secret", { raw_body: "secret" }]) {
+    assert.deepEqual(normalizeAliasDeletionJob({ ...raw, waits }), expected);
+  }
+  const invalidWaits = [null, [], false, "secret", {}, ...[
+    { account_id: "12" }, { account_id: { secret: "private" } }, { alias_id: -1 },
+    { alias_id: Number.MAX_SAFE_INTEGER + 1 }, { account_id: 0, alias_id: 0 },
+    { operation: "__proto__" }, { operation: "constructor" }, { operation: "reserve" },
+    { operation: "<img src=x onerror=alert(1)>" },
+    { retry_at: "<script>secret</script>" }, { retry_at: "2026-13-08T01:01:00Z" },
+    { retry_at: "2026-09-08" }, { retry_at: "2026-09-08T01:01:00" },
+    { retry_at: { secret: "private" } }, { retry_at: ["2026-09-08T01:01:00Z"] },
+    { attempt: 0 }, { attempt: 4 }, { attempt: 1.5 }, { attempt: "1" },
+    { max_attempts: 4 }, { max_attempts: "3" },
+  ].map((patch) => ({ ...validWait, ...patch }))];
+  const result = normalizeAliasDeletionJob({ ...raw, waits: [...invalidWaits, validWait] });
+  assert.deepEqual(result, { ...expected, waits: [{
+    accountId: 12, aliasId: 91, operation: "delete", retryAt: validWait.retry_at,
+    attempt: 1, maxAttempts: 3,
+  }] });
+  for (const optional of [
+    { http_status: "429", service_code: { raw_body: "secret" } },
+    { http_status: 600, service_code: "<script>secret</script>" },
+    { http_status: 99, service_code: "x".repeat(65) },
+    { http_status: 429.5, service_code: 429 },
+  ]) {
+    assert.deepEqual(normalizeAliasDeletionJob({ ...raw, waits: [{ ...validWait, ...optional }] }), result);
+  }
+  for (const deferred of [undefined, null, -1, 0.5, "1", true, {}, Number.MAX_SAFE_INTEGER + 1, 1]) {
+    assert.deepEqual(normalizeAliasDeletionJob({ ...raw, deferred }), expected);
+  }
+});
+
+test("wait metadata accepts normalized and Pascal-case fields and clears on older snapshots", () => {
+  const wait = {
+    accountId: 12, aliasId: 91, operation: "list", retryAt: "2026-09-08T01:01:00Z",
+    attempt: 3, maxAttempts: 3, httpStatus: 503, serviceCode: "RATE_LIMITED",
+  };
+  assert.deepEqual(normalizeAliasDeletionJob({ waits: [wait] }).waits, [wait]);
+  assert.deepEqual(normalizeAliasDeletionJob({ Waits: [{
+    AccountID: 12, AliasID: 91, Operation: "list", RetryAt: wait.retryAt,
+    Attempt: 3, MaxAttempts: 3, HTTPStatus: 503, ServiceCode: "RATE_LIMITED",
+  }] }).waits, [wait]);
+  const raw = { job_id: "job", status: "running", requested: 416, processed: 0, deleted: 0, failed: 0 };
+  assert.equal(normalizeAliasDeletionJob({ ...raw, waits: [wait] }).waits.length, 1);
+  assert.deepEqual(normalizeAliasDeletionJob(raw).waits, []);
+  assert.equal(normalizeAliasDeletionJob({ Failed: 4, Deferred: 3 }).deferred, 3);
+  assert.equal(normalizeAliasDeletionJob({ failed: 4, deferred: 5 }).deferred, 0);
 });
 
 test("job normalization never derives counters from results or invents retention evidence", () => {
