@@ -49,7 +49,7 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 
 `admin-path` 的值形如 `/<32位小写十六进制>/admin/`。管理界面、静态资源和前端路由跟随这个随机前缀，管理 API 的首选入口是去掉该值结尾 `/` 后再拼接 `/api/v1`。OpenAPI 的 `{admin_path}` 变量则使用去掉首尾 `/` 的值。为兼容升级前客户端，同一套 JSON 管理 API 也保留在固定 `/admin/api/v1`；固定 `/admin` 不提供管理界面。登录成功会为两个 API 路径签发同一会话的受限 Cookie，两个入口都执行相同的登录限流、会话认证和 CSRF 校验。管理响应默认使用 `Cache-Control: no-store, private`，返回明文凭证的处理器会覆盖为 `no-store`。随机路径只能降低未授权扫描噪声，不应被当作访问控制边界。
 
-使用 `admin` 和首次生成的密码登录随机管理路径，添加 iCloud 主号后同步或手动登记隐私邮箱。管理端支持创建邮箱分组，并在“全部隐私邮箱”或主号详情中把单个、勾选的隐私邮箱移动到所选分组；删除分组不会删除邮箱，只会将其恢复为未分组。对已完成 Apple 登录且主号没有同步错误的 iCloud 隐私邮箱，可以在“全部隐私邮箱”中勾选后执行“从 Apple 删除”：服务会先调用 Apple 的停用/永久删除流程，只有 Apple 确认删除成功后才清理本地记录；Apple 失败时会保留对应本地记录并返回逐项错误。自定义邮箱不走此 Apple 删除流程。公开接口说明位于 <http://127.0.0.1:8080/docs/>，机器可读契约见 [`docs/openapi.yaml`](docs/openapi.yaml)。
+使用 `admin` 和首次生成的密码登录随机管理路径，添加 iCloud 主号后同步或手动登记隐私邮箱。管理端支持创建邮箱分组，并在“全部隐私邮箱”或主号详情中把单个、勾选的隐私邮箱移动到所选分组；删除分组不会删除邮箱，只会将其恢复为未分组。对已完成 Apple 登录且主号没有同步错误的 iCloud 隐私邮箱，可以在“全部隐私邮箱”中勾选后执行“从 Apple 删除”：服务会先调用 Apple 的停用/永久删除流程，只有 Apple 确认删除成功后才清理本地记录；明确失败的项目会保留对应本地记录并返回逐项错误。批量操作支持后台任务及状态轮询；任务中断后尚无结果的项目，其远端结果待核查，不承诺本地记录仍在，详见下方“批量 Apple 删除后台任务”。自定义邮箱不走此 Apple 删除流程。公开接口说明位于 <http://127.0.0.1:8080/docs/>，机器可读契约见 [`docs/openapi.yaml`](docs/openapi.yaml)。
 
 每个主号可配置上游隐式 TLS IMAP 主机、端口和登录用户名，默认是 `imap.mail.me.com:993`。已有隐私邮箱后仍可修改这三项，但这代表切换邮箱来源：服务会清除该主号旧来源的同步游标、v1 快照、消费与 `Seen` 状态、v2 归档和 OTP 历史，轮换公开 IMAPS 的 `UIDVALIDITY`，再从新来源建立不回填历史的基线。单纯修改 IMAP 密码（直连 iCloud 使用 App 专用密码，第三方转发使用第三方 IMAP 密码）或重新启用主号只重置同步状态，不删除已有邮件。已有隐私邮箱后主号邮箱地址仍不可修改。
 
@@ -64,6 +64,48 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 以上三套规则只决定邮件取件与归属。Apple 隐私邮箱目录同步和自动创建仍按 Apple 返回的默认转发目标与 iCloud 主号邮箱做现有校验；如果 Apple 的默认转发目标是另一个中间地址（例如标头中的 `f=`），现有地址可以正常取件，但目录同步或自动创建可能报告转发目标不匹配。完整支持该场景需要单独保存 Apple 转发目标，不能用最终 IMAP 用户名代替中间地址。
 
 添加主号时也可以选择“自定义邮箱”。自定义模式单独保存邮箱后缀（例如 `example.com`），同一后缀只能配置一个主号；IMAP 密码使用 `imap_password` 提交并按原值加密保存。它不会调用 Apple，也不会改变 iCloud 隐私邮箱原有的每小时自动创建规则。在主号详情中输入生成数量即可批量生成随机地址，格式为 8–12 位小写英文字母和数字加 `@后缀`，同一批次和全局地址表都会阻止重复，地址也不能与主号的 IMAP 登录身份相同。单次最多生成 1000 个，可多次分批生成，`custom` 主号的累计数量不设上限。自定义地址的删除只清理本地记录，不会请求 Apple。
+
+## 批量 Apple 删除后台任务
+
+以下路径均相对于 `<admin-path>/api/v1`，固定兼容入口为 `/admin/api/v1`。提交和轮询都需要有效管理 Session；`DELETE` 还需 `X-CSRF-Token` 及同源校验。后台任务只脱离提交请求的连接生命周期，不免除管理会话和凭据轮换保护。
+
+| 请求 | 成功响应 | 用途 |
+| --- | --- | --- |
+| `DELETE /aliases/batch`，正文 `{"alias_ids":[101,102]}` | `200 data {requested,deleted,failed,results}` | 保留原同步接口及结果格式 |
+| `DELETE /aliases/batch?async=1`，正文含 `alias_ids` 和 `operation_id` | `202 data {job_id,status,requested,processed,deleted,failed,results,request_id,created_at,updated_at}` | 提交后台任务，或取得幂等重试对应的原任务 |
+| `GET /aliases/batch/jobs/latest` | `200 data` 为任务对象或 `null` | 优先返回当前管理员的 active 任务，否则返回按创建时间最近的任务；没有任务时为 `null` |
+| `GET /aliases/batch/jobs/:jobID` | `200 data` 为任务对象 | 按 ID 轮询；ID 格式无效或当前管理员名下无该任务时返回 `404`，不泄露其他管理员的同 ID 任务 |
+
+异步请求示例正文：
+
+```json
+{
+  "alias_ids": [101, 102],
+  "operation_id": "a1b2c3d4-5678-4abc-8def-0123456789ab"
+}
+```
+
+`alias_ids` 为 1–1000 个不重复的正整数。异步模式必填 `operation_id`：16–128 个 ASCII 字母、数字、`-` 或 `_`。`job_id` 就是原 `operation_id`，任务身份和幂等键按管理员隔离；不同管理员可以使用相同 `operation_id` 创建各自的任务，读取只返回当前管理员名下的任务。客户端仍建议使用 UUID，并在首次提交前保存此键和原始 ID 列表（包括顺序）。
+
+若连接中断或响应丢失，优先直接 `GET /aliases/batch/jobs/<原 operation_id>`，即使尚未收到提交响应也可定位同一任务；页面恢复且未保存键时可查询 `jobs/latest`。同一管理员以相同 `operation_id` 和完全相同、顺序一致的 `alias_ids` 重试会返回原任务，包括并发重复提交，不重复删除；服务先查幂等键，再对新任务预检邮箱，因此原任务已经删除的本地 ID 不会使此类重试失败。原任务已 `completed` 或 `interrupted` 时也不会重新执行。不要因超时生成新键或重排、删减原列表。
+
+任务状态为 `queued`、`running`、`completed`、`interrupted`，其中前两者属于 active。`completed` 表示本次处理已经结束，不表示所有地址删除成功；应结合 `deleted`、`failed` 和逐项结果判断。`processed` 只统计已持久化完成结果的项目，`requested` 表示请求总数；`request_id` 保留首次提交的追踪标识，与后续查询响应的 `X-Request-ID` 不必相同，`created_at`、`updated_at` 为 UTC RFC 3339 时间字符串（可含小数秒）。
+
+正常进度的 `results` 只包含已有完成结果的项目，按原 ID 列表顺序返回，不为待处理项预填成功或失败；初始可为空数组，此时 `processed=deleted=failed=0`。每项包含 `id`、`address`、`deleted`，错误项可带 `code`、`message`、`local_retained`。`interrupted` 是例外：HTTP 响应会为尚无完成结果的剩余项合成 `code: BATCH_DELETE_INTERRUPTED`，说明“任务已中断，远端删除结果待核查”。这些项计入 `failed`，不计入 `processed`；其 `deleted: false` 不是远端仍存在的证明，`local_retained` 在实现中为 false、在 JSON 中省略，也不证明本地已经删除。不要把它们当作已完成项，也不要仅凭 `results.length` 或 `deleted+failed` 计算已处理进度。确认远端状态后再决定后续操作。
+
+任务进度与对应逐项 audit 在同一事务中持久化；停止服务会取消后台执行并等待有界收尾，重启将遗留未终结任务标为 `interrupted`，不自动重放。已确认结果保留；本地任务/审计事务不等于 Apple 远端与数据库之间的原子事务，因此中断时仍可能存在待核查项目。后台运行上限为 2 小时；该上限不是完成全部删除的时长承诺。
+
+每个管理员最多 1 个 active 任务，服务全局最多 2 个。原任务的幂等重试不新占任务名额；其他提交及全量轮换按以下规则处理：
+
+| 条件 | HTTP / 错误码 | 调用方处理 |
+| --- | --- | --- |
+| 提交新任务时，当前管理员已有 active 任务或凭据正在轮换 | `409 BATCH_DELETE_IN_PROGRESS` | 查看当前管理员任务；轮换后重新登录 |
+| 提交新任务时，服务全局任务名额已满 | `429 BATCH_DELETE_BUSY` | 稍后重试同一操作 |
+| 同一管理员的相同 `operation_id` 携带不同 ID 列表（含顺序变化） | `409 IDEMPOTENCY_CONFLICT` | 核对原请求，保留原操作的键与列表绑定 |
+| 后台任务执行器尚未启动或正在关闭 | `503 BATCH_DELETE_UNAVAILABLE` | 等服务就绪后重试 |
+| 存在 active 删除任务时请求全量凭据轮换 | `409 BATCH_DELETE_IN_PROGRESS` | 等任务结束后再轮换；轮换不会占锁等待任务，从而阻塞进度轮询 |
+
+Apple 调用按账号组织：同一账号逐条处理，复用会话校验（validate）和目录（directory）结果，并沿用每次响应更新后的会话；每个任务内不同账号最多 2 路并发，这与全局最多 2 个 active 任务是两层限制。异常时会重新读取并验证远端状态，不会仅清理本地记录来跳过 Apple 确认；若新一次读取的 Apple 目录确认地址已不存在，可以清理对应本地记录，旧缓存中的缺失本身不构成确认。在同一账号、无异常且 N 个地址都需要先停用再删除的模拟请求计数中，复用可将 `4N` 次调用降到 `2N+2`；这只是请求次数示例，不是实际耗时或固定加速比。实际时长和成功数仍取决于 Apple 响应、限流、会话状态及异常复核，单次接收 1000 项不代表承诺 1000 项成功。
 
 ## 管理端凭证与复制格式
 
@@ -84,6 +126,8 @@ alias@example.com----IMAP_PASSWORD----CLIENT_ID----REFRESH_TOKEN
 管理 API 的凭证响应设置 `Cache-Control: no-store`。legacy alias 使用兼容接口只轮换 API Key 和由其派生的旧直达链接，保留消费记录、邮件快照、IMAP `Seen` 状态及 credential mode。v2 alias 可显式轮换整套凭证，使旧 API Key、派生取码 URL、IMAP 密码、refresh token 和所有已签发 access token 同时失效。schema 迁移本身不会轮换已领取的 legacy Key。
 
 需要在凭据泄露后整体止损时，可在安装级随机管理前缀或固定兼容入口调用 `POST <admin-path>/api/v1/aliases/rotate-all-credentials`。该接口要求有效管理 Session、`X-CSRF-Token` 和当前管理员密码，并提交 JSON `{"confirmation":"ROTATE_ALL","current_password":"CURRENT_ADMIN_PASSWORD"}`。重认证具有独立限流；`current_password` 与 `confirmation` 只用于本次校验，不得写入访问日志、应用日志或审计详情。
+
+服务存在 `queued` 或 `running` 的批量 Apple 删除任务时，全量轮换返回 `409 BATCH_DELETE_IN_PROGRESS`，请等待任务结束后重试；此时不执行轮换，也不持有轮换锁等待后台删除，以保持任务进度可轮询。
 
 全量轮换在同一事务中把所有 legacy alias 强制迁移为 v2，并为所有现有 v2 alias 轮换整套凭据。等待 Apple 目录确认的 alias 也会轮换；对应 `pending_alias_api_keys` 会同步更新为新凭证包的 API Key，原确认关系和领取流程保持不变。响应的 `data` 只返回 `total`、`rotated`、`migrated_legacy`、`rotated_v2`、`rotated_pending` 和固定为 `true` 的 `reauthentication_required`，不返回任何新凭据；其中 `rotated_pending` 是已轮换总数的子集。执行后，旧 legacy API Key 与 v1 直达链接，以及原 v2 API Key、派生链接、IMAP/OAuth 凭据和 access token 全部失效；邮件归档、消费/已读状态和 IMAP `Seen` 任务保留。管理员密码本身不变，但服务会提升执行管理员的 `password_version`、撤销该管理员的全部后台 Session，并清除随机管理路径与固定兼容路径的 Cookie，必须重新登录。
 

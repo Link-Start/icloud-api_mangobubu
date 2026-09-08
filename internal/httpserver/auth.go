@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -55,7 +56,11 @@ func (s *Server) clearSessionCookies(c *gin.Context) {
 
 func (s *Server) audit(c *gin.Context, adminID *int64, username, action, resourceType, resourceID, result, detail string) {
 	entry := domain.AuditLog{AdminID: adminID, Username: username, Action: action, ResourceType: resourceType, ResourceID: resourceID, Result: result, IP: c.ClientIP(), RequestID: requestID(c), Detail: detail, CreatedAt: time.Now().UTC()}
-	if _, err := s.store.CreateAuditLog(c.Request.Context(), entry); err != nil && !errors.Is(err, store.ErrNotFound) {
+	// The action may already have committed when a client or gateway closes
+	// its connection. Give the audit its own bounded persistence window.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer cancel()
+	if _, err := s.store.CreateAuditLog(ctx, entry); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.logger.Error("写入操作记录失败", "error", err, "request_id", requestID(c))
 	}
 }

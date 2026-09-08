@@ -1047,6 +1047,74 @@ export async function deleteAliases(ids, csrfToken) {
   };
 }
 
+export function normalizeAliasDeletionJob(raw) {
+  if (raw === null) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw Object.assign(new Error("任务查询响应异常，删除结果待确认。"), {
+      code: "INVALID_RESPONSE",
+    });
+  }
+
+  const job = raw.job && typeof raw.job === "object" ? raw.job : raw;
+  const rawResults = listFrom(job, "results", "items");
+  const count = (...keys) => {
+    const value = firstDefined(job, ...keys);
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  };
+  return {
+    jobId: firstDefined(job, "job_id", "jobId", "JobID") || "",
+    status: firstDefined(job, "status", "Status") || "",
+    requested: count("requested", "Requested"),
+    processed: count("processed", "Processed"),
+    deleted: count("deleted", "Deleted"),
+    failed: count("failed", "Failed"),
+    results: rawResults.map((rawResult) => ({
+      id: firstDefined(rawResult, "id", "ID"),
+      address: firstDefined(rawResult, "address", "Address") || "",
+      deleted: firstDefined(rawResult, "deleted", "Deleted") === true,
+      code: firstDefined(rawResult, "code", "Code") || "",
+      message: firstDefined(rawResult, "message", "Message") || "",
+      localRetained:
+        firstDefined(
+          rawResult,
+          "local_retained",
+          "localRetained",
+          "LocalRetained",
+        ) === true,
+    })),
+    requestId: firstDefined(job, "request_id", "requestId", "RequestID") || "",
+    createdAt:
+      firstDefined(job, "created_at", "createdAt", "CreatedAt") || null,
+    updatedAt:
+      firstDefined(job, "updated_at", "updatedAt", "UpdatedAt") || null,
+  };
+}
+
+export async function startAliasDeletionJob(ids, operationId, csrfToken, options = {}) {
+  const data = await apiRequest("/aliases/batch?async=1", {
+    method: "DELETE",
+    body: { alias_ids: ids, operation_id: operationId },
+    csrfToken,
+    signal: options.signal,
+  });
+  return normalizeAliasDeletionJob(data);
+}
+
+export async function getAliasDeletionJob(jobId, options = {}) {
+  const data = await apiRequest(
+    `/aliases/batch/jobs/${encodeURIComponent(jobId)}`,
+    { signal: options.signal },
+  );
+  return normalizeAliasDeletionJob(data);
+}
+
+export async function getLatestAliasDeletionJob(options = {}) {
+  const data = await apiRequest("/aliases/batch/jobs/latest", {
+    signal: options.signal,
+  });
+  return normalizeAliasDeletionJob(data);
+}
+
 export async function getAuditLogs(options = {}) {
   const query = listQuery(options);
   const data = await apiRequest(`/audit?${query}`, {

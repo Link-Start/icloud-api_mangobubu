@@ -17,7 +17,8 @@ import (
 const adminAPIMaxAliasBatchDelete = domain.MaxEnabledAliasesPerAccount
 
 type adminAPIDeleteAliasesRequest struct {
-	AliasIDs []int64 `json:"alias_ids"`
+	AliasIDs    []int64 `json:"alias_ids"`
+	OperationID string  `json:"operation_id,omitempty"`
 }
 
 type adminAPIAliasBatchDeleteItemDTO struct {
@@ -67,6 +68,14 @@ func (s *Server) adminAPIDeleteAliases(c *gin.Context) {
 		s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIAppleServiceUnavailable())
 		return
 	}
+	if mode := c.Query("async"); mode != "" {
+		if mode != "1" {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "async 必须为 1")
+			return
+		}
+		s.adminAPIStartAliasDeletionJob(c, adminSession, input)
+		return
+	}
 
 	aliases, ok := s.adminAPIPreflightAliasBatchDelete(c, adminSession, input.AliasIDs)
 	if !ok {
@@ -112,10 +121,12 @@ func (s *Server) adminAPIDeleteAliases(c *gin.Context) {
 			s.audit(c, &adminSession.AdminID, adminSession.Username, "delete", "alias", strconv.FormatInt(aliasID, 10), "success", "batch")
 		} else {
 			apiErr := adminAPIBatchAliasDeleteError(outcome.Err)
-			apiErr = adminAPIAppleAliasDeleteFailure(apiErr)
+			if apiErr.Code != "BATCH_DELETE_INTERRUPTED" {
+				apiErr = adminAPIAppleAliasDeleteFailure(apiErr)
+				item.LocalRetained = true
+			}
 			item.Code = apiErr.Code
 			item.Message = apiErr.Message
-			item.LocalRetained = true
 			result.Failed++
 			s.auditAppleAliasDeleteFailure(c, adminSession, aliasID, apiErr)
 		}
@@ -231,6 +242,12 @@ func (s *Server) adminAPIRunAliasBatchDelete(
 }
 
 func adminAPIBatchAliasDeleteError(err error) adminAPIAppleError {
+	if errors.Is(err, context.Canceled) && hmesync.Code(err) == "" {
+		return adminAPIAppleError{
+			Status: http.StatusConflict, Code: "BATCH_DELETE_INTERRUPTED",
+			Message: "删除任务已中断，请刷新 Apple 目录核对结果后重试",
+		}
+	}
 	if errors.Is(err, store.ErrAliasConfirmationPending) || errors.Is(err, hmesync.ErrAliasConfirmationPending) {
 		return adminAPIAppleError{
 			Status:  http.StatusConflict,

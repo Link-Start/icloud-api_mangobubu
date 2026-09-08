@@ -44,6 +44,7 @@ type Server struct {
 	mailSyncWakeMu       sync.Mutex
 	mailSyncWake         map[int64]time.Time
 	credentialRotationMu sync.RWMutex
+	aliasDeletionJobs    aliasDeletionJobRuntime
 	// beforeCredentialRotationLock is a deterministic test seam. Production
 	// leaves it nil.
 	beforeCredentialRotationLock func()

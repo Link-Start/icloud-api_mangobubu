@@ -14,6 +14,8 @@ import {
   getAllAuditLogs,
   getAccounts,
   getAliasPage,
+  getAliasDeletionJob,
+  getLatestAliasDeletionJob,
   getAllAliases,
   getMailGroups,
   getAllRuntimeLogs,
@@ -25,11 +27,13 @@ import {
   moveAliasToGroup,
   moveAliasesToGroup,
   normalizeAutoCreation,
+  normalizeAliasDeletionJob,
   rotateAlias,
   rotateAllAliasCredentials,
   setAliasAutoCreation,
   syncAccount,
   syncAccountAliases,
+  startAliasDeletionJob,
   updateMailGroup,
   verifyAppleSession,
 } from "../src/api/admin.js";
@@ -738,6 +742,125 @@ test(`alias pages apply ${parameter}, search and account filters before paginati
   );
 });
 }
+
+test("async alias deletion sends the operation ID once and maps the 202 snapshot exactly", async () => {
+  const operationId = "63c21a27-6ef4-425f-a11c-edda65c29267";
+  const controller = new AbortController();
+  const requests = [];
+  const raw = {
+    job_id: operationId, status: "running", requested: 9, processed: 2,
+    deleted: 1, failed: 1, request_id: "request-42",
+    created_at: "2026-09-08T01:00:00Z", updated_at: "2026-09-08T01:00:01Z",
+    results: [
+      { id: 91, address: "deleted@icloud.com", deleted: true },
+      { id: 92, address: "retained@icloud.com", deleted: false,
+        code: "APPLE_RATE_LIMITED", message: "稍后核对", local_retained: true },
+    ],
+  };
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return jsonResponse(raw, 202);
+  };
+
+  const result = await startAliasDeletionJob([91, 92], operationId, "csrf-token", {
+    signal: controller.signal,
+  });
+  assert.equal(requests.length, 1);
+  const { url, options } = requests[0];
+  assert.equal(url, "/admin/api/v1/aliases/batch?async=1");
+  assert.equal(options.method, "DELETE");
+  assert.equal(options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.equal(options.signal, controller.signal);
+  assert.deepEqual(JSON.parse(options.body), { alias_ids: [91, 92], operation_id: operationId });
+  assert.deepEqual(result, {
+    jobId: operationId, status: "running", requested: 9, processed: 2,
+    deleted: 1, failed: 1, requestId: "request-42",
+    createdAt: raw.created_at, updatedAt: raw.updated_at,
+    results: [
+      { id: 91, address: "deleted@icloud.com", deleted: true, code: "", message: "", localRetained: false },
+      { id: 92, address: "retained@icloud.com", deleted: false,
+        code: "APPLE_RATE_LIMITED", message: "稍后核对", localRetained: true },
+    ],
+  });
+});
+
+test("job reads encode IDs, forward cancellation, and preserve latest null", async () => {
+  const requests = [];
+  const controller = new AbortController();
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return jsonResponse(url.endsWith("/latest") ? null : {
+      job_id: "job/id?value", status: "queued", requested: 2, processed: 0,
+      deleted: 0, failed: 0, results: [],
+    });
+  };
+  assert.equal((await getAliasDeletionJob("job/id?value", { signal: controller.signal })).status, "queued");
+  assert.equal(await getLatestAliasDeletionJob({ signal: controller.signal }), null);
+  assert.deepEqual(requests.map(({ url }) => url), [
+    "/admin/api/v1/aliases/batch/jobs/job%2Fid%3Fvalue",
+    "/admin/api/v1/aliases/batch/jobs/latest",
+  ]);
+  for (const { options } of requests) {
+    assert.equal(options.method, "GET");
+    assert.equal(options.body, undefined);
+    assert.equal(options.signal, controller.signal);
+  }
+});
+
+test("job normalization never derives counters from results or invents retention evidence", () => {
+  const result = normalizeAliasDeletionJob({
+    job_id: "job", status: "interrupted", requested: 8, processed: 1,
+    deleted: 0, failed: 6,
+    results: [{ id: 91, deleted: false, code: "BATCH_DELETE_INTERRUPTED" }],
+  });
+  assert.equal(result.processed, 1);
+  assert.equal(result.failed, 6);
+  assert.equal(result.deleted, 0);
+  assert.equal(result.results[0].localRetained, false);
+  const malformed = normalizeAliasDeletionJob({ job_id: "job", results: [{ deleted: "false", local_retained: "false" }] });
+  assert.equal(malformed.status, "");
+  assert.deepEqual([malformed.requested, malformed.processed, malformed.deleted, malformed.failed], [null, null, null, null]);
+  assert.equal(malformed.results[0].deleted, false);
+  assert.equal(malformed.results[0].localRetained, false);
+  for (const value of [null, -1, 0.5, "2"]) {
+    assert.equal(normalizeAliasDeletionJob({ processed: value }).processed, null);
+  }
+  assert.equal(normalizeAliasDeletionJob(null), null);
+  for (const value of [[], "invalid", false]) {
+    assert.throws(() => normalizeAliasDeletionJob(value), { code: "INVALID_RESPONSE" });
+  }
+});
+
+test("async deletion preserves admission errors and request IDs without retrying DELETE", async () => {
+  for (const [status, code] of [
+    [409, "BATCH_DELETE_IN_PROGRESS"], [409, "IDEMPOTENCY_CONFLICT"],
+    [429, "BATCH_DELETE_BUSY"], [503, "BATCH_DELETE_UNAVAILABLE"],
+  ]) {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { code, message: "提交未接收", request_id: "error-request" } }), {
+        status, headers: { "Content-Type": "application/json" },
+      });
+    };
+    await assert.rejects(startAliasDeletionJob([91], "operation-id", "csrf"), {
+      status, code, requestId: "error-request",
+    });
+    assert.equal(calls, 1);
+  }
+});
+
+test("an owner-isolated 404 is propagated rather than replaced by latest", async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ error: { code: "NOT_FOUND" } }), {
+      status: 404, headers: { "Content-Type": "application/json" },
+    });
+  };
+  await assert.rejects(getAliasDeletionJob("other-owner-job"), { status: 404, code: "NOT_FOUND" });
+  assert.equal(calls, 1);
+});
 
 test("alias pages omit disabled latest-mail filters", async () => {
   const requests = [];

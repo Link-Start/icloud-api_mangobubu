@@ -30,7 +30,7 @@
           v-model="moveTargetGroupId"
           class="alias-group-bulk-select"
           :loading="groupsLoading || movingAliases || deletingAliases"
-          :disabled="movingAliases || deletingAliases"
+          :disabled="movingAliases || deletingAliases || deletionJobBlocked"
           placeholder="移动到分组"
           aria-label="将勾选的隐私邮箱移动到分组"
           @change="moveSelectedAliases"
@@ -51,6 +51,7 @@
           :loading="deletingAliases"
           :disabled="
             deletingAliases ||
+            deletionJobBlocked ||
             movingAliases ||
             exportingAll ||
             rotatingAllCredentials
@@ -254,6 +255,81 @@
         </el-button>
       </div>
     </div>
+
+    <section
+      v-if="deletionJob || deletionState.recovering || deletionState.submitting || deletionState.uncertain"
+      class="data-panel alias-deletion-progress"
+      aria-labelledby="alias-deletion-title"
+    >
+      <div class="alias-deletion-progress__header">
+        <strong id="alias-deletion-title">Apple 批量删除</strong>
+        <el-tag :type="deletionJobType">{{ deletionStatusLabel }}</el-tag>
+        <el-button
+          :icon="Refresh"
+          :loading="deletionState.checking"
+          :disabled="deletingAliases || deletionState.submitting"
+          @click="refreshDeletionJob"
+        >刷新任务状态</el-button>
+      </div>
+      <template v-if="deletionJob">
+        <p role="status" aria-live="polite" aria-atomic="true">
+          已处理 {{ deletionJob.processed }} / {{ deletionJob.requested }}；
+          成功删除 {{ deletionJob.deleted }}；失败 {{ deletionJob.failed }}
+        </p>
+        <el-progress
+          :percentage="deletionPercentage"
+          :show-text="false"
+          aria-label="Apple 批量删除进度"
+        />
+        <p class="alias-deletion-progress__meta">
+          任务：{{ deletionJob.jobId }} · 更新：{{ formatTime(deletionJob.updatedAt) }}
+          <span v-if="deletionJob.requestId"> · 请求编号：{{ deletionJob.requestId }}</span>
+        </p>
+        <p v-if="isAliasDeletionJobActive(deletionJob)" class="alias-deletion-progress__hint">
+          任务在服务端持续执行，每 2 秒串行查询进度；离开或刷新页面不会取消任务。
+        </p>
+      </template>
+      <p v-if="deletionState.recovering" role="status">
+        正在恢复当前管理员的最近任务，查询确认前暂停新建删除任务。
+      </p>
+      <p v-if="!deletionJob && deletionState.operationId" class="alias-deletion-progress__meta">
+        本次任务：{{ deletionState.operationId }}
+      </p>
+      <p v-if="deletionState.uncertain" class="alias-deletion-progress__hint" role="status">
+        {{ deletionState.unmatched ? "尚未查到本次提交对应的任务。" : "任务查询或提交响应异常。" }}
+        删除结果待确认，保留最近已知进度；系统只重试查询，不会自动重新提交删除请求。
+        <span v-if="deletionState.error?.code">（{{ deletionState.error.code }}）</span>
+        <span v-if="deletionState.error?.requestId">请求编号：{{ deletionState.error.requestId }}</span>
+      </p>
+      <div v-if="deletionState.unmatched" class="alias-deletion-progress__hint">
+        如需重新选择，请先在主号详情刷新 Apple 目录确认实际状态。
+        <el-button
+          :disabled="deletionState.checking || deletingAliases"
+          @click="acknowledgeDeletionState"
+        >已刷新 Apple 目录并核对结果</el-button>
+      </div>
+      <p v-if="deletionJob?.status === 'interrupted'" class="alias-deletion-progress__hint" role="status">
+        任务已中断，部分 Apple 结果待确认。请在主号详情刷新 Apple 目录确认后重新选择；系统不会自动重放剩余项。
+      </p>
+      <div v-if="deletionRecentFailures.length" class="alias-deletion-progress__failures">
+        <strong>近期未删除或待确认结果（最近 {{ deletionRecentFailures.length }} 项）</strong>
+        <div v-for="failure in deletionRecentFailures" :key="failure.id">
+          {{ failure.address || `ID ${failure.id}` }}：{{ failure.message || failure.code || "删除结果待确认" }}
+          <span v-if="failure.localRetained">；本地记录已保留</span>
+          <span v-else>；Apple / 本地状态待核对</span>
+        </div>
+      </div>
+      <details v-if="deletionJob?.results.length" @toggle="deletionResultsExpanded = $event.target.open">
+        <summary>查看服务端已返回的逐项结果（{{ deletionJob.results.length }} 项）</summary>
+        <ul v-if="deletionResultsExpanded" class="alias-deletion-progress__results">
+          <li v-for="result in deletionJob.results" :key="result.id">
+            {{ result.address || `ID ${result.id}` }}：
+            {{ result.deleted ? "已删除" : result.message || result.code || "删除结果待确认" }}
+            <span v-if="!result.deleted && result.localRetained">；本地记录已保留</span>
+          </li>
+        </ul>
+      </details>
+    </section>
 
       <RequestAlert
         v-if="accountsLoadError || groupsError"
@@ -569,21 +645,23 @@ import {
   Setting,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 
 import {
   createMailGroup,
-  deleteAliases,
   deleteMailGroup,
   getAccount,
   getAccountPage,
   getAliasPage,
+  getAliasDeletionJob,
   getAllAliases,
   getMailGroups,
+  getLatestAliasDeletionJob,
   moveAliasToGroup,
   moveAliasesToGroup,
   rotateAllAliasCredentials,
+  startAliasDeletionJob,
   updateMailGroup,
 } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
@@ -593,6 +671,13 @@ import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
 import VirtualDataTable from "../components/VirtualDataTable.vue";
 import { useAuth } from "../stores/auth.js";
+import {
+  createAliasDeletionController,
+  createAliasDeletionStorage,
+  isAliasDeletionJobActive,
+  isAliasDeletionJobTerminal,
+} from "../utils/aliasDeletionJob.js";
+import { ADMIN_BASE_PATH } from "../utils/runtimePath.js";
 import {
   createActionLock,
   createLatestRequestGate,
@@ -668,6 +753,76 @@ const groupsLoadGate = createLatestRequestGate();
 let accountSearchTimer = null;
 let aliasAbortController = null;
 let viewActive = true;
+
+const deletionState = ref({});
+const deletionResultsExpanded = ref(false);
+let deletionController = makeDeletionController();
+deletionState.value = deletionController.getState();
+const deletionJob = computed(() => deletionState.value.job);
+const deletionJobBlocked = computed(() => deletionState.value.blocked);
+const deletionPercentage = computed(() => deletionJob.value?.requested
+  ? Math.min(100, Math.max(0, deletionJob.value.processed / deletionJob.value.requested * 100))
+  : 0);
+const deletionRecentFailures = computed(() =>
+  (deletionJob.value?.results || []).filter((item) => !item.deleted).slice(-5).reverse(),
+);
+const deletionJobType = computed(() => {
+  if (deletionState.value.uncertain || deletionJob.value?.failed || deletionJob.value?.status === "interrupted") return "warning";
+  return deletionJob.value?.status === "completed" ? "success" : "info";
+});
+const deletionStatusLabel = computed(() => {
+  if (deletionState.value.submitting) return "正在提交";
+  if (deletionState.value.uncertain) return "结果待确认";
+  if (deletionState.value.recovering) return "恢复任务中";
+  return { queued: "排队中", running: "执行中", completed: "已完成", interrupted: "已中断" }[deletionJob.value?.status] || "查询中";
+});
+
+function makeDeletionController() {
+  const username = auth.state.username;
+  return createAliasDeletionController({
+    startJob: startAliasDeletionJob,
+    getJob: getAliasDeletionJob,
+    getLatestJob: getLatestAliasDeletionJob,
+    storage: createAliasDeletionStorage(ADMIN_BASE_PATH, username),
+    onChange(next) {
+      if (!viewActive || auth.state.username !== username) return;
+      const previousJob = deletionState.value.job;
+      deletionState.value = next;
+      if (next.job && next.job.jobId !== previousJob?.jobId) {
+        clearAliasSelection();
+        deletionResultsExpanded.value = false;
+      }
+      if (isAliasDeletionJobTerminal(next.job) &&
+          (next.job.jobId !== previousJob?.jobId || !isAliasDeletionJobTerminal(previousJob))) {
+        clearAliasSelection();
+        void Promise.all([
+          loadAliases({ silent: true }),
+          loadAccounts({ silent: true }),
+          loadGroups({ silent: true }),
+        ]);
+      }
+    },
+  });
+}
+
+watch(() => auth.state.username, () => {
+  deletionController.stop();
+  deletionController = makeDeletionController();
+  deletionState.value = deletionController.getState();
+  deletionResultsExpanded.value = false;
+  clearAliasSelection();
+  if (viewActive && auth.state.username) void deletionController.start();
+}, { flush: "sync" });
+
+function refreshDeletionJob() {
+  return deletionController.refresh({ latest: true });
+}
+
+function acknowledgeDeletionState() {
+  if (!deletionController.acknowledgeUnmatched()) return;
+  clearAliasSelection();
+  void loadAliases();
+}
 
 const selectedAliases = computed(() => {
   const selectedIds = new Set(selectedAliasIds.value);
@@ -1050,7 +1205,10 @@ function batchDeleteAccountState(detail) {
 
 async function deleteSelectedAliases() {
   if (
+    !viewActive ||
+    !auth.state.username ||
     deletingAliases.value ||
+    deletionJobBlocked.value ||
     movingAliases.value ||
     exportingAll.value ||
     rotatingAllCredentials.value ||
@@ -1059,6 +1217,9 @@ async function deleteSelectedAliases() {
     return;
   }
 
+  const controller = deletionController;
+  const username = auth.state.username;
+  const isCurrent = () => viewActive && deletionController === controller && auth.state.username === username;
   const selectedIds = [...selectedAliasIds.value];
   const selected = aliases.value.filter((alias) => selectedIds.includes(alias.id));
   if (selected.length !== selectedIds.length) {
@@ -1082,6 +1243,7 @@ async function deleteSelectedAliases() {
     const details = await Promise.all(
       accountIds.map((accountId) => getAccount(accountId, { limit: 1, offset: 0 })),
     );
+    if (!isCurrent()) return;
     const states = details.map(batchDeleteAccountState);
     if (states.includes("custom")) {
       ElMessage.warning("批量删除仅支持 Apple 已登录的 iCloud 主号。");
@@ -1107,6 +1269,7 @@ async function deleteSelectedAliases() {
         autofocus: false,
       },
     );
+    if (!isCurrent()) return;
     await ElMessageBox.prompt(
       "这是 Apple 端不可恢复的操作。请输入 DELETE_APPLE_ALIASES 以确认。",
       "最终确认批量删除",
@@ -1122,34 +1285,16 @@ async function deleteSelectedAliases() {
       },
     );
 
-    const result = await deleteAliases(selectedIds, auth.state.csrfToken);
-    clearAliasSelection();
-    await Promise.all([
-      loadAliases(),
-      loadAccounts({ silent: true }),
-    ]);
-    const failed = Math.max(
-      Number(result?.failed) || 0,
-      Array.isArray(result?.results)
-        ? result.results.filter((item) => !item.deleted).length
-        : 0,
-    );
-    const deleted = Math.max(
-      Number(result?.deleted) || 0,
-      selected.length - failed,
-    );
-    if (failed > 0) {
-      ElMessage.warning(
-        `Apple 已永久删除 ${deleted} 个隐私邮箱，${failed} 个失败；失败邮箱的本地记录已保留，请处理错误后重试。`,
-      );
-    } else {
-      successMessage(`已从 Apple 和本项目永久删除 ${deleted} 个隐私邮箱。`);
-    }
+    if (!isCurrent()) return;
+    const submitted = await controller.submit(selectedIds, auth.state.csrfToken);
+    if (!isCurrent()) return;
+    if (submitted) clearAliasSelection();
+    else ElMessage.warning("删除任务状态已变化，请先查看任务进度。");
   } catch (error) {
-    if (confirmationCancelled(error)) return;
+    if (!isCurrent() || confirmationCancelled(error)) return;
     showRequestError(
       error,
-      "批量删除未完成，本地记录已保留，请稍后重试。",
+      "删除任务未提交，请检查提示后再操作。",
     );
   } finally {
     deletingAliases.value = false;
@@ -1482,7 +1627,8 @@ async function moveSelectedAliases(groupValue) {
   if (
     !selectedAliasIds.value.length ||
     movingAliases.value ||
-    deletingAliases.value
+    deletingAliases.value ||
+    deletionJobBlocked.value
   ) {
     return;
   }
@@ -1543,6 +1689,7 @@ function openAccount(id) {
 }
 
 onMounted(() => {
+  if (auth.state.username) void deletionController.start();
   loadAccounts();
   loadGroups();
   loadAliases();
@@ -1551,6 +1698,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   viewActive = false;
+  deletionController.stop();
   if (accountSearchTimer !== null) {
     window.clearTimeout(accountSearchTimer);
     accountSearchTimer = null;
@@ -1564,6 +1712,49 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.alias-deletion-progress {
+  display: grid;
+  flex: 0 0 auto;
+  min-width: 0;
+  max-height: 40vh;
+  gap: 10px;
+  padding: 16px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.alias-deletion-progress__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.alias-deletion-progress__meta,
+.alias-deletion-progress__hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.alias-deletion-progress__failures {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.alias-deletion-progress summary {
+  cursor: pointer;
+}
+
+.alias-deletion-progress__results {
+  max-height: 220px;
+  padding-left: 20px;
+  overflow: auto;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
 .alias-list-filters {
   display: grid;
   grid-template-columns: minmax(220px, 1.3fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(140px, 0.75fr) auto;

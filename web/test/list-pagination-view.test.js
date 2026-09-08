@@ -136,8 +136,11 @@ test("alias paging resets on filters and supports full batched display/export", 
   assert.match(source, /getAccount\(accountId, \{ limit: 1, offset: 0 \}\)/);
   assert.match(source, /Apple 已登录的 iCloud 主号/);
   assert.match(source, /DELETE_APPLE_ALIASES/);
-  assert.match(source, /await deleteAliases\(selectedIds, auth\.state\.csrfToken\)/);
-  assert.match(source, /本地记录已保留/);
+  assert.match(source, /await controller\.submit\(selectedIds, auth\.state\.csrfToken\)/);
+  assert.doesNotMatch(source, /await deleteAliases\(/);
+  assert.match(source, /startJob: startAliasDeletionJob/);
+  assert.match(source, /deletionJob\.processed/);
+  assert.match(source, /v-if="failure\.localRetained"/);
 });
 
 test("latest-mail choices update both filter flags and reset cleanly", async () => {

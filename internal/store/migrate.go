@@ -559,7 +559,31 @@ var sqliteMailGroupSchema = []string{
 
 var schemaV8WithMailGroups = append(append([]string{}, schemaV8...), sqliteMailGroupSchema...)
 
+// Progress snapshots are additive v8 schema convergence in both databases.
+// BIGINT uses the store's existing Unix-nanosecond timestamp encoding. There
+// are deliberately no credentials or foreign keys to aliases: deleted alias
+// IDs and their confirmed results must survive for administrator inspection.
+const createAliasDeletionJobsTable = `CREATE TABLE IF NOT EXISTS alias_deletion_jobs (
+		id TEXT NOT NULL CHECK(length(trim(id)) BETWEEN 1 AND 128),
+		admin_id BIGINT NOT NULL REFERENCES admins(id) ON DELETE CASCADE CHECK(admin_id > 0),
+		request_id TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'interrupted')),
+		items_json TEXT NOT NULL DEFAULT '[]',
+		created_at BIGINT NOT NULL,
+		updated_at BIGINT NOT NULL,
+		PRIMARY KEY(admin_id, id)
+	)`
+
+const createAliasDeletionJobsLatestIndex = `CREATE INDEX IF NOT EXISTS alias_deletion_jobs_admin_created_idx
+		ON alias_deletion_jobs(admin_id, created_at DESC, id DESC)`
+
+const createAliasDeletionJobsActiveIndex = `CREATE UNIQUE INDEX IF NOT EXISTS alias_deletion_jobs_active_admin_idx
+		ON alias_deletion_jobs(admin_id) WHERE status IN ('queued', 'running')`
+
 var sqliteSchemaConvergence = []string{
+	createAliasDeletionJobsTable,
+	createAliasDeletionJobsLatestIndex,
+	createAliasDeletionJobsActiveIndex,
 	// Mailbox settings live in a side table so upgrading an existing v7
 	// database never rewrites the heavily used accounts table. Missing rows are
 	// interpreted as the historical iCloud mode by account reads.
@@ -1813,6 +1837,9 @@ var postgresMigrateV3ToV4 = []string{
 }
 
 var postgresSchemaConvergence = []string{
+	createAliasDeletionJobsTable,
+	createAliasDeletionJobsLatestIndex,
+	createAliasDeletionJobsActiveIndex,
 	// See the SQLite convergence note above. This side table is intentionally
 	// created with IF NOT EXISTS so convergence can repair an interrupted v8
 	// migration without a destructive accounts-table rewrite.

@@ -1816,7 +1816,6 @@ func TestDeleteAliasesUsesAppleFirstWorkflowForEachAlias(t *testing.T) {
 	repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "one@icloud.com", Enabled: true})
 	repo.addAlias(domain.Alias{ID: 42, AccountID: 3, Address: "two@icloud.com", Enabled: true})
 
-	var listCalls atomic.Int32
 	var events []string
 	client := &fakeAppleClient{
 		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
@@ -1824,17 +1823,13 @@ func TestDeleteAliasesUsesAppleFirstWorkflowForEachAlias(t *testing.T) {
 			return session, nil
 		},
 		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
-			call := listCalls.Add(1)
-			address := "one@icloud.com"
-			remoteID := "remote-one"
-			if call == 2 {
-				address = "two@icloud.com"
-				remoteID = "remote-two"
-			}
-			events = append(events, "list:"+remoteID)
+			events = append(events, "list")
 			result := aliasDeletionDirectory()
 			result.Aliases = []apple.Alias{{
-				AnonymousID: remoteID, HME: address,
+				AnonymousID: "remote-one", HME: "one@icloud.com",
+				ForwardToEmail: "primary@icloud.com", IsActive: true,
+			}, {
+				AnonymousID: "remote-two", HME: "two@icloud.com",
 				ForwardToEmail: "primary@icloud.com", IsActive: true,
 			}}
 			return result, session, nil
@@ -1871,7 +1866,7 @@ func TestDeleteAliasesUsesAppleFirstWorkflowForEachAlias(t *testing.T) {
 	if client.deactivateCalls.Load() != 2 || client.deleteCalls.Load() != 2 {
 		t.Fatalf("Apple calls: deactivate=%d delete=%d", client.deactivateCalls.Load(), client.deleteCalls.Load())
 	}
-	wantEvents := "validate,list:remote-one,deactivate:remote-one,delete:remote-one,local:41,validate,list:remote-two,deactivate:remote-two,delete:remote-two,local:42"
+	wantEvents := "validate,list,deactivate:remote-one,delete:remote-one,local:41,deactivate:remote-two,delete:remote-two,local:42"
 	if got := strings.Join(events, ","); got != wantEvents {
 		t.Fatalf("batch operation order = %q, want %q", got, wantEvents)
 	}

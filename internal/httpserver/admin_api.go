@@ -88,6 +88,8 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.GET("/aliases", s.adminAPIListAliases)
 	protected.PATCH("/aliases/group", s.adminAPIMoveAliasesToGroup)
 	protected.DELETE("/aliases/batch", s.adminAPIDeleteAliases)
+	protected.GET("/aliases/batch/jobs/latest", s.adminAPIGetLatestAliasDeletionJob)
+	protected.GET("/aliases/batch/jobs/:jobID", s.adminAPIGetAliasDeletionJob)
 	protected.GET("/aliases/:id", s.adminAPIGetAlias)
 	protected.POST("/aliases/:id/rotate-key", s.adminAPIRotateAliasKey)
 	protected.POST("/aliases/:id/rotate-credentials", s.adminAPIRotateAliasCredentials)
@@ -1845,6 +1847,12 @@ func (s *Server) adminAPIRotateAllAliasCredentials(c *gin.Context) {
 		return
 	}
 
+	endRotation, rotationOK := s.beginAliasDeletionCredentialRotation()
+	if !rotationOK {
+		writeAdminAPIError(c, http.StatusConflict, "BATCH_DELETE_IN_PROGRESS", "后台删除任务正在运行，请完成后再轮换凭证")
+		return
+	}
+	defer endRotation()
 	if s.beforeCredentialRotationLock != nil {
 		s.beforeCredentialRotationLock()
 	}
