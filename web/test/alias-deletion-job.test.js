@@ -257,6 +257,48 @@ test("rate-limit waits resume the original job with zero outcomes and never send
     snapshot.processed === 0 && snapshot.failed === 0 && !isAliasDeletionJobTerminal(snapshot)));
 });
 
+test("polling keeps account waits while other accounts make progress on the same job", async (t) => {
+  const waits = [{ accountId: 1, aliasId: 101, operation: "delete", attempt: 1, maxAttempts: 3,
+    retryAt: "2026-09-10T01:05:00Z", httpStatus: 429 }];
+  const snapshots = [
+    job("running", { requested: 4, waits }),
+    job("running", { requested: 4, waits, processed: 1, deleted: 1,
+      results: [{ id: 201, deleted: true }] }),
+    job("running", { requested: 4, waits, processed: 2, deleted: 2,
+      results: [{ id: 201, deleted: true }, { id: 301, deleted: true }] }),
+    job("completed", { requested: 4, waits: [], processed: 4, deleted: 4,
+      results: [101, 102, 201, 301].map((id) => ({ id, deleted: true })) }),
+  ];
+  let polls = 0;
+  const { controller, timers, storage, calls } = harness({
+    getJob: async (id) => {
+      assert.equal(id, operationId);
+      return snapshots[polls++];
+    },
+  });
+  t.after(() => controller.stop());
+  await controller.start();
+  await controller.submit([101, 102, 201, 301], "csrf");
+  for (const snapshot of snapshots) {
+    assert.equal(timers.fireNext(), ALIAS_DELETION_POLL_INTERVAL_MS);
+    await controller.refresh();
+    const state = controller.getState();
+    assert.equal(state.job.jobId, operationId);
+    assert.deepEqual(state.job.waits, snapshot.waits);
+    assert.equal(state.job.processed, snapshot.processed);
+    assert.equal(state.job.deleted, snapshot.deleted);
+    assert.equal(state.job.failed, 0);
+    if (snapshot.status === "running") {
+      assert.deepEqual(storage.read(), { operationId });
+      assert.deepEqual(timers.delays(), [ALIAS_DELETION_POLL_INTERVAL_MS]);
+    }
+  }
+  assert.equal(polls, 4);
+  assert.equal(calls.filter(([method]) => method === "DELETE").length, 1);
+  assert.deepEqual(timers.delays(), []);
+  assert.equal(storage.read(), null);
+});
+
 test("result messages deduplicate retention notices and distinguish deferred and unknown outcomes", () => {
   const rateLimited = { deleted: false, code: "APPLE_RATE_LIMITED", localRetained: true };
   for (const message of [

@@ -290,7 +290,7 @@
           任务在服务端持续执行，每 2 秒串行查询进度；离开或刷新页面不会取消任务。
         </p>
         <div v-if="deletionWaits.length" class="alias-deletion-progress__waits" role="status" aria-live="polite">
-          <strong>Apple限流，正在等待后继续</strong>
+          <strong>以下主号触发 Apple 限流，等待后继续</strong>
           <div v-for="(wait, index) in deletionWaits" :key="`${wait.accountId}:${wait.aliasId}:${wait.operation}:${index}`">
             <span v-if="wait.accountId">主号 ID {{ wait.accountId }}</span>
             <span v-if="wait.aliasId">{{ wait.accountId ? " · " : "" }}邮箱 ID {{ wait.aliasId }}</span>
@@ -298,7 +298,7 @@
             · 预计重试时间：{{ formatTime(wait.retryAt, { seconds: true }) }}
             · 第 {{ wait.attempt }} 次重试（最多 {{ wait.maxAttempts }} 次）
           </div>
-          <span class="alias-deletion-progress__hint">等待中的邮箱及剩余项尚未计为已处理或失败；到时由服务端继续原任务。</span>
+          <span class="alias-deletion-progress__hint">仅上述主号等待；其他未限流主号继续处理。等待中的邮箱及这些主号的剩余项尚未计为已处理或失败；到时由服务端继续。</span>
         </div>
       </template>
       <p v-if="deletionState.recovering" role="status">
@@ -788,7 +788,7 @@ const deletionStatusLabel = computed(() => {
   if (deletionState.value.submitting) return "正在提交";
   if (deletionState.value.uncertain) return "结果待确认";
   if (deletionState.value.recovering) return "恢复任务中";
-  if (deletionWaits.value.length) return "限流等待中";
+  if (deletionWaits.value.length) return "执行中（主号限流等待）";
   return { queued: "排队中", running: "执行中", completed: "已完成", interrupted: "已中断" }[deletionJob.value?.status] || "查询中";
 });
 

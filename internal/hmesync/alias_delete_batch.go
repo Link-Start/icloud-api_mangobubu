@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"icloud-api/internal/apple"
 	"icloud-api/internal/domain"
@@ -47,9 +48,12 @@ type aliasDeletionGroup struct {
 	items     []aliasDeletionItem
 }
 
-// DeleteAliases holds the operation and account locks for each account's entire
-// group, sharing one validation, directory and rolling session. Up to two account
-// groups run concurrently within a batch; each account remains strictly serial.
+// DeleteAliases holds the Apple operation lock for each account's entire group,
+// sharing one validation, directory and rolling session. With AccountLockAcquirer,
+// the shared account lock is released during recovery cooldowns so local settings
+// remain responsive. Up to two account groups actively execute within a batch;
+// a cooling account yields its execution slot so unrelated accounts can proceed.
+// Each account's Apple operations remain strictly serial.
 // Item failures do not discard already completed results or stop other accounts.
 func (s *Service) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]AliasDeletionOutcome, error) {
 	if len(aliasIDs) == 0 {
@@ -147,35 +151,32 @@ func (s *Service) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]AliasD
 		group.items = append(group.items, item)
 	}
 
-	jobs := make(chan *aliasDeletionGroup, len(groups))
-	for _, group := range groups {
-		jobs <- group
-	}
-	close(jobs)
+	// Each account keeps its own suspended flow (including its rolling session
+	// and recovery budget). Limit active execution, not the number of flows:
+	// otherwise two cooling accounts would block every healthy queued account.
+	slots := make(chan struct{}, 2)
 	var workers sync.WaitGroup
-	for range min(2, len(groups)) {
+	for _, group := range groups {
 		workers.Go(func() {
 			// Recover inside the goroutine: an HTTP caller's recovery boundary
 			// cannot catch worker panics. Defers release both account locks first.
 			if err, panicked := runAliasDeletionSafely(func() error {
-				for group := range jobs {
-					err, panicked := runAliasDeletionSafely(func() error {
-						return s.withAliasDeletionAccount(ctx, group.accountID, func() error {
-							batch := aliasDeletionBatch{s: s, repo: deleteRepo, client: deleteClient, accountID: group.accountID}
-							batch.recovery = newAliasDeletionRecovery(ctx)
-							for _, item := range group.items {
-								complete(item, batch.delete(ctx, item.aliasID))
-							}
-							return nil
-						})
-					})
-					if panicked {
-						fail(err)
-					}
-					for _, item := range group.items {
-						if !completed[item.index] {
-							complete(item, err)
+				err, panicked := runAliasDeletionSafely(func() error {
+					return s.withAliasDeletionAccount(ctx, group.accountID, slots, func(waitCooldown func(context.Context, time.Duration) error) error {
+						batch := aliasDeletionBatch{s: s, repo: deleteRepo, client: deleteClient, accountID: group.accountID, waitCooldown: waitCooldown}
+						batch.recovery = newAliasDeletionRecovery(ctx)
+						for _, item := range group.items {
+							complete(item, batch.delete(ctx, item.aliasID))
 						}
+						return nil
+					})
+				})
+				if panicked {
+					fail(err)
+				}
+				for _, item := range group.items {
+					if !completed[item.index] {
+						complete(item, err)
 					}
 				}
 				return nil
@@ -210,7 +211,37 @@ func runAliasDeletionSafely(operation func() error) (err error, panicked bool) {
 	return operation(), false
 }
 
-func (s *Service) withAliasDeletionAccount(ctx context.Context, accountID int64, operation func() error) error {
+// aliasDeletionExecutionSlot is confined to one account flow. A nil pool is
+// used by single deletion, which has no batch-level concurrency limit.
+type aliasDeletionExecutionSlot struct {
+	pool chan struct{}
+	held bool
+}
+
+func (slot *aliasDeletionExecutionSlot) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if slot.pool == nil {
+		return nil
+	}
+	select {
+	case slot.pool <- struct{}{}:
+		slot.held = true
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (slot *aliasDeletionExecutionSlot) release() {
+	if slot.held {
+		<-slot.pool
+		slot.held = false
+	}
+}
+
+func (s *Service) withAliasDeletionAccount(ctx context.Context, accountID int64, slots chan struct{}, operation func(func(context.Context, time.Duration) error) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -219,38 +250,72 @@ func (s *Service) withAliasDeletionAccount(ctx context.Context, accountID int64,
 		return err
 	}
 	defer releaseOperation()
-	guarded := func() error {
+	// A second batch waiting on this account's Apple operation must not take
+	// an execution slot needed by that batch's unrelated healthy accounts.
+	slot := aliasDeletionExecutionSlot{pool: slots}
+	if err := slot.acquire(ctx); err != nil {
+		return err
+	}
+	defer slot.release()
+	waitWithoutSlot := func(waitCtx context.Context, delay time.Duration) error {
+		slot.release()
+		if err := s.waitAliasDeletion(waitCtx, delay); err != nil {
+			return err
+		}
+		return slot.acquire(waitCtx)
+	}
+	guarded := func(waitCooldown func(context.Context, time.Duration) error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return operation()
+		return operation(waitCooldown)
 	}
 	if acquirer, ok := s.locker.(AccountLockAcquirer); ok {
 		releaseAccount, err := acquirer.AcquireAccountLock(ctx, accountID)
 		if err != nil {
 			return err
 		}
-		defer releaseAccount()
-		return guarded()
+		defer func() {
+			if releaseAccount != nil {
+				releaseAccount()
+			}
+		}()
+		return guarded(func(waitCtx context.Context, delay time.Duration) error {
+			// Responses have already checkpointed the rolling Apple session.
+			// Keep its operation lock, but let local settings use the account
+			// boundary while no remote request or publication is in flight.
+			releaseAccount()
+			releaseAccount = nil
+			if err := waitWithoutSlot(waitCtx, delay); err != nil {
+				return err
+			}
+			var err error
+			releaseAccount, err = acquirer.AcquireAccountLock(waitCtx, accountID)
+			return err
+		})
 	}
-	return s.locker.WithAccountLock(ctx, accountID, guarded)
+	// Callback-only embedders do not expose a safe release/reacquire boundary.
+	return s.locker.WithAccountLock(ctx, accountID, func() error { return guarded(waitWithoutSlot) })
 }
 
-// aliasDeletionBatch is confined to one worker under both account locks. Nothing
-// is cached beyond that boundary: another operation may change identity or tokens.
+// aliasDeletionBatch is confined to one worker under the Apple operation lock.
+// Requests and local publication also hold the shared account lock. Recovery
+// invalidates the directory and rechecks local identity/pending state after a
+// cooldown, since settings can change while the shared account lock is released.
 type aliasDeletionBatch struct {
-	s         *Service
-	repo      AliasDeletionRepository
-	client    AliasDeletionClient
-	accountID int64
-	account   domain.Account
-	record    domain.AppleWebSession
-	session   apple.Session
-	ready     bool
-	stopped   error
-	directory map[string]apple.Alias // Includes foreign aliases for ownership checks.
-	valid     bool
-	recovery  *aliasDeletionRecovery // Only opt-in DeleteAliases, never DeleteAlias.
+	s            *Service
+	repo         AliasDeletionRepository
+	client       AliasDeletionClient
+	accountID    int64
+	account      domain.Account
+	record       domain.AppleWebSession
+	session      apple.Session
+	ready        bool
+	stopped      error
+	directory    map[string]apple.Alias // Includes foreign aliases for ownership checks.
+	valid        bool
+	recovery     *aliasDeletionRecovery // Only opt-in DeleteAliases, never DeleteAlias.
+	waitCooldown func(context.Context, time.Duration) error
 }
 
 func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {

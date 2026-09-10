@@ -453,7 +453,7 @@ func (s *Service) DeleteAlias(ctx context.Context, aliasID int64) error {
 		return errors.New("alias account ID must be positive")
 	}
 
-	return s.withAliasDeletionAccount(ctx, initial.AccountID, func() error {
+	return s.withAliasDeletionAccount(ctx, initial.AccountID, nil, func(_ func(context.Context, time.Duration) error) error {
 		batch := aliasDeletionBatch{s: s, repo: deleteRepo, client: deleteClient, accountID: initial.AccountID}
 		return batch.delete(ctx, aliasID)
 	})

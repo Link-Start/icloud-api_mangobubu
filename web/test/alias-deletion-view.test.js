@@ -270,8 +270,9 @@ test("waiting renders server retry times, attempts, IDs and fixed Chinese operat
     message: "<script>wait-secret</script>",
   }));
   const waiting = await renderProgress({ ...raw, waits });
-  assert.match(waiting.text, /Apple限流，正在等待后继续/);
-  assert.match(waiting.text, /限流等待中/);
+  assert.match(waiting.text, /以下主号触发 Apple 限流，等待后继续/);
+  assert.match(waiting.text, /执行中（主号限流等待）/);
+  assert.match(waiting.text, /仅上述主号等待；其他未限流主号继续处理/);
   assert.match(waiting.text, /已处理 0 \/ 416； 成功删除 0；失败\/未执行 0/);
   assert.match(waiting.text, /主号 ID 12/);
   assert.match(waiting.text, /邮箱 ID 94/);
@@ -284,9 +285,48 @@ test("waiting renders server retry times, attempts, IDs and fixed Chinese operat
   assert.doesNotMatch(waiting.html, /UPSTREAM_SECRET|RAW_SECRET|wait-secret|<script>/);
   for (const next of [raw, { ...raw, waits: [] }, { ...raw, status: "completed", waits }]) {
     const resumed = await renderProgress(next);
-    assert.doesNotMatch(resumed.text, /Apple限流，正在等待后继续|限流等待中|预计重试时间/);
+    assert.doesNotMatch(resumed.text, /触发 Apple 限流|主号限流等待|仅上述主号等待|预计重试时间/);
+    assert.match(resumed.text, next.status === "completed" ? /已完成/ : /执行中/);
     assert.match(resumed.text, /已处理 0 \/ 416/);
   }
+});
+
+test("account-specific waits coexist with other accounts' completed results and ongoing progress", async () => {
+  const raw = {
+    job_id: "multi-account-job", status: "running", requested: 8, processed: 2,
+    deleted: 2, failed: 0,
+    results: [
+      { id: 201, address: "account-2-first@example.invalid", deleted: true },
+      { id: 301, address: "account-3-first@example.invalid", deleted: true },
+    ],
+    waits: [{
+      account_id: 1, alias_id: 101, operation: "delete",
+      retry_at: "2026-09-08T01:08:23Z", attempt: 1, max_attempts: 3,
+    }],
+  };
+  const waiting = await renderProgress(raw);
+  assert.match(waiting.text, /执行中（主号限流等待）/);
+  assert.match(waiting.text, /已处理 2 \/ 8； 成功删除 2；失败\/未执行 0/);
+  assert.match(waiting.text, /主号 ID 1 · 邮箱 ID 101/);
+  assert.doesNotMatch(waiting.text, /主号 ID [23]/);
+  assert.match(waiting.text, /仅上述主号等待；其他未限流主号继续处理/);
+  assert.match(waiting.text, /account-2-first@example.invalid： 已删除/);
+  assert.match(waiting.text, /account-3-first@example.invalid： 已删除/);
+
+  const progressed = await renderProgress({
+    ...raw, processed: 3, deleted: 3,
+    results: [...raw.results, { id: 302, address: "account-3-next@example.invalid", deleted: true }],
+  });
+  assert.match(progressed.text, /已处理 3 \/ 8； 成功删除 3；失败\/未执行 0/);
+  assert.match(progressed.text, /主号 ID 1 · 邮箱 ID 101/);
+  assert.match(progressed.text, /account-3-next@example.invalid： 已删除/);
+
+  const resumed = await renderProgress({ ...raw, waits: [] });
+  assert.match(resumed.text, /执行中/);
+  assert.match(resumed.text, /已处理 2 \/ 8； 成功删除 2；失败\/未执行 0/);
+  assert.doesNotMatch(resumed.text, /主号限流等待|触发 Apple 限流|仅上述主号等待|预计重试时间/);
+  assert.match(resumed.text, /account-2-first@example.invalid： 已删除/);
+  assert.match(resumed.text, /account-3-first@example.invalid： 已删除/);
 });
 
 test("416 rate-limited results have one retention notice each in both failure previews and details", async () => {
@@ -341,5 +381,5 @@ test("malformed wait metadata cannot hide the original job or introduce HTML and
   assert.match(text, /known-job/);
   assert.match(text, /已处理 7 \/ 416； 成功删除 6；失败\/未执行 1/);
   assert.doesNotMatch(html, /RAW_SECRET|<img|<script/);
-  assert.doesNotMatch(text, /限流等待中|预计重试时间|其中未执行/);
+  assert.doesNotMatch(text, /主号限流等待|预计重试时间|其中未执行/);
 });

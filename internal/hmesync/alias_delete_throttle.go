@@ -43,10 +43,11 @@ type aliasDeletionRecoveryKey struct{}
 // WithAliasDeletionRecovery opts DeleteAliases into paced, bounded throttle
 // recovery. DeleteAlias and batches without this context retain their original
 // semantics. A nil report still enables recovery, without wait notifications.
-// Reports run synchronously under account locks and can arrive concurrently for
-// different accounts: callers must synchronize shared state and must not re-enter
-// account operations. Every wait start is paired with Waiting=false on exit,
-// including cancellation. No item result is reported merely because it is waiting.
+// Reports run synchronously while account locks may be held and can arrive
+// concurrently for different accounts: callers must synchronize shared state
+// and must not re-enter account operations. Every wait start is paired with
+// Waiting=false on exit, including cancellation. No item result is reported
+// merely because it is waiting.
 func WithAliasDeletionRecovery(ctx context.Context, report func(AliasDeletionWait)) context.Context {
 	return context.WithValue(ctx, aliasDeletionRecoveryKey{}, report)
 }
@@ -211,7 +212,7 @@ func (b *aliasDeletionBatch) reportWait(ctx context.Context, operation string, c
 		}()
 		r.report(state)
 	}
-	err := b.s.waitAliasDeletion(ctx, delay)
+	err := b.waitCooldown(ctx, delay)
 	if err != nil && ctx.Err() == nil && b.stopped == nil {
 		// A failing injected waiter must not let the next item bypass a cooldown.
 		b.stopped = err
