@@ -204,6 +204,9 @@ func (f *Fetcher) fetchArchiveIncremental(
 		}
 		archived, err := fetchArchivedMessage(client, candidate, account.ID, mailbox.UIDValidity, syncedAt, settings)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return failure, ctxErr
+			}
 			return failure, err
 		}
 		result.ArchivedMessages = append(result.ArchivedMessages, archived)

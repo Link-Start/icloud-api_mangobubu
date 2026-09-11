@@ -13,10 +13,13 @@ import (
 )
 
 const (
-	defaultIMAPTimeout              = 8 * time.Second
-	defaultMaxAliases               = domain.MaxEnabledAliasesPerAccount
-	defaultMaxCandidates            = 1024
-	defaultMaxIncrementalCandidates = 256
+	defaultIMAPTimeout   = 8 * time.Second
+	defaultMaxAliases    = domain.MaxEnabledAliasesPerAccount
+	defaultMaxCandidates = 1024
+	// Message bodies are read sequentially and each batch commits atomically.
+	// Small default batches can save progress before exhausting the sync budget.
+	defaultMaxIncrementalCandidates = 32
+	maxIncrementalCandidates        = 256
 	defaultMaxHeaderBytes           = 128 << 10
 	defaultMaxMessageBytes          = 100 << 20
 	defaultMaxBodyBytes             = 512 << 10
@@ -122,7 +125,7 @@ func (f *Fetcher) settings() fetchSettings {
 		settings.maxCandidates = min(f.MaxCandidates, defaultMaxCandidates)
 	}
 	if f.MaxIncrementalCandidates > 0 {
-		settings.maxIncrementalCandidates = min(f.MaxIncrementalCandidates, defaultMaxIncrementalCandidates)
+		settings.maxIncrementalCandidates = min(f.MaxIncrementalCandidates, maxIncrementalCandidates)
 	}
 	if f.MaxHeaderBytes > 0 {
 		settings.maxHeaderBytes = f.MaxHeaderBytes
