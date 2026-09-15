@@ -454,7 +454,10 @@ func (s *Service) DeleteAlias(ctx context.Context, aliasID int64) error {
 	}
 
 	return s.withAliasDeletionAccount(ctx, initial.AccountID, nil, func(_ func(context.Context, time.Duration) error) error {
-		batch := aliasDeletionBatch{s: s, repo: deleteRepo, client: deleteClient, accountID: initial.AccountID}
+		batch := aliasDeletionBatch{
+			s: s, repo: deleteRepo, client: deleteClient, accountID: initial.AccountID,
+			initialPending: map[int64]bool{aliasID: !initial.Enabled && strings.TrimSpace(initial.LastSyncError) == domain.AppleAliasConfirmationPending},
+		}
 		return batch.delete(ctx, aliasID)
 	})
 }

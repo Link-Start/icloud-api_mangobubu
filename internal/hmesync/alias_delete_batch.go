@@ -39,8 +39,9 @@ func ReportAliasDeletionProgress(ctx context.Context, outcome AliasDeletionOutco
 }
 
 type aliasDeletionItem struct {
-	index   int
-	aliasID int64
+	index          int
+	aliasID        int64
+	pendingInitial bool
 }
 
 type aliasDeletionGroup struct {
@@ -142,6 +143,7 @@ func (s *Service) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]AliasD
 			complete(item, errors.New("alias account ID must be positive"))
 			continue
 		}
+		item.pendingInitial = !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending
 		group := byAccount[alias.AccountID]
 		if group == nil {
 			group = &aliasDeletionGroup{accountID: alias.AccountID}
@@ -163,7 +165,10 @@ func (s *Service) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]AliasD
 			if err, panicked := runAliasDeletionSafely(func() error {
 				err, panicked := runAliasDeletionSafely(func() error {
 					return s.withAliasDeletionAccount(ctx, group.accountID, slots, func(waitCooldown func(context.Context, time.Duration) error) error {
-						batch := aliasDeletionBatch{s: s, repo: deleteRepo, client: deleteClient, accountID: group.accountID, waitCooldown: waitCooldown}
+						batch := aliasDeletionBatch{s: s, repo: deleteRepo, client: deleteClient, accountID: group.accountID, waitCooldown: waitCooldown, initialPending: make(map[int64]bool, len(group.items))}
+						for _, item := range group.items {
+							batch.initialPending[item.aliasID] = item.pendingInitial
+						}
 						batch.recovery = newAliasDeletionRecovery(ctx)
 						for _, item := range group.items {
 							complete(item, batch.delete(ctx, item.aliasID))
@@ -303,19 +308,20 @@ func (s *Service) withAliasDeletionAccount(ctx context.Context, accountID int64,
 // invalidates the directory and rechecks local identity/pending state after a
 // cooldown, since settings can change while the shared account lock is released.
 type aliasDeletionBatch struct {
-	s            *Service
-	repo         AliasDeletionRepository
-	client       AliasDeletionClient
-	accountID    int64
-	account      domain.Account
-	record       domain.AppleWebSession
-	session      apple.Session
-	ready        bool
-	stopped      error
-	directory    map[string]apple.Alias // Includes foreign aliases for ownership checks.
-	valid        bool
-	recovery     *aliasDeletionRecovery // Only opt-in DeleteAliases, never DeleteAlias.
-	waitCooldown func(context.Context, time.Duration) error
+	s              *Service
+	repo           AliasDeletionRepository
+	client         AliasDeletionClient
+	accountID      int64
+	account        domain.Account
+	record         domain.AppleWebSession
+	session        apple.Session
+	ready          bool
+	stopped        error
+	directory      map[string]apple.Alias // Includes foreign aliases for ownership checks.
+	initialPending map[int64]bool         // Pending marker observed before batch admission.
+	valid          bool
+	recovery       *aliasDeletionRecovery // Only opt-in DeleteAliases, never DeleteAlias.
+	waitCooldown   func(context.Context, time.Duration) error
 }
 
 func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
@@ -329,9 +335,18 @@ func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
 	if alias.AccountID != b.accountID {
 		return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 	}
-	if !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending {
+	pendingConfirmation := !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending
+	if pendingConfirmation && !b.initialPending[aliasID] {
+		// A pending marker introduced after this flow was admitted indicates a
+		// concurrent reservation whose remote outcome is still unknown.
 		return wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, store.ErrAliasConfirmationPending)
 	}
+	// Pending auto-created aliases are eligible for deletion as well. Their
+	// local row is intentionally staged while Apple directory propagation is
+	// pending; continue through the authoritative directory refresh below. If
+	// Apple still omits the address, delete the local row directly (there is no
+	// anonymous ID to submit to Apple's mutation endpoint). If it is present,
+	// the normal deactivate/delete workflow applies.
 	if b.stopped != nil {
 		return b.stopped
 	}
@@ -354,6 +369,12 @@ func (b *aliasDeletionBatch) delete(ctx context.Context, aliasID int64) error {
 	if !b.ready {
 		b.account = account
 		if err := b.initialize(ctx); err != nil {
+			// A staged alias with no usable Apple session cannot be reconciled
+			// against the authoritative directory yet. Preserve the pending
+			// classification so callers can retry after signing in.
+			if pendingConfirmation && errors.Is(err, ErrLoginRequired) {
+				return wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, store.ErrAliasConfirmationPending)
+			}
 			if b.stopped == nil {
 				b.stopped = err
 			}

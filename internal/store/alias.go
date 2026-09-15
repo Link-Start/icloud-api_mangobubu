@@ -348,19 +348,14 @@ func (s *Store) listAliases(ctx context.Context, enabledOnly bool, accountIDs ..
 func (s *Store) DeleteAlias(ctx context.Context, id int64) error {
 	var accountID int64
 	var enabled bool
-	var lastSyncError string
 	if err := s.queryRowContext(ctx,
-		`SELECT account_id, enabled, last_sync_error FROM aliases WHERE id = ?`, id,
-	).Scan(&accountID, &enabled, &lastSyncError); err != nil {
+		`SELECT account_id, enabled FROM aliases WHERE id = ?`, id,
+	).Scan(&accountID, &enabled); err != nil {
 		if err == sql.ErrNoRows {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read alias account before delete: %w", err)
 	}
-	if !enabled && lastSyncError == domain.AppleAliasConfirmationPending {
-		return fmt.Errorf("delete alias: %w", ErrAliasConfirmationPending)
-	}
-
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin alias deletion: %w", err)
@@ -371,17 +366,13 @@ func (s *Store) DeleteAlias(ctx context.Context, id int64) error {
 		return fmt.Errorf("lock alias account before delete: %w", err)
 	}
 	var currentEnabled bool
-	var currentLastSyncError string
 	if err := s.txQueryRowContext(ctx, tx,
-		`SELECT enabled, last_sync_error FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
-	).Scan(&currentEnabled, &currentLastSyncError); err != nil {
+		`SELECT enabled FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
+	).Scan(&currentEnabled); err != nil {
 		if err == sql.ErrNoRows {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read alias state before delete: %w", err)
-	}
-	if !currentEnabled && currentLastSyncError == domain.AppleAliasConfirmationPending {
-		return fmt.Errorf("delete alias: %w", ErrAliasConfirmationPending)
 	}
 	result, err := s.txExecContext(ctx, tx,
 		`DELETE FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,

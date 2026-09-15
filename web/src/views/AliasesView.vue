@@ -1246,10 +1246,9 @@ async function deleteSelectedAliases() {
     return;
   }
   if (selected.some(isAliasConfirmationPending)) {
-    ElMessage.warning("等待 Apple 目录确认的隐私邮箱暂时不能批量删除。");
+    ElMessage.warning("等待 Apple 目录确认的隐私邮箱暂时不能批量删除，请在主号详情中核对后单独删除。");
     return;
   }
-
   deletingAliases.value = true;
   liveRefresh.stop();
   beginAliasMutation();

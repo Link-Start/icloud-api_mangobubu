@@ -151,14 +151,9 @@ func (s *Server) adminAPIPreflightAliasBatchDelete(
 			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIBatchAliasDeleteError(err))
 			return nil, false
 		}
-		if adminAPIAliasConfirmationPending(alias) {
-			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIAppleError{
-				Status:  http.StatusConflict,
-				Code:    hmesync.CodeAliasConfirmationPending,
-				Message: "该隐私邮箱正在等待 Apple 目录确认，暂时不能批量删除",
-			})
-			return nil, false
-		}
+		// Pending auto-created aliases are eligible for deletion. The deletion
+		// service refreshes Apple's authoritative directory under the account
+		// lock and removes a locally staged row when Apple omits the address.
 		if alias.AccountID < 1 {
 			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIAppleError{
 				Status:  http.StatusInternalServerError,
@@ -260,6 +255,9 @@ func adminAPIBatchAliasDeleteError(err error) adminAPIAppleError {
 			Message: "删除任务已中断，请刷新 Apple 目录核对结果后重试",
 		}
 	}
+	// A pending marker introduced after batch admission is still protected by
+	// the deletion service. Preserve that concurrency result for the API while
+	// allowing aliases that were already pending at admission to reconcile.
 	if errors.Is(err, store.ErrAliasConfirmationPending) || errors.Is(err, hmesync.ErrAliasConfirmationPending) {
 		return adminAPIAppleError{
 			Status:  http.StatusConflict,

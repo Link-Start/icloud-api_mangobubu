@@ -244,6 +244,10 @@ func TestDeleteAliasesProgressValidationAndFallback(t *testing.T) {
 	client := &fakeAppleClient{}
 	service, repo, ids, _ := newAliasDeletionBatchFixture(t, 1, client, &fakeLocker{})
 	repo.addAlias(domain.Alias{ID: ids[0], AccountID: 3, Address: "pending@icloud.com", LastSyncError: domain.AppleAliasConfirmationPending})
+	client.validate = func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil }
+	client.list = func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+		return aliasDeletionDirectory(), session, nil
+	}
 	inputs := []int64{ids[0], 0, ids[0], 999, -1}
 	var reports []AliasDeletionOutcome
 	ctx := WithAliasDeletionProgress(context.Background(), func(outcome AliasDeletionOutcome) { reports = append(reports, outcome) })
@@ -252,7 +256,7 @@ func TestDeleteAliasesProgressValidationAndFallback(t *testing.T) {
 		t.Fatal("invalid/duplicate/missing items did not each report")
 	}
 	for i, id := range inputs {
-		if outcomes[i].AliasID != id || outcomes[i].Err == nil {
+		if outcomes[i].AliasID != id || (i != 0 && outcomes[i].Err == nil) {
 			t.Errorf("invalid result at index %d", i)
 		}
 		matches := 0
@@ -265,8 +269,8 @@ func TestDeleteAliasesProgressValidationAndFallback(t *testing.T) {
 			t.Errorf("index %d reported %d times", i, matches)
 		}
 	}
-	if !errors.Is(outcomes[0].Err, ErrAliasConfirmationPending) || !errors.Is(outcomes[0].Err, store.ErrAliasConfirmationPending) {
-		t.Error("pending protection lost")
+	if outcomes[0].Err != nil || repo.hasAlias(ids[0]) || repo.aliasDeletes.Load() != 1 {
+		t.Errorf("pending alias was not treated as idempotent deletion: outcome=%#v exists=%v deletes=%d", outcomes[0], repo.hasAlias(ids[0]), repo.aliasDeletes.Load())
 	}
 	if !errors.Is(outcomes[3].Err, store.ErrNotFound) {
 		t.Error("missing alias classification lost")

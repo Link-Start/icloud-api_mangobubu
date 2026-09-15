@@ -1912,28 +1912,40 @@ func TestDeleteAliasesSessionExpiresDuringBatch(t *testing.T) {
 	}
 }
 
-func TestDeleteAliasRejectsPendingConfirmationBeforeApple(t *testing.T) {
+func TestDeleteAliasRemovesPendingConfirmationWhenAppleDirectoryOmitsIt(t *testing.T) {
 	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
 	repo.addAlias(domain.Alias{
 		ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: false,
 		LastSyncError: "  " + domain.AppleAliasConfirmationPending + "  ",
 	})
-	client := &fakeAppleClient{validate: func(context.Context, apple.Session) (apple.Session, error) {
-		t.Fatal("pending alias reached Apple validation")
-		return apple.Session{}, nil
-	}}
+	var validates, lists atomic.Int32
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			validates.Add(1)
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			lists.Add(1)
+			// The alias was reserved locally but never became visible in the
+			// authoritative Apple directory. Treat that absence as an idempotent
+			// remote deletion and remove the stale local marker.
+			return aliasDeletionDirectory(), session, nil
+		},
+	}
 	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
 
 	err := service.DeleteAlias(context.Background(), 41)
-	if !errors.Is(err, ErrAliasConfirmationPending) ||
-		!errors.Is(err, store.ErrAliasConfirmationPending) ||
-		Code(err) != CodeAliasConfirmationPending {
-		t.Fatalf("pending alias deletion error = %v code=%q", err, Code(err))
+	if err != nil {
+		t.Fatalf("pending alias deletion = %v", err)
 	}
-	if !repo.hasAlias(41) || repo.aliasDeletes.Load() != 0 ||
+	if repo.hasAlias(41) || repo.aliasDeletes.Load() != 1 ||
+		validates.Load() != 1 || lists.Load() != 1 ||
 		client.deactivateCalls.Load() != 0 || client.deleteCalls.Load() != 0 {
-		t.Fatal("pending alias deletion changed local or remote state")
+		t.Fatalf("pending alias deletion state: exists=%v local=%d validate=%d list=%d deactivate=%d delete=%d",
+			repo.hasAlias(41), repo.aliasDeletes.Load(), validates.Load(), lists.Load(),
+			client.deactivateCalls.Load(), client.deleteCalls.Load())
 	}
 }
 

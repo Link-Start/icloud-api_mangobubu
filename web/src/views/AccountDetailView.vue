@@ -488,45 +488,44 @@
                 />
               </template>
               <template v-else-if="column.key === 'actions'">
-                <div
-                  v-if="!isAliasConfirmationPending(row)"
-                  class="icon-action-row"
-                >
-                  <el-button
-                    size="small"
-                    :icon="CopyDocument"
-                    :loading="Boolean(copyLoading[`${row.id}:otp`])"
-                    :disabled="isAliasActionBusy(row)"
-                    @click="copyAliasCredentials(row, ALIAS_EXPORT_OTP)"
-                  >取码</el-button>
-                  <el-button
-                    size="small"
-                    :icon="CopyDocument"
-                    :loading="Boolean(copyLoading[`${row.id}:imap`])"
-                    :disabled="isAliasActionBusy(row)"
-                    @click="copyAliasCredentials(row, ALIAS_EXPORT_IMAP)"
-                    v-if="isAliasV2(row)"
-                  >IMAP</el-button>
-                  <el-button
-                    v-else-if="isLegacyDirectLinkAvailable(row)"
-                    size="small"
-                    :icon="CopyDocument"
-                    :loading="Boolean(copyLoading[`${row.id}:legacy-link`])"
-                    :disabled="isAliasActionBusy(row)"
-                    @click="copyLegacyDirectLink(row)"
-                  >旧直达</el-button>
-                  <el-tooltip :content="aliasRotationLabel(row)" placement="top">
+                <div class="icon-action-row">
+                  <template v-if="!isAliasConfirmationPending(row)">
                     <el-button
-                      :icon="Key"
-                      circle
-                      :loading="Boolean(rotateLoading[row.id])"
+                      size="small"
+                      :icon="CopyDocument"
+                      :loading="Boolean(copyLoading[`${row.id}:otp`])"
                       :disabled="isAliasActionBusy(row)"
-                      :aria-label="`${aliasRotationLabel(row)}：${row.address}`"
-                      @click="rotateKey(row)"
-                    />
-                  </el-tooltip>
+                      @click="copyAliasCredentials(row, ALIAS_EXPORT_OTP)"
+                    >取码</el-button>
+                    <el-button
+                      size="small"
+                      :icon="CopyDocument"
+                      :loading="Boolean(copyLoading[`${row.id}:imap`])"
+                      :disabled="isAliasActionBusy(row)"
+                      @click="copyAliasCredentials(row, ALIAS_EXPORT_IMAP)"
+                      v-if="isAliasV2(row)"
+                    >IMAP</el-button>
+                    <el-button
+                      v-else-if="isLegacyDirectLinkAvailable(row)"
+                      size="small"
+                      :icon="CopyDocument"
+                      :loading="Boolean(copyLoading[`${row.id}:legacy-link`])"
+                      :disabled="isAliasActionBusy(row)"
+                      @click="copyLegacyDirectLink(row)"
+                    >旧直达</el-button>
+                    <el-tooltip :content="aliasRotationLabel(row)" placement="top">
+                      <el-button
+                        :icon="Key"
+                        circle
+                        :loading="Boolean(rotateLoading[row.id])"
+                        :disabled="isAliasActionBusy(row)"
+                        :aria-label="`${aliasRotationLabel(row)}：${row.address}`"
+                        @click="rotateKey(row)"
+                      />
+                    </el-tooltip>
+                  </template>
                   <el-tooltip
-                    :content="isCustomMailbox ? '从本地永久删除邮箱' : '从 iCloud 永久删除隐私邮箱'"
+                    :content="isCustomMailbox ? '从本地永久删除邮箱' : (isAliasConfirmationPending(row) ? '核对 Apple 目录后删除或清理本地记录' : '从 iCloud 永久删除隐私邮箱')"
                     placement="top"
                   >
                     <el-button
@@ -536,7 +535,7 @@
                       circle
                       :loading="Boolean(deleteLoading[row.id])"
                       :disabled="isAliasActionBusy(row)"
-                      :aria-label="`${isCustomMailbox ? '从本地永久删除邮箱' : '从 iCloud 永久删除隐私邮箱'} ${row.address}`"
+                      :aria-label="`${isCustomMailbox ? '从本地永久删除邮箱' : (isAliasConfirmationPending(row) ? '删除或清理本地记录' : '从 iCloud 永久删除隐私邮箱')} ${row.address}`"
                       @click="removeAlias(row)"
                     />
                   </el-tooltip>
@@ -606,44 +605,43 @@
                 </dd>
               </div>
             </dl>
-            <footer
-              v-if="!isAliasConfirmationPending(alias)"
-              class="mobile-record__actions mobile-record__actions--three"
-            >
-              <el-button
-                :icon="CopyDocument"
-                :loading="Boolean(copyLoading[`${alias.id}:otp`])"
-                :disabled="isAliasActionBusy(alias)"
-                @click="copyAliasCredentials(alias, ALIAS_EXPORT_OTP)"
-              >
-                复制取码格式
-              </el-button>
-              <el-button
-                :icon="CopyDocument"
-                :loading="Boolean(copyLoading[`${alias.id}:imap`])"
-                :disabled="isAliasActionBusy(alias)"
-                @click="copyAliasCredentials(alias, ALIAS_EXPORT_IMAP)"
-                v-if="isAliasV2(alias)"
-              >
-                复制 IMAP 格式
-              </el-button>
-              <el-button
-                v-else-if="isLegacyDirectLinkAvailable(alias)"
-                :icon="CopyDocument"
-                :loading="Boolean(copyLoading[`${alias.id}:legacy-link`])"
-                :disabled="isAliasActionBusy(alias)"
-                @click="copyLegacyDirectLink(alias)"
-              >
-                复制旧直达链接
-              </el-button>
-              <el-button
-                :icon="Key"
-                :loading="Boolean(rotateLoading[alias.id])"
-                :disabled="isAliasActionBusy(alias)"
-                @click="rotateKey(alias)"
-              >
-                {{ aliasRotationLabel(alias) }}
-              </el-button>
+            <footer class="mobile-record__actions mobile-record__actions--three">
+              <template v-if="!isAliasConfirmationPending(alias)">
+                <el-button
+                  :icon="CopyDocument"
+                  :loading="Boolean(copyLoading[`${alias.id}:otp`])"
+                  :disabled="isAliasActionBusy(alias)"
+                  @click="copyAliasCredentials(alias, ALIAS_EXPORT_OTP)"
+                >
+                  复制取码格式
+                </el-button>
+                <el-button
+                  :icon="CopyDocument"
+                  :loading="Boolean(copyLoading[`${alias.id}:imap`])"
+                  :disabled="isAliasActionBusy(alias)"
+                  @click="copyAliasCredentials(alias, ALIAS_EXPORT_IMAP)"
+                  v-if="isAliasV2(alias)"
+                >
+                  复制 IMAP 格式
+                </el-button>
+                <el-button
+                  v-else-if="isLegacyDirectLinkAvailable(alias)"
+                  :icon="CopyDocument"
+                  :loading="Boolean(copyLoading[`${alias.id}:legacy-link`])"
+                  :disabled="isAliasActionBusy(alias)"
+                  @click="copyLegacyDirectLink(alias)"
+                >
+                  复制旧直达链接
+                </el-button>
+                <el-button
+                  :icon="Key"
+                  :loading="Boolean(rotateLoading[alias.id])"
+                  :disabled="isAliasActionBusy(alias)"
+                  @click="rotateKey(alias)"
+                >
+                  {{ aliasRotationLabel(alias) }}
+                </el-button>
+              </template>
               <el-button
                 type="danger"
                 plain
@@ -652,7 +650,7 @@
                 :disabled="isAliasActionBusy(alias)"
                 @click="removeAlias(alias)"
               >
-                永久删除
+                {{ isAliasConfirmationPending(alias) ? "删除或清理本地记录" : "永久删除" }}
               </el-button>
             </footer>
           </article>
@@ -2081,10 +2079,7 @@ async function moveAliasToGroup(alias, groupValue) {
 }
 
 async function removeAlias(alias) {
-  if (
-    isAliasConfirmationPending(alias) ||
-    !aliasActionLock.acquire(alias.id)
-  ) {
+  if (!aliasActionLock.acquire(alias.id)) {
     return;
   }
   beginDetailMutation();
@@ -2095,8 +2090,10 @@ async function removeAlias(alias) {
     await ElMessageBox.confirm(
       customMailbox
         ? "删除后，该邮箱将从本地永久删除，同时清除完整凭证、邮件归档映射及关联记录，且无法恢复。继续吗？"
-        : "删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地完整凭证、邮件归档映射及关联记录，且无法恢复。继续吗？",
-      `${customMailbox ? "从本地永久删除" : "从 iCloud 永久删除"} ${alias.address}`,
+        : isAliasConfirmationPending(alias)
+          ? "此邮箱尚在等待 Apple 目录确认。系统会先核对 Apple 目录：若地址已存在则从 iCloud 永久删除并清理本地记录；若地址不存在则仅清理本地记录。删除及清理均不可恢复。继续吗？"
+          : "删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地完整凭证、邮件归档映射及关联记录，且无法恢复。继续吗？",
+      `${customMailbox ? "从本地永久删除" : isAliasConfirmationPending(alias) ? "核对 Apple 目录并清理" : "从 iCloud 永久删除"} ${alias.address}`,
       {
         type: "warning",
         confirmButtonText: "永久删除",
@@ -2113,7 +2110,9 @@ async function removeAlias(alias) {
     successMessage(
       customMailbox
         ? "邮箱已从本地永久删除。"
-        : "隐私邮箱已从 iCloud 和本地永久删除。",
+        : isAliasConfirmationPending(alias)
+          ? "Apple 目录核对完成，此邮箱的本地记录已清理。"
+          : "隐私邮箱已从 iCloud 和本地永久删除。",
     );
   } catch (error) {
     if (confirmationCancelled(error)) return;

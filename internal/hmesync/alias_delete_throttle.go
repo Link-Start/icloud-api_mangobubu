@@ -143,7 +143,7 @@ func (b *aliasDeletionBatch) beforeRequest(ctx context.Context, operation string
 		b.stopped = wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		return b.stopped
 	}
-	if !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending {
+	if !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending && !b.initialPending[r.aliasID] {
 		return wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, store.ErrAliasConfirmationPending)
 	}
 	if err := ctx.Err(); err != nil {

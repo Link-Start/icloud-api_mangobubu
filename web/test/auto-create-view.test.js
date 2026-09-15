@@ -129,7 +129,7 @@ test("custom account deletion identifies the mailbox by its suffix", async () =>
   assert.match(remove, /确定删除主号 \$\{accountIdentity\}/);
 });
 
-test("directory-confirmation aliases remain visibly gated without a key-claim queue", async () => {
+test("directory-confirmation aliases keep credentials gated while exposing single-alias cleanup", async () => {
   const source = await readFile(viewPath, "utf8");
   const confirmationBody = functionBody(
     source,
@@ -157,7 +157,6 @@ test("directory-confirmation aliases remain visibly gated without a key-claim qu
     "async function rotateKey",
     "async function copyAliasCredentials",
     "async function toggleAlias",
-    "async function removeAlias",
   ]) {
     assert.match(
       functionBody(source, signature),
@@ -165,6 +164,102 @@ test("directory-confirmation aliases remain visibly gated without a key-claim qu
       `${signature} must reject a directory-confirmation alias`,
     );
   }
+  const remove = functionBody(source, "async function removeAlias");
+  assert.doesNotMatch(remove, /if\s*\(\s*isAliasConfirmationPending\(alias\)/);
+  assert.match(remove, /先核对 Apple 目录/);
+  assert.match(remove, /若地址不存在则仅清理本地记录/);
+  assert.match(remove, /删除及清理均不可恢复/);
+});
+
+test("pending alias removal confirms, sends one request, and reloads the server-backed list", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const body = functionBody(source, "async function removeAlias");
+  const events = [];
+  const confirmations = [];
+  const messages = [];
+  const alias = {
+    id: 7,
+    address: "pending@icloud.com",
+    enabled: false,
+    lastSyncError: "APPLE_ALIAS_CONFIRMATION_PENDING",
+  };
+  let locked = false;
+  const dependencies = {
+    aliasActionLock: {
+      acquire() { if (locked) return false; locked = true; return true; },
+      release() { locked = false; events.push("release"); },
+    },
+    beginDetailMutation() { events.push("begin"); },
+    account: { value: { id: 1 } },
+    deleteLoading: {},
+    isCustomMailbox: { value: false },
+    isAliasConfirmationPending: (item) => item.lastSyncError === "APPLE_ALIAS_CONFIRMATION_PENDING",
+    ElMessageBox: {
+      async confirm(message, title, options) {
+        confirmations.push({ message, title, options });
+        events.push("confirm");
+      },
+    },
+    isCurrentAccount: () => true,
+    auth: { state: { csrfToken: "csrf" } },
+    async deleteAlias(id, csrf) {
+      assert.equal(id, alias.id);
+      assert.equal(csrf, "csrf");
+      events.push("delete");
+    },
+    async loadDetail() { events.push("reload"); return true; },
+    successMessage(message) { messages.push(message); },
+    confirmationCancelled: (error) => error === "cancel",
+    isAppleSessionInvalid: () => false,
+    appleSession: { value: null },
+    openAppleLogin() { assert.fail("unexpected login"); },
+    showRequestError() { assert.fail("unexpected request failure"); },
+  };
+  const removeAlias = Function(
+    ...Object.keys(dependencies),
+    `"use strict"; return async function (alias) ${body}`,
+  )(...Object.values(dependencies));
+
+  await Promise.all([removeAlias(alias), removeAlias(alias)]);
+  assert.deepEqual(events, ["begin", "confirm", "delete", "reload", "release"]);
+  assert.equal(confirmations.length, 1);
+  assert.match(confirmations[0].message, /先核对 Apple 目录/);
+  assert.match(confirmations[0].message, /若地址不存在则仅清理本地记录/);
+  assert.equal(confirmations[0].options.confirmButtonClass, "el-button--danger");
+  assert.deepEqual(messages, ["Apple 目录核对完成，此邮箱的本地记录已清理。"]);
+  assert.deepEqual(dependencies.deleteLoading, {});
+});
+
+test("pending cleanup cancellation never sends a deletion request", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const body = functionBody(source, "async function removeAlias");
+  let released = false;
+  const dependencies = {
+    aliasActionLock: { acquire: () => true, release: () => { released = true; } },
+    beginDetailMutation() {},
+    account: { value: { id: 1 } },
+    deleteLoading: {},
+    isCustomMailbox: { value: false },
+    isAliasConfirmationPending: () => true,
+    ElMessageBox: { confirm: async () => { throw "cancel"; } },
+    isCurrentAccount: () => true,
+    auth: { state: { csrfToken: "csrf" } },
+    deleteAlias() { assert.fail("cancelled cleanup sent DELETE"); },
+    loadDetail() { assert.fail("cancelled cleanup reloaded"); },
+    successMessage() { assert.fail("cancelled cleanup claimed success"); },
+    confirmationCancelled: (error) => error === "cancel",
+    isAppleSessionInvalid: () => false,
+    appleSession: { value: null },
+    openAppleLogin() {},
+    showRequestError() { assert.fail("cancellation surfaced as error"); },
+  };
+  const removeAlias = Function(
+    ...Object.keys(dependencies),
+    `"use strict"; return async function (alias) ${body}`,
+  )(...Object.values(dependencies));
+  await removeAlias({ id: 7, address: "pending@icloud.com" });
+  assert.equal(released, true);
+  assert.deepEqual(dependencies.deleteLoading, {});
 });
 
 test("alias deletion is presented as an irreversible iCloud operation", async () => {

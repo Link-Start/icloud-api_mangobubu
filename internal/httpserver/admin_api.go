@@ -2043,10 +2043,9 @@ func (s *Server) adminAPIDeleteAlias(c *gin.Context) {
 		s.writeAdminAPIStoreReadError(c, err)
 		return
 	}
-	if adminAPIAliasConfirmationPending(alias) {
-		writeAdminAPIAliasConfirmationPending(c)
-		return
-	}
+	// Pending auto-created aliases are handled by the Apple-first deletion
+	// service. It refreshes Apple's authoritative directory and removes a
+	// locally staged row when propagation never exposed the address.
 	if s.adminAPIDeleteCustomAlias(c, alias) {
 		return
 	}
@@ -2056,15 +2055,15 @@ func (s *Server) adminAPIDeleteAlias(c *gin.Context) {
 		return
 	}
 	if err := s.hmeSync.DeleteAlias(c.Request.Context(), id); err != nil {
-		if errors.Is(err, store.ErrAliasConfirmationPending) {
+		if errors.Is(err, store.ErrAliasConfirmationPending) || errors.Is(err, hmesync.ErrAliasConfirmationPending) {
 			writeAdminAPIAliasConfirmationPending(c)
+			return
+		}
+		apiErr := classifyAdminAPIAppleError(err)
+		if errors.Is(err, store.ErrNotFound) && apiErr.Status == http.StatusNotFound {
+			writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
 		} else {
-			apiErr := classifyAdminAPIAppleError(err)
-			if errors.Is(err, store.ErrNotFound) && apiErr.Status == http.StatusNotFound {
-				writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
-			} else {
-				s.adminAPIFinishAppleAliasDeleteFailure(c, adminSession, id, apiErr)
-			}
+			s.adminAPIFinishAppleAliasDeleteFailure(c, adminSession, id, apiErr)
 		}
 		return
 	}
