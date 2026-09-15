@@ -6,6 +6,7 @@ export const PAGE_SIZE_OPTIONS = Object.freeze([
   { value: 20, label: "20 条/页" },
   { value: 50, label: "50 条/页" },
   { value: 100, label: "100 条/页" },
+  { value: 200, label: "200 条/页" },
   { value: 500, label: "500 条/页" },
   { value: 1000, label: "1000 条/页" },
   { value: ALL_PAGE_SIZE, label: "全部显示" },

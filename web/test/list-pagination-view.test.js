@@ -34,6 +34,7 @@ test("shared list pagination binds page, size, total, loading, and page changes"
   assert.match(source, /\{ label: "20 条\/页", value: 20 \}/);
   assert.match(source, /\{ label: "50 条\/页", value: 50 \}/);
   assert.match(source, /\{ label: "100 条\/页", value: 100 \}/);
+  assert.match(source, /\{ label: "200 条\/页", value: 200 \}/);
   assert.match(source, /\{ label: "500 条\/页", value: 500 \}/);
   assert.match(source, /\{ label: "1000 条\/页", value: 1000 \}/);
   assert.match(source, /\{ label: "全部显示", value: 0 \}/);
