@@ -224,6 +224,29 @@ func (s *Store) ConfirmPendingAutoAlias(
 	session domain.AppleWebSession,
 	aliasID int64,
 ) (domain.Alias, domain.AppleWebSession, error) {
+	return s.confirmPendingAutoAlias(ctx, session, aliasID, time.Time{})
+}
+
+// ConfirmFreshAutoAlias publishes an alias reserved during the current account
+// lock critical section. The caller must have confirmed a successful reserve
+// for an address absent from its pre-reserve directory. Preserve the IMAP cursor
+// only if no account/alias mutation has advanced the pre-reserve account version;
+// otherwise use the conservative pending-confirmation cursor reset.
+func (s *Store) ConfirmFreshAutoAlias(
+	ctx context.Context,
+	session domain.AppleWebSession,
+	aliasID int64,
+	expectedAccountVersion time.Time,
+) (domain.Alias, domain.AppleWebSession, error) {
+	return s.confirmPendingAutoAlias(ctx, session, aliasID, expectedAccountVersion)
+}
+
+func (s *Store) confirmPendingAutoAlias(
+	ctx context.Context,
+	session domain.AppleWebSession,
+	aliasID int64,
+	expectedAccountVersion time.Time,
+) (domain.Alias, domain.AppleWebSession, error) {
 	if aliasID < 1 || session.AccountID < 1 {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("confirm pending automatic alias: identity is invalid")
 	}
@@ -290,9 +313,11 @@ func (s *Store) ConfirmPendingAutoAlias(
 	if err := requireAffected(result, "pending automatic alias"); err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, err
 	}
-	if _, err := s.txExecContext(ctx, tx,
-		`DELETE FROM imap_sync_states WHERE account_id = ?`, session.AccountID); err != nil {
-		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("reset IMAP cursor after automatic alias confirmation: %w", err)
+	if expectedAccountVersion.IsZero() || accountVersion != timestamp(expectedAccountVersion) {
+		if _, err := s.txExecContext(ctx, tx,
+			`DELETE FROM imap_sync_states WHERE account_id = ?`, session.AccountID); err != nil {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("reset IMAP cursor after automatic alias confirmation: %w", err)
+		}
 	}
 	if _, err := s.bumpAccountVersionTx(ctx, tx, session.AccountID, accountVersion); err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("advance account version after automatic alias confirmation: %w", err)

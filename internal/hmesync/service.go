@@ -1012,6 +1012,20 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		}
 		return domain.Alias{}, addressErr
 	}
+	// A new address cannot have mail before reserve, and this account lock has
+	// prevented IMAP from advancing its cursor while reserve was in flight.
+	// Only this successful, same-operation publication may retain the cursor.
+	// Older pending aliases and ambiguous reserves still require a rescan;
+	// they may already have received mail before the latest IMAP observation.
+	if !hasPendingConfirmation && releaseAccount != nil && mappedCreateErr == nil {
+		if _, alreadyExisted := findAppleAlias(settings.Aliases, address); !alreadyExisted {
+			if freshRepo, ok := s.repo.(FreshAutoAliasConfirmationRepository); ok {
+				confirmPending = func(ctx context.Context, session domain.AppleWebSession, aliasID int64) (domain.Alias, domain.AppleWebSession, error) {
+					return freshRepo.ConfirmFreshAutoAlias(ctx, session, aliasID, account.UpdatedAt)
+				}
+			}
+		}
+	}
 	label := strings.TrimSpace(created.Label)
 	if label == "" {
 		label = autoCreateLabel

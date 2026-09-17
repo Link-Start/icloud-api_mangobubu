@@ -164,7 +164,7 @@ func (f *Fetcher) fetchArchiveIncremental(
 		return publish()
 	}
 
-	uids, hasMore, processedThrough, err := discoverArchiveUIDs(client, previous.LastUID, upperUID, settings.maxIncrementalCandidates)
+	uids, hasMore, processedThrough, err := discoverArchiveUIDs(client, mailbox.NumMessages, previous.LastUID, upperUID, settings.maxIncrementalCandidates)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return failure, ctxErr
@@ -339,7 +339,7 @@ func dialArchiveIMAP(ctx context.Context, address, serverName string, settings f
 // committed UID. It returns every UID in that window, including messages that
 // are already \Seen upstream. Sequence probes keep the response bounded for
 // sparse UID spaces; the leading/trailing sentinels detect EXPUNGE races.
-func discoverArchiveUIDs(client *imapclientv2.Client, lastUID, upperUID uint32, limit int) ([]uint32, bool, uint32, error) {
+func discoverArchiveUIDs(client *imapclientv2.Client, numMessages, lastUID, upperUID uint32, limit int) ([]uint32, bool, uint32, error) {
 	if limit < 1 {
 		return nil, false, lastUID, errors.New("incremental UID limit must be positive")
 	}
@@ -350,11 +350,11 @@ func discoverArchiveUIDs(client *imapclientv2.Client, lastUID, upperUID uint32, 
 		return nil, false, upperUID, nil
 	}
 
-	mailbox := client.Mailbox()
-	if mailbox == nil || mailbox.NumMessages == 0 {
+	// Use the completed SELECT response: the client may signal Wait before
+	// publishing its internal Mailbox cache, so nil there does not mean empty.
+	if numMessages == 0 {
 		return nil, false, upperUID, nil
 	}
-	numMessages := mailbox.NumMessages
 	// A small numeric interval can be searched directly. SEARCH is only used
 	// for range discovery here; unlike the legacy path, it deliberately has no
 	// \Seen predicate because v2 archives both read and unread mail.

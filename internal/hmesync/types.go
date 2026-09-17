@@ -44,6 +44,16 @@ type AutoCreateRepository interface {
 	ConfirmPendingAutoAlias(context.Context, domain.AppleWebSession, int64) (domain.Alias, domain.AppleWebSession, error)
 }
 
+// FreshAutoAliasConfirmationRepository is an optional confirmation surface
+// used when an alias is reserved and confirmed within one account-lock
+// critical section. Unlike the historical pending-confirmation operation, a
+// fresh confirmation can preserve the existing IMAP cursor if the account
+// version still matches the one read before reserve. The caller must also
+// establish that the reserve succeeded and returned a previously absent alias.
+type FreshAutoAliasConfirmationRepository interface {
+	ConfirmFreshAutoAlias(context.Context, domain.AppleWebSession, int64, time.Time) (domain.Alias, domain.AppleWebSession, error)
+}
+
 // AutoAliasDiscardRepository conditionally removes an unpublished local
 // candidate and its credentials. The caller must first verify the candidate
 // is absent from a fresh, complete Apple directory after the visibility grace

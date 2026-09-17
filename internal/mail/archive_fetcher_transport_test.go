@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	imap "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
@@ -106,6 +108,57 @@ func TestArchiveIncrementalCandidateLimitDefaultsAndCompatibility(t *testing.T) 
 				t.Fatalf("first-sync recent window = %d, want unchanged 1024", settings.maxCandidates)
 			}
 		})
+	}
+}
+
+func TestArchiveUIDDiscoveryUsesSelectSnapshotBeforeMailboxCachePublication(t *testing.T) {
+	// go-imap beta.8 completes Select().Wait() before publishing Client.Mailbox().
+	// Model that scheduling window deterministically: the server accepts the
+	// next mailbox command, but this client's selected-mailbox cache is nil.
+	// The completed SELECT snapshot must still drive discovery, not a false
+	// empty-mailbox result that would advance past messages without fetching them.
+	clientConn, serverConn := net.Pipe()
+	client := imapclient.New(clientConn, nil)
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- func() error {
+			defer serverConn.Close()
+			if err := serverConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(serverConn, "* PREAUTH [CAPABILITY IMAP4rev1] fixture ready\r\n"); err != nil {
+				return err
+			}
+			command, err := bufio.NewReader(serverConn).ReadString('\n')
+			if err != nil {
+				return err
+			}
+			fields := strings.Fields(command)
+			if len(fields) != 5 || strings.Join(fields[1:], " ") != "UID SEARCH UID 1:2" {
+				return fmt.Errorf("unexpected discovery command: %q", command)
+			}
+			_, err = fmt.Fprintf(serverConn, "* SEARCH 1 2\r\n%s OK SEARCH completed\r\n", fields[0])
+			return err
+		}()
+	}()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = serverConn.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil && !t.Failed() {
+				t.Errorf("scripted UID discovery server: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("scripted UID discovery server did not stop")
+		}
+	})
+	if mailbox := client.Mailbox(); mailbox != nil {
+		t.Fatalf("fixture mailbox cache = %#v, want unpublished nil cache", mailbox)
+	}
+	uids, hasMore, processedThrough, err := discoverArchiveUIDs(client, 2, 0, 2, 32)
+	if err != nil || !reflect.DeepEqual(uids, []uint32{1, 2}) || hasMore || processedThrough != 2 {
+		t.Fatalf("UID discovery with unpublished cache = %v, more:%v cursor:%d, %v; want both SELECT snapshot messages", uids, hasMore, processedThrough, err)
 	}
 }
 
