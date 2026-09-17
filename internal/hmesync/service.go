@@ -511,8 +511,9 @@ func (s *Service) deleteLocalAliasAfterApple(ctx context.Context, repo AliasDele
 	return repo.DeleteAlias(persistContext, aliasID)
 }
 
-// CreateAutoAlias reserves exactly one Hide My Email address and publishes it
-// locally with a complete persistent credential bundle. The method never
+// CreateAutoAlias reserves at most one Hide My Email address and publishes it
+// locally with a complete persistent credential bundle, or reconciles an older
+// candidate without issuing another reserve. The method never
 // retries reserve because repeating that remote side effect could create
 // duplicates; only the read-only directory confirmation is retried.
 func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (createdAlias domain.Alias, resultErr error) {
@@ -674,10 +675,6 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		if errors.Is(mapped, ErrSessionExpired) {
 			mapped = expireAutoSession(mapped)
 		}
-		if hasPendingConfirmation &&
-			(errors.Is(mapped, ErrUpstream) || errors.Is(mapped, ErrRateLimited)) {
-			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, mapped)
-		}
 		return domain.Alias{}, mapped
 	}
 	if strings.TrimSpace(validated.AppleID) != "" &&
@@ -710,10 +707,6 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		mapped := mapAppleError(err, false)
 		if errors.Is(mapped, ErrSessionExpired) {
 			mapped = expireAutoSession(mapped)
-		}
-		if hasPendingConfirmation &&
-			(errors.Is(mapped, ErrUpstream) || errors.Is(mapped, ErrRateLimited)) {
-			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, mapped)
 		}
 		return domain.Alias{}, mapped
 	}
@@ -812,7 +805,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 				errors.New("Apple returned a different pending alias address"))
 		}
 		if !confirmed.IsActive {
-			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending,
+			return domain.Alias{}, wrapError(CodeAliasInactive, ErrAliasInactive,
 				errors.New("Apple returned an inactive pending alias"))
 		}
 		if !sameEmail(confirmed.ForwardToEmail, account.Email) {
@@ -866,11 +859,11 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	if hasPendingConfirmation {
 		confirmed, found := findAppleAlias(settings.Aliases, pendingConfirmation.Alias.Address)
 		if !found {
-			return domain.Alias{}, wrapError(
-				CodeAliasConfirmationPending,
-				ErrAliasConfirmationPending,
-				errors.New("Apple list omitted the pending reserved alias"),
-			)
+			discarded, err := s.discardMissingAutoAlias(ctx, account, pendingConfirmation, settings, releaseAccount != nil)
+			if discarded {
+				pendingConfirmationTracked = false
+			}
+			return domain.Alias{}, err
 		}
 		return confirmPendingAlias(ctx, pendingConfirmation.Alias, confirmed, listedSession, 1)
 	}
@@ -1091,8 +1084,8 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		if !created.IsActive {
 			reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, 1)
 			return domain.Alias{}, wrapError(
-				CodeAliasConfirmationPending,
-				ErrAliasConfirmationPending,
+				CodeAliasInactive,
+				ErrAliasInactive,
 				errors.New("Apple returned an inactive reserved alias"),
 			)
 		}
@@ -1107,8 +1100,8 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	}
 
 	// Minimal or ambiguous reserve results are reconciled only through bounded,
-	// read-only directory requests. The pending row prevents every later plan
-	// from issuing another reserve while Apple directory visibility catches up.
+	// read-only directory requests. Later plans confirm the candidate or retire
+	// it after the visibility grace period if a fresh directory still omits it.
 	confirmationSession := sessionForConfirmation
 	confirmationCause := mappedCreateErr
 	for attemptIndex := 0; ; attemptIndex++ {
@@ -1178,6 +1171,12 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		combinedErr := errors.Join(confirmationErr, confirmationCause)
 		if !shouldRetryAutoCreateConfirmation(confirmationErr) ||
 			attemptIndex >= len(s.autoCreateConfirmationDelays) {
+			// A failed read is not evidence that the address is absent. Retain
+			// the candidate and the actual upstream diagnostic (including rate
+			// limits), instead of relabeling it as directory propagation delay.
+			if listErr != nil {
+				return domain.Alias{}, combinedErr
+			}
 			return domain.Alias{}, wrapError(
 				CodeAliasConfirmationPending,
 				ErrAliasConfirmationPending,

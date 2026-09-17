@@ -44,6 +44,14 @@ type AutoCreateRepository interface {
 	ConfirmPendingAutoAlias(context.Context, domain.AppleWebSession, int64) (domain.Alias, domain.AppleWebSession, error)
 }
 
+// AutoAliasDiscardRepository conditionally removes an unpublished local
+// candidate and its credentials. The caller must first verify the candidate
+// is absent from a fresh, complete Apple directory after the visibility grace
+// period. This operation must never remove an enabled or unrelated alias.
+type AutoAliasDiscardRepository interface {
+	DiscardPendingAutoAlias(context.Context, int64, int64) error
+}
+
 // ModernAutoCreateRepository is the transitional richer shape used by older
 // PR2 adapters. The service accepts both shapes so changing an adapter does not
 // turn automatic creation into a runtime-unavailable operation.

@@ -1016,7 +1016,11 @@ const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
   APPLE_UPSTREAM_ERROR:
     "Apple 服务暂时异常，请稍后再试；自动创建会按计划继续执行",
   APPLE_ALIAS_CONFIRMATION_PENDING:
-    "Apple 已创建隐私邮箱，正在等待目录确认；后续自动创建计划只会继续确认，不会重复创建",
+    "Apple 隐私邮箱创建结果尚未确认；候选满 5 分钟后，若完整目录仍查无此地址，将自动清理本地记录",
+  APPLE_ALIAS_CANDIDATE_DISCARDED:
+    "Apple 最新目录未找到候选地址，已清理本地待确认记录；下次计划将重新创建",
+  APPLE_ALIAS_INACTIVE:
+    "Apple 目录中的候选地址已停用，本地记录已保留；请在 iCloud 重新启用，或确认不再使用后通过邮箱列表删除",
   APPLE_ACCOUNT_MISMATCH:
     "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
   APPLE_FORWARDING_TARGET_MISSING:

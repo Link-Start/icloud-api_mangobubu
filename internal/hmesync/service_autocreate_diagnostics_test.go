@@ -47,8 +47,12 @@ func TestCreateAutoAliasReportsPendingDirectoryReadAsReconciliation(t *testing.T
 	})
 
 	_, err := service.CreateAutoAlias(ctx, 3)
-	if Code(err) != CodeAliasConfirmationPending || !errors.Is(err, ErrAliasConfirmationPending) {
+	if Code(err) != CodeUpstreamError || !errors.Is(err, ErrUpstream) {
 		t.Fatalf("pending directory read error = %v code=%q", err, Code(err))
+	}
+	var pending interface{ PendingConfirmation() bool }
+	if !errors.As(err, &pending) || !pending.PendingConfirmation() {
+		t.Fatal("directory failure lost the retained candidate marker")
 	}
 	if containsAliasCreationPhase(progress, domain.AliasCreationPhaseCheckingForwarding) {
 		t.Fatalf("pending reconciliation reported forwarding preflight: %#v", progress)
@@ -137,7 +141,7 @@ func TestCreateAutoAliasReportsReserveValidationFailureDuringConfirmation(t *tes
 	})
 
 	_, err := service.CreateAutoAlias(ctx, 3)
-	if Code(err) != CodeAliasConfirmationPending || !errors.Is(err, ErrAliasConfirmationPending) {
+	if Code(err) != CodeAliasInactive || !errors.Is(err, ErrAliasInactive) {
 		t.Fatalf("inactive reserve error = %v code=%q", err, Code(err))
 	}
 	if !containsAliasCreationPhase(progress, domain.AliasCreationPhaseConfirming) {

@@ -689,8 +689,12 @@ func TestCreateAutoAliasPersistsAndReconcilesPendingConfirmationWithoutAnotherRe
 	}
 
 	second, err := service.CreateAutoAlias(ctx, 3)
-	if !errors.Is(err, ErrAliasConfirmationPending) || Code(err) != CodeAliasConfirmationPending || second.ID != 0 {
+	if !errors.Is(err, ErrUpstream) || Code(err) != CodeUpstreamError || second.ID != 0 {
 		t.Fatalf("second attempt = %#v, err=%v code=%q", second, err, Code(err))
+	}
+	var pendingMarker interface{ PendingConfirmation() bool }
+	if !errors.As(err, &pendingMarker) || !pendingMarker.PendingConfirmation() {
+		t.Fatal("failed directory read lost the pending candidate marker")
 	}
 	if client.createCalls.Load() != 1 || repo.creates.Load() != 1 || repo.confirms.Load() != 0 {
 		t.Fatalf("second attempt repeated side effects: reserves=%d creates=%d confirms=%d",
@@ -1304,7 +1308,7 @@ func TestCreateAutoAliasRejectsExplicitInactiveReserveResult(t *testing.T) {
 	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
 
 	_, err := service.CreateAutoAlias(ctx, 3)
-	if !errors.Is(err, ErrAliasConfirmationPending) || Code(err) != CodeAliasConfirmationPending {
+	if !errors.Is(err, ErrAliasInactive) || Code(err) != CodeAliasInactive {
 		t.Fatalf("inactive reserve error = %v code=%q", err, Code(err))
 	}
 	if client.createCalls.Load() != 1 || repo.creates.Load() != 1 {
@@ -1504,7 +1508,7 @@ func TestCreateAutoAliasPrioritizesLatestConfirmationError(t *testing.T) {
 	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
 
 	_, err := service.CreateAutoAlias(ctx, 3)
-	if Code(err) != CodeAliasConfirmationPending || !errors.Is(err, ErrAliasConfirmationPending) {
+	if Code(err) != CodeUpstreamError || !errors.Is(err, ErrUpstream) {
 		t.Fatalf("confirmation error = %v code=%q", err, Code(err))
 	}
 	var got *apple.Error

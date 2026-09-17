@@ -171,6 +171,27 @@ test("directory-confirmation aliases keep credentials gated while exposing singl
   assert.match(remove, /删除及清理均不可恢复/);
 });
 
+test("pending creation messages distinguish bounded confirmation, cleanup, and inactive aliases", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const format = autoCreationErrorFormatter(source);
+
+  const pending = format("APPLE_ALIAS_CONFIRMATION_PENDING");
+  assert.match(pending, /创建结果尚未确认/);
+  assert.match(pending, /满 5 分钟/);
+  assert.match(pending, /完整目录仍查无此地址/);
+  assert.match(pending, /自动清理本地记录/);
+  assert.doesNotMatch(pending, /已创建|只会继续确认/);
+  assert.equal(
+    format("APPLE_ALIAS_CANDIDATE_DISCARDED"),
+    "Apple 最新目录未找到候选地址，已清理本地待确认记录；下次计划将重新创建",
+  );
+  const inactive = format("APPLE_ALIAS_INACTIVE");
+  assert.match(inactive, /候选地址已停用/);
+  assert.match(inactive, /本地记录已保留/);
+  assert.match(inactive, /重新启用/);
+  assert.doesNotMatch(inactive, /等待目录|自动清理/);
+});
+
 test("pending alias removal confirms, sends one request, and reloads the server-backed list", async () => {
   const source = await readFile(viewPath, "utf8");
   const body = functionBody(source, "async function removeAlias");

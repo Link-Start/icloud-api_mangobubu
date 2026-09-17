@@ -79,6 +79,13 @@ func (flow aliasCreationFlow) hasRecordedRemoteSideEffect() bool {
 }
 
 func (flow aliasCreationFlow) hasRemoteSideEffectPossibleForError(stage domain.AliasCreationPhase, err error) bool {
+	var coded diagnosticCodeProvider
+	if errors.As(err, &coded) && strings.TrimSpace(coded.DiagnosticCode()) == "APPLE_ALIAS_CANDIDATE_DISCARDED" {
+		// A complete directory check found no remote alias and only the local
+		// candidate was removed. Retain a prior mutation marker, but do not infer
+		// a remote creation from the read-only reconciliation stage.
+		return flow.hasRecordedRemoteSideEffect()
+	}
 	if stage == domain.AliasCreationPhaseReserving && explicitRateLimitRejection(err) {
 		// A known HME throttle in a definitive HTTP response rejects the
 		// business operation. Preserve an earlier forwarding mutation marker, but
@@ -213,7 +220,10 @@ func (m *Manager) logAliasCreationProgress(
 	// side effect occurred. Keep the recorded marker for mutations that happened
 	// before reserve separate so an explicit Apple rejection can be reported as
 	// non-mutating without weakening transport-failure diagnostics.
-	if stage != domain.AliasCreationPhaseReserving && aliasCreationRemoteSideEffectPossible(stage) {
+	// Reconciliation alone may only read an old candidate's directory state.
+	// The terminal result determines whether that candidate still needs the
+	// conservative remote-side-effect marker.
+	if stage != domain.AliasCreationPhaseReserving && stage != domain.AliasCreationPhaseReconciling && aliasCreationRemoteSideEffectPossible(stage) {
 		flow.state.remoteSideEffectPossible = true
 	}
 	percent := normalizedAliasCreationPercent(update.Percent)
@@ -700,6 +710,8 @@ func isAllowedAliasCreationErrorCode(code string) bool {
 		"APPLE_RATE_LIMITED",
 		"APPLE_UPSTREAM_ERROR",
 		"APPLE_ALIAS_CONFIRMATION_PENDING",
+		"APPLE_ALIAS_CANDIDATE_DISCARDED",
+		"APPLE_ALIAS_INACTIVE",
 		"APPLE_ACCOUNT_MISMATCH",
 		"APPLE_FORWARDING_TARGET_MISSING",
 		"ACCOUNT_CHANGED",
@@ -730,6 +742,7 @@ func aliasCreationErrorClass(code string) string {
 		return "context"
 	case code == "APPLE_ACCOUNT_ACTION_REQUIRED" || code == "APPLE_ACCOUNT_MISMATCH" ||
 		code == "APPLE_FORWARDING_TARGET_MISSING" ||
+		code == "APPLE_ALIAS_CANDIDATE_DISCARDED" || code == "APPLE_ALIAS_INACTIVE" ||
 		code == "ACCOUNT_CHANGED" || code == "ALIAS_OWNERSHIP_CONFLICT" || code == "ACCOUNT_DISABLED":
 		return "account_state"
 	case strings.HasPrefix(code, "APPLE_SESSION") || strings.HasPrefix(code, "APPLE_LOGIN") ||
@@ -762,7 +775,10 @@ func aliasCreationCauseCategory(err error, info aliasCreationErrorInfo) string {
 }
 
 func aliasCreationPendingConfirmation(err error, code string) bool {
-	if code == "APPLE_ALIAS_CONFIRMATION_PENDING" {
+	switch code {
+	case "APPLE_ALIAS_CANDIDATE_DISCARDED":
+		return false
+	case "APPLE_ALIAS_CONFIRMATION_PENDING", "APPLE_ALIAS_INACTIVE":
 		return true
 	}
 	var provider pendingConfirmationProvider
@@ -832,7 +848,11 @@ func aliasCreationErrorReason(code string) string {
 	case "APPLE_FORWARDING_TARGET_MISSING":
 		return "Apple 未能确认隐私邮箱的默认转发目标，本次未发起创建；请确认当前主号可作为转发邮箱，或先在 iCloud 手动创建一个隐私邮箱"
 	case "APPLE_ALIAS_CONFIRMATION_PENDING":
-		return "Apple 地址已创建但目录确认尚未完成，后续计划会继续确认"
+		return "Apple 隐私邮箱创建结果尚未确认；候选满 5 分钟后，若完整目录仍查无此地址，将自动清理本地记录"
+	case "APPLE_ALIAS_CANDIDATE_DISCARDED":
+		return "Apple 最新目录未找到候选地址，已清理本地待确认记录；下次计划将重新创建"
+	case "APPLE_ALIAS_INACTIVE":
+		return "Apple 目录中的候选地址已停用，本地记录已保留；请在 iCloud 重新启用，或确认不再使用后通过邮箱列表删除"
 	case "ALIAS_LIMIT_REACHED":
 		return "主号已达到隐私邮箱容量上限"
 	case "ACCOUNT_CHANGED":
