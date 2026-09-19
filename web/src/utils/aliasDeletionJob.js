@@ -141,6 +141,7 @@ export function createAliasDeletionController({
   getJob,
   getJobs,
   cancelJob,
+  clearCompletedJobs,
   storage,
   onChange = () => {},
   createOperationId = createAliasDeletionOperationId,
@@ -161,6 +162,7 @@ export function createAliasDeletionController({
     error: null,
     blocked: Boolean(pending),
     cancelling: [],
+    clearing: false,
   };
   let stopped = false;
   let started = false;
@@ -168,6 +170,7 @@ export function createAliasDeletionController({
   let inFlight = null;
   const readControllers = new Set();
   const revisions = new Map();
+  const clearedJobIds = new Set();
 
   function update(patch) {
     if (stopped) return;
@@ -189,6 +192,7 @@ export function createAliasDeletionController({
   function mergeJobs(jobs, expectedRevisions) {
     const merged = new Map(state.jobs.map((job) => [job.jobId, job]));
     for (const job of jobs) {
+      if (clearedJobIds.has(job.jobId)) continue;
       if (expectedRevisions && revisions.get(job.jobId) !== expectedRevisions.get(job.jobId)) continue;
       merged.set(job.jobId, job);
       revisions.set(job.jobId, (revisions.get(job.jobId) || 0) + 1);
@@ -209,7 +213,7 @@ export function createAliasDeletionController({
 
   function schedule() {
     clearTimer();
-    if (stopped || inFlight || state.submitting) return;
+    if (stopped || inFlight || state.submitting || state.clearing) return;
     if (state.recovering || state.uncertain || state.jobs.some(isAliasDeletionJobActive)) {
       timer = setTimeoutFn(() => {
         timer = null;
@@ -233,7 +237,7 @@ export function createAliasDeletionController({
   function refresh() {
     if (stopped) return Promise.resolve(false);
     if (inFlight) return inFlight;
-    if (state.submitting) return Promise.resolve(false);
+    if (state.submitting || state.clearing) return Promise.resolve(false);
     clearTimer();
     update({ checking: true });
     const operationId = pending?.operationId;
@@ -369,6 +373,23 @@ export function createAliasDeletionController({
       } finally {
         update({ cancelling: state.cancelling.filter((id) => id !== jobId) });
         if (!stopped) void refresh();
+      }
+    },
+    async clearCompleted(csrfToken) {
+      if (stopped || !clearCompletedJobs || state.clearing || state.recovering || state.blocked ||
+          !state.jobs.some((job) => job.status === "completed")) return false;
+      clearTimer();
+      update({ clearing: true });
+      try {
+        const result = await shortRequest((options) => clearCompletedJobs(csrfToken, options));
+        if (stopped) return false;
+        // Keep late list, lookup and cancellation replies from restoring cleared history.
+        for (const id of result.clearedJobIds) clearedJobIds.add(id);
+        update({ jobs: state.jobs.filter((job) => !clearedJobIds.has(job.jobId)) });
+        return result;
+      } finally {
+        update({ clearing: false });
+        schedule();
       }
     },
     stop() {

@@ -9,9 +9,14 @@
       <span class="alias-deletion-progress__hint">
         {{ state.jobs?.filter(isAliasDeletionJobActive).length || 0 }} 个进行中任务
       </span>
-      <el-button :loading="state.checking" :disabled="state.submitting || busy" @click="$emit('refresh')">
+      <el-button :loading="state.checking" :disabled="state.submitting || state.clearing || busy" @click="$emit('refresh')">
         刷新任务状态
       </el-button>
+      <el-button
+        :loading="state.clearing"
+        :disabled="busy || state.submitting || state.recovering || !!state.operationId || !state.jobs?.some(job => job.status === 'completed')"
+        @click="$emit('clear-completed')"
+      >清空已完成任务</el-button>
     </div>
     <p class="alias-deletion-progress__hint">
       不同主号同时执行；同一主号按提交顺序处理，每 60 分钟最多删除 200 个，剩余自动等待。
@@ -124,7 +129,7 @@ defineProps({
   busy: Boolean,
   cancellingIds: { type: Array, default: () => [] },
 });
-defineEmits(["refresh", "cancel", "acknowledge"]);
+defineEmits(["refresh", "cancel", "acknowledge", "clear-completed"]);
 
 const expanded = ref(new Set());
 function setExpanded(jobId, open) {

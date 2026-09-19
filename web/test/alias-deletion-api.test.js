@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cancelAliasDeletionJob, getAliasDeletionJobs, normalizeAliasDeletionJob } from "../src/api/admin.js";
+import { cancelAliasDeletionJob, clearCompletedAliasDeletionJobs, getAliasDeletionJobs, normalizeAliasDeletionJob } from "../src/api/admin.js";
 
 const raw = {
   job_id: "job-one", status: "running", requested: 1000, processed: 200,
@@ -72,4 +72,36 @@ test("login waits tolerate omitted retry times and malformed optional data stays
   assert.equal(job.pending, 800);
   const malformed = normalizeAliasDeletionJob({ ...raw, accounts: [{ ...raw.accounts[0], used: "200" }], cancel_requested: "true", cancelled: "800" });
   assert.deepEqual(malformed.accounts, []); assert.equal(malformed.cancelRequested, false); assert.equal(malformed.cancelled, 0);
+});
+
+test("clearing completed history sends CSRF and returns the confirmed IDs", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const abort = new AbortController();
+  globalThis.fetch = async (url, options) => {
+    assert.equal(url, "/admin/api/v1/aliases/batch/jobs/clear-completed");
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.get("X-CSRF-Token"), "csrf");
+    assert.equal(options.signal, abort.signal);
+    assert.equal(options.body, undefined);
+    return new Response(JSON.stringify({ data: { cleared: 1, cleared_job_ids: ["earlier-job", "job-one"] } }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  assert.deepEqual(await clearCompletedAliasDeletionJobs("csrf", { signal: abort.signal }), {
+    cleared: 1, clearedJobIds: ["earlier-job", "job-one"],
+  });
+});
+
+test("invalid clear responses do not confirm history removal", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  for (const value of [null, {}, { cleared: -1, cleared_job_ids: [] },
+    { cleared: 1, cleared_job_ids: [] }, { cleared: 0, cleared_job_ids: [null] },
+    { cleared: 0, cleared_job_ids: [""] }, { cleared: "1", cleared_job_ids: ["job-one"] }]) {
+    globalThis.fetch = async () => new Response(JSON.stringify({ data: value }), {
+      headers: { "Content-Type": "application/json" },
+    });
+    await assert.rejects(clearCompletedAliasDeletionJobs("csrf"), { code: "INVALID_RESPONSE" });
+  }
 });

@@ -940,7 +940,7 @@ paths:
       operationId: listAliasBatchDeleteJobs
       summary: 查询当前管理员的 Apple 删除任务列表
       description: |
-        返回当前管理员的全部 active（queued/running）任务，以及最近 20 个终态任务。
+        返回当前管理员的全部 active（queued/running）任务，以及最近 20 个未清空的终态任务。
         任务和逐主号进度来自持久队列；GET 不要求 X-CSRF-Token，也不会重新提交删除。
         其他管理员的任务不在响应中。若需要查询更早的任务，使用原 operation_id 按 ID 读取。
       security:
@@ -965,6 +965,54 @@ paths:
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
+  /api/v1/aliases/batch/jobs/clear-completed:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: keys 卷中管理路径去掉首尾斜杠后的值
+      - url: https://HOST/admin
+        description: 固定兼容入口；会话认证、CSRF 和访问隔离规则相同
+    post:
+      tags: [Administration]
+      operationId: clearCompletedAliasBatchDeleteJobs
+      summary: 清空当前管理员的已完成 Apple 删除任务
+      description: |
+        持久化隐藏当前管理员全部 status=completed 的任务，包括有失败或取消项的已结束任务。
+        list/latest 排除已清空任务；queued/running/interrupted 任务保留，执行队列和额度不变。
+        按 job_id 查询和相同 operation_id 的幂等重试仍返回原任务，不重复执行删除。
+        cleared 为本次新清空数量，cleared_job_ids 包含此前已清空的 completed ID，
+        供客户端忽略滞后响应。重复清空可返回 cleared=0。请求无正文，需要有效管理 Session、
+        X-CSRF-Token 和同源校验。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      responses:
+        "200":
+          description: 已清空的任务记录；没有可清空任务时 cleared 为 0。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminAliasBatchDeleteCacheControl"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminClearCompletedAliasBatchDeleteJobsResponse"
+              example:
+                data:
+                  cleared: 0
+                  cleared_job_ids: []
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
   /api/v1/aliases/batch/jobs/latest:
     servers:
       - url: https://HOST/{admin_path}
@@ -981,8 +1029,8 @@ paths:
       summary: 查询当前管理员最近的批量 Apple 删除任务
       description: |
         每次查询都校验有效管理 Session，优先返回当前管理员的 active（queued/running）任务；
-        多个 active 任务时优先返回最近创建的任务；没有 active 任务时返回最近的终态任务。
-        当前管理员没有任务时返回 {"data":null}。此路径保留兼容；多任务页面应使用列表接口，
+        多个 active 任务时优先返回最近创建的任务；没有 active 任务时返回最近的未清空终态任务。
+        当前管理员没有未清空任务时返回 {"data":null}。此路径保留兼容；多任务页面应使用列表接口，
         已知 operation_id 或 job_id 时应直接按该 ID 轮询以定位指定操作。GET 不要求 X-CSRF-Token。
         新队列结果只含实际成功或失败项，取消通过 cancelled 计数。旧快照 interrupted 响应
         仍为未知项目合成 BATCH_DELETE_INTERRUPTED；读取状态不会启动或重放任务。
@@ -990,7 +1038,7 @@ paths:
         - adminSession: []
       responses:
         "200":
-          description: 当前管理员的 active 任务优先，否则为按创建时间最近的任务；没有任务时 data 为 null。
+          description: 当前管理员的 active 任务优先，否则为按创建时间最近的未清空任务；没有未清空任务时 data 为 null。
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -2815,16 +2863,36 @@ components:
           properties:
             jobs:
               type: array
-              description: 当前管理员的全部 active 任务及最近 20 个终态任务。
+              description: 当前管理员的全部 active 任务及最近 20 个未清空的终态任务。
               items:
                 $ref: "#/components/schemas/AdminAliasBatchDeleteJob"
+    AdminClearCompletedAliasBatchDeleteJobsResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [cleared, cleared_job_ids]
+          properties:
+            cleared:
+              type: integer
+              minimum: 0
+              description: 本次新隐藏的 completed 任务数量。
+            cleared_job_ids:
+              type: array
+              uniqueItems: true
+              description: 当前管理员已隐藏的 completed 任务 ID，包含此前清空记录。
+              items:
+                type: string
     AdminLatestAliasBatchDeleteJobResponse:
       type: object
       additionalProperties: false
       required: [data]
       properties:
         data:
-          description: 当前管理员的 active 任务优先，否则为按创建时间最近的任务；没有任务时为 null。
+          description: 当前管理员的 active 任务优先，否则为按创建时间最近的未清空任务；没有未清空任务时为 null。
           anyOf:
             - $ref: "#/components/schemas/AdminAliasBatchDeleteJob"
             - type: "null"

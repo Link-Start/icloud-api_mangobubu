@@ -398,6 +398,16 @@ func (s *Server) adminAPICancelAliasDeletionJob(c *gin.Context) {
 	writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
 }
 
+func (s *Server) adminAPIClearCompletedAliasDeletionJobs(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	cleared, ids, err := s.store.ClearCompletedAliasDeletionJobs(c.Request.Context(), mustSession(c).AdminID)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	writeAdminAPIData(c, http.StatusOK, gin.H{"cleared": cleared, "cleared_job_ids": ids})
+}
+
 func (s *Server) adminAPIGetLatestAliasDeletionJob(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	jobs, err := s.store.ListAliasDeletionJobs(c.Request.Context(), mustSession(c).AdminID, 1)

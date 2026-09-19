@@ -22,6 +22,7 @@ var aliasDeletionQueueSchemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS alias_deletion_queue_sequence (
 		id BIGINT PRIMARY KEY CHECK(id = 1), sequence BIGINT NOT NULL DEFAULT 0)`,
 	`INSERT INTO alias_deletion_queue_sequence(id, sequence) VALUES(1, 0) ON CONFLICT(id) DO NOTHING`,
+	createAliasDeletionJobClearancesTable,
 	`CREATE TABLE IF NOT EXISTS alias_deletion_job_metadata (
 		admin_id BIGINT NOT NULL, job_id TEXT NOT NULL, queue_version INTEGER NOT NULL DEFAULT 1,
 		password_version BIGINT NOT NULL, username TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
@@ -197,8 +198,10 @@ func (s *Store) ListAliasDeletionJobs(ctx context.Context, adminID int64, limit 
 		limit = 1000
 	}
 	rows, err := s.queryContext(ctx, `SELECT `+aliasDeletionJobColumns+` FROM alias_deletion_jobs WHERE admin_id = ? AND
-		(status IN ('queued', 'running') OR id IN (SELECT id FROM alias_deletion_jobs WHERE admin_id = ?
-		AND status IN ('completed', 'interrupted') ORDER BY created_at DESC, id DESC LIMIT ?)) ORDER BY created_at DESC, id DESC`, adminID, adminID, limit)
+		(status IN ('queued', 'running') OR id IN (SELECT id FROM alias_deletion_jobs j WHERE j.admin_id = ?
+		AND j.status IN ('completed', 'interrupted') AND NOT EXISTS(SELECT 1 FROM alias_deletion_job_clearances c
+		WHERE c.admin_id = j.admin_id AND c.job_id = j.id)
+		ORDER BY created_at DESC, id DESC LIMIT ?)) ORDER BY created_at DESC, id DESC`, adminID, adminID, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -93,10 +93,13 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 | --- | --- | --- |
 | `DELETE /aliases/batch`，正文 `{"alias_ids":[101,102]}` | `200 data {requested,deleted,failed,results}` | 同步兼容接口；额度不足的项目立即返回等待信息，由调用方决定后续操作 |
 | `DELETE /aliases/batch?async=1`，正文含 `alias_ids` 和 `operation_id` | `202 data` 为任务对象 | 提交持久队列，或取得幂等重试对应的原任务 |
-| `GET /aliases/batch/jobs` | `200 data {jobs:[...]}` | 查询当前管理员的全部 active 任务及最近 20 个终态任务 |
-| `GET /aliases/batch/jobs/latest` | `200 data` 为任务对象或 `null` | 兼容入口，优先返回 active 任务，否则返回按创建时间最近的任务 |
+| `GET /aliases/batch/jobs` | `200 data {jobs:[...]}` | 查询当前管理员的全部 active 任务及最近 20 个未清空的终态任务 |
+| `GET /aliases/batch/jobs/latest` | `200 data` 为任务对象或 `null` | 兼容入口，优先返回 active 任务，否则返回按创建时间最近的未清空任务 |
 | `GET /aliases/batch/jobs/:jobID` | `200 data` 为任务对象 | 按 ID 查询；ID 格式无效或当前管理员名下无该任务时返回 `404` |
 | `POST /aliases/batch/jobs/:jobID/cancel` | `200 data` 为任务对象 | 取消此任务的剩余项，保留已有结果；已在途操作先完成结果核对 |
+| `POST /aliases/batch/jobs/clear-completed` | `200 data {cleared,cleared_job_ids}` | 从列表和 latest 中清空当前管理员的已完成任务，保留按 ID 查询及幂等重试 |
+
+Apple 删除队列中的“清空已完成任务”按钮会持久化隐藏当前管理员的全部 `completed` 任务，包含有失败或取消项的已结束任务；排队、执行和中断任务继续保留。刷新页面或重启后仍保持清空，原任务可按 ID 查询，同一操作编号的重复提交仍返回原任务。响应 `cleared` 为本次新清空数量，`cleared_job_ids` 包含此前已清空的任务 ID，以便页面处理滞后响应。
 
 异步请求示例正文：
 

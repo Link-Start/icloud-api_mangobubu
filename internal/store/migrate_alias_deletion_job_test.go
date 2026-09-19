@@ -137,6 +137,7 @@ func TestAliasDeletionJobPostgresConvergenceAllSupportedVersions(t *testing.T) {
 				}
 				for _, statement := range []string{
 					createAliasDeletionJobsTable, createAliasDeletionJobsLatestIndex, createAliasDeletionJobsActiveIndex,
+					createAliasDeletionJobClearancesTable,
 				} {
 					if !containsNormalizedSQL(capture.statements, statement) {
 						t.Errorf("missing PostgreSQL job schema convergence: %s", statement)

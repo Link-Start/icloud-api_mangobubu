@@ -24,6 +24,11 @@ const maxAliasDeletionJobItems = 1000
 
 const aliasDeletionJobColumns = `id, admin_id, request_id, status, items_json, created_at, updated_at`
 
+const createAliasDeletionJobClearancesTable = `CREATE TABLE IF NOT EXISTS alias_deletion_job_clearances (
+	admin_id BIGINT NOT NULL, job_id TEXT NOT NULL, cleared_at BIGINT NOT NULL,
+	PRIMARY KEY(admin_id, job_id),
+	FOREIGN KEY(admin_id, job_id) REFERENCES alias_deletion_jobs(admin_id, id) ON DELETE CASCADE)`
+
 // CreateAliasDeletionJob records a bounded progress snapshot. Callers normally
 // supply both timestamps; omitted timestamps default to the creation time.
 // Retries never replace an existing job, even when its original owner retries.
@@ -68,11 +73,58 @@ func (s *Store) GetAliasDeletionJob(ctx context.Context, id string, adminID int6
 func (s *Store) GetLatestAliasDeletionJob(ctx context.Context, adminID int64) (domain.AliasDeletionJob, error) {
 	job, err := scanAliasDeletionJob(s.queryRowContext(ctx,
 		`SELECT `+aliasDeletionJobColumns+` FROM alias_deletion_jobs
-		 WHERE admin_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, adminID))
+		 WHERE admin_id = ? AND NOT EXISTS(SELECT 1 FROM alias_deletion_job_clearances c
+		 WHERE c.admin_id = alias_deletion_jobs.admin_id AND c.job_id = alias_deletion_jobs.id)
+		 ORDER BY created_at DESC, id DESC LIMIT 1`, adminID))
 	if err == nil {
 		err = s.hydrateDeletionJobMetadata(ctx, &job)
 	}
 	return job, err
+}
+
+// ClearCompletedAliasDeletionJobs hides completed history for one owner while
+// retaining job IDs, results, and shared execution state for idempotent retries.
+// The returned IDs include previously cleared jobs so repeated requests can also
+// discard stale browser responses; the count includes only newly cleared jobs.
+func (s *Store) ClearCompletedAliasDeletionJobs(ctx context.Context, adminID int64) (int64, []string, error) {
+	tx, err := s.beginDeletionQueueTx(ctx)
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin alias deletion history clear: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := s.txExecContext(ctx, tx, `
+		INSERT INTO alias_deletion_job_clearances(admin_id, job_id, cleared_at)
+		SELECT admin_id, id, ? FROM alias_deletion_jobs WHERE admin_id = ? AND status = 'completed'
+		ON CONFLICT(admin_id, job_id) DO NOTHING`, timestamp(s.now()), adminID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("clear completed alias deletion jobs: %w", err)
+	}
+	cleared, err := result.RowsAffected()
+	if err != nil {
+		return 0, nil, fmt.Errorf("read alias deletion history clear result: %w", err)
+	}
+	rows, err := s.txQueryContext(ctx, tx, `SELECT job_id FROM alias_deletion_job_clearances WHERE admin_id = ? ORDER BY job_id`, adminID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("read cleared alias deletion job IDs: %w", err)
+	}
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, nil, fmt.Errorf("scan cleared alias deletion job ID: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return 0, nil, fmt.Errorf("read cleared alias deletion job IDs: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("commit alias deletion history clear: %w", err)
+	}
+	return cleared, ids, nil
 }
 
 // GetActiveAliasDeletionJob is independent of the latest historical job so

@@ -68,6 +68,105 @@ test("operation IDs are UUIDs including the HTTP-compatible random-values fallba
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 });
 
+test("clearing history removes only confirmed jobs and ignores stale polls and cancellation replies", async () => {
+  const done = job("completed", { processed: 7, deleted: 7, pending: 0 });
+  const running = job("running", { jobId: "still-running" });
+  const interrupted = job("interrupted", { jobId: "legacy-interrupted" });
+  const newlyDone = job("completed", { jobId: "just-finished", processed: 7, failed: 7, pending: 0 });
+  const cancellation = deferred(), listing = deferred(), clearing = deferred();
+  let reads = 0, clears = 0;
+  const { controller, timers } = harness({
+    getJobs: async () => ++reads === 1 ? [done, running, interrupted] : listing.promise,
+    cancelJob: async () => cancellation.promise,
+    clearCompletedJobs: async (csrf, options) => {
+      clears++;
+      assert.equal(csrf, "csrf"); assert.ok(options.signal);
+      return clearing.promise;
+    },
+  });
+  await controller.start();
+  const cancel = controller.cancel(running.jobId, "csrf");
+  const refresh = controller.refresh();
+  await flushPromises();
+  const clear = controller.clearCompleted("csrf");
+  assert.equal(controller.getState().clearing, true);
+  assert.equal(await controller.clearCompleted("csrf"), false);
+  assert.equal(clears, 1);
+  clearing.resolve({ cleared: 2, clearedJobIds: [done.jobId, running.jobId] });
+  await clear;
+  assert.deepEqual(controller.getState().jobs.map((value) => value.jobId), [interrupted.jobId]);
+  listing.resolve([done, running, interrupted, newlyDone]);
+  await refresh;
+  cancellation.resolve({ ...running, status: "completed", processed: 7, pending: 0, cancelled: 7 });
+  await cancel;
+  await flushPromises();
+  assert.deepEqual(new Set(controller.getState().jobs.map((value) => value.jobId)), new Set([interrupted.jobId, newlyDone.jobId]));
+  assert.equal(controller.getState().clearing, false);
+  assert.deepEqual(timers.delays(), []);
+  controller.stop();
+});
+
+test("clear failures retain history and active polling, and an idempotent retry can clear it", async () => {
+  const done = job("completed", { processed: 7, deleted: 7, pending: 0 });
+  const running = job("running", { jobId: "active-job" });
+  let attempts = 0;
+  const { controller, timers } = harness({
+    getJobs: async () => [done, running],
+    clearCompletedJobs: async () => {
+      if (++attempts === 1) throw apiError(503, "SERVICE_UNAVAILABLE");
+      return { cleared: 0, clearedJobIds: [done.jobId] };
+    },
+  });
+  await controller.start();
+  await assert.rejects(controller.clearCompleted("csrf"), { code: "SERVICE_UNAVAILABLE" });
+  assert.equal(controller.getState().jobs.length, 2);
+  assert.equal(controller.getState().clearing, false);
+  assert.deepEqual(timers.delays(), [ALIAS_DELETION_POLL_INTERVAL_MS]);
+  await controller.clearCompleted("csrf");
+  assert.deepEqual(controller.getState().jobs, [running]);
+  await controller.refresh();
+  assert.deepEqual(controller.getState().jobs, [running]);
+  assert.deepEqual(timers.delays(), [ALIAS_DELETION_POLL_INTERVAL_MS]);
+  controller.stop();
+});
+
+test("clearing is blocked during recovery and pending submission, and stopped views ignore its reply", async () => {
+  const done = job("completed", { processed: 7, deleted: 7, pending: 0 });
+  const clearing = deferred(), confirmation = deferred();
+  let calls = 0;
+  const { controller, changes } = harness({
+    getJobs: async () => [done],
+    getJob: async () => confirmation.promise,
+    startJob: async () => { throw new Error("lost response"); },
+    createOperationId: () => "pending-operation",
+    clearCompletedJobs: async () => { calls++; return clearing.promise; },
+  });
+  assert.equal(await controller.clearCompleted("csrf"), false);
+  await controller.start();
+  const clear = controller.clearCompleted("csrf");
+  await controller.submit([92], "csrf");
+  assert.equal(await controller.clearCompleted("csrf"), false);
+  clearing.resolve({ cleared: 1, clearedJobIds: [done.jobId] });
+  await clear;
+  assert.equal(await controller.clearCompleted("csrf"), false);
+  assert.equal(calls, 1);
+  controller.stop();
+  const count = changes.length;
+  confirmation.resolve(job("queued", { jobId: "pending-operation" }));
+  await flushPromises();
+  assert.equal(changes.length, count);
+
+  const late = deferred();
+  const stopped = harness({ getJobs: async () => [done], clearCompletedJobs: async () => late.promise });
+  await stopped.controller.start();
+  const request = stopped.controller.clearCompleted("csrf");
+  stopped.controller.stop();
+  const previous = stopped.controller.getState();
+  late.resolve({ cleared: 1, clearedJobIds: [done.jobId] });
+  assert.equal(await request, false);
+  assert.equal(stopped.controller.getState(), previous);
+});
+
 test("jobs omitted by the terminal history limit are resolved individually", async () => {
   let complete = false;
   const active = Array.from({ length: 25 }, (_, index) => job("running", { jobId: `history-job-${index}` }));

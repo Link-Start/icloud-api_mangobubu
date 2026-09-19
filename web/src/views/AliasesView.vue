@@ -263,6 +263,7 @@
       @refresh="refreshDeletionJob"
       @acknowledge="acknowledgeDeletionState"
       @cancel="cancelDeletionJob"
+      @clear-completed="clearCompletedDeletionJobs"
     />
 
       <RequestAlert
@@ -593,6 +594,7 @@ import {
   getMailGroups,
   getAliasDeletionJobs,
   cancelAliasDeletionJob,
+  clearCompletedAliasDeletionJobs,
   moveAliasToGroup,
   moveAliasesToGroup,
   rotateAllAliasCredentials,
@@ -702,6 +704,7 @@ function makeDeletionController() {
     getJob: getAliasDeletionJob,
     getJobs: getAliasDeletionJobs,
     cancelJob: cancelAliasDeletionJob,
+    clearCompletedJobs: clearCompletedAliasDeletionJobs,
     storage: createAliasDeletionStorage(ADMIN_BASE_PATH, username),
     onChange(next) {
       if (!viewActive || auth.state.username !== username) return;
@@ -737,6 +740,26 @@ function acknowledgeDeletionState() {
   if (!deletionController.acknowledgeUnmatched()) return;
   clearAliasSelection();
   void loadAliases();
+}
+
+async function clearCompletedDeletionJobs() {
+  const controller = deletionController;
+  const username = auth.state.username;
+  const isCurrent = () => viewActive && deletionController === controller && auth.state.username === username;
+  try {
+    const result = await controller.clearCompleted(auth.state.csrfToken);
+    if (isCurrent() && result) {
+      successMessage("已清空已完成任务");
+      // A cleared job may have finished before its last progress poll arrived.
+      void Promise.all([
+        loadAliases({ silent: true }),
+        loadAccounts({ silent: true }),
+        loadGroups({ silent: true }),
+      ]);
+    }
+  } catch (error) {
+    if (isCurrent()) showRequestError(error, "清空已完成任务失败，请稍后重试。");
+  }
 }
 
 async function cancelDeletionJob(jobId) {

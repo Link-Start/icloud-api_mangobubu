@@ -28,7 +28,10 @@ async function renderProgress(rawJobs, statePatch = {}, expanded = true) {
     setup: () => ({ ...deletionUtils, ...bindings, state, busy: false, cancellingIds: [], formatTime }),
   });
   for (const name of ["el-tag", "el-button", "el-progress"]) {
-    app.component(name, { setup: (_props, { slots }) => () => h("span", slots.default?.()) });
+    app.component(name, name === "el-button" ? {
+      props: { disabled: Boolean, loading: Boolean },
+      setup: (props, { slots }) => () => h("button", { disabled: props.disabled || props.loading }, slots.default?.()),
+    } : { setup: (_props, { slots }) => () => h("span", slots.default?.()) });
   }
   app.config.warnHandler = (message) => assert.fail(message);
   const html = await renderToString(app);
@@ -198,7 +201,7 @@ test("terminal transitions refresh lists without clearing a selection for the ne
   let options;
   const dependencies = {
     auth, viewActive: true, deletionState: state,
-    startAliasDeletionJob() {}, getAliasDeletionJob() {}, getAliasDeletionJobs() {}, cancelAliasDeletionJob() {},
+    startAliasDeletionJob() {}, getAliasDeletionJob() {}, getAliasDeletionJobs() {}, cancelAliasDeletionJob() {}, clearCompletedAliasDeletionJobs() {},
     createAliasDeletionStorage() {}, ADMIN_BASE_PATH: "/admin", isAliasDeletionJobTerminal,
     createAliasDeletionController: (value) => { options = value; return {}; },
     clearAliasSelection: () => assert.fail("existing task must not clear a new selection"),
@@ -304,6 +307,43 @@ test("legacy interrupted tasks preserve the explicit reconciliation notice", asy
   assert.match(text, /此旧任务已中断，部分 Apple 结果待确认/);
   assert.match(text, /不会自动重放旧任务的剩余项/);
   assert.doesNotMatch(text, /取消剩余任务/);
+});
+
+test("clear history is enabled only for completed jobs with no unresolved submission", async () => {
+  for (const [status, statePatch, enabled] of [
+    ["completed", {}, true], ["running", {}, false], ["interrupted", {}, false],
+    ["completed", { clearing: true }, false], ["completed", { recovering: true }, false],
+    ["completed", { submitting: true }, false], ["completed", { operationId: "pending-operation" }, false],
+  ]) {
+    const { html } = await renderProgress(rawJob({ status }), statePatch);
+    const button = html.match(/<button([^>]*)>清空已完成任务<\/button>/);
+    assert.ok(button, "clear button is visible in the queue header");
+    assert.equal(button[1].includes("disabled"), !enabled, JSON.stringify({ status, statePatch }));
+  }
+});
+
+test("clearing refreshes mailbox counts even when the final progress poll was missed", async () => {
+  const implementation = source.slice(source.indexOf("async function clearCompletedDeletionJobs("), source.indexOf("async function cancelDeletionJob("));
+  for (const changeUser of [false, true]) {
+    const auth = { state: { username: "owner", csrfToken: "csrf" } };
+    const refreshes = [], messages = [];
+    const dependencies = {
+      auth, viewActive: true,
+      deletionController: { clearCompleted: async (csrf) => {
+        assert.equal(csrf, "csrf");
+        if (changeUser) auth.state.username = "other";
+        return { cleared: 0, clearedJobIds: ["previously-cleared"] };
+      } },
+      successMessage: (message) => messages.push(message), showRequestError: assert.fail,
+      loadAliases: async (options) => { assert.deepEqual(options, { silent: true }); refreshes.push("aliases"); },
+      loadAccounts: async (options) => { assert.deepEqual(options, { silent: true }); refreshes.push("accounts"); },
+      loadGroups: async (options) => { assert.deepEqual(options, { silent: true }); refreshes.push("groups"); },
+    };
+    const clear = Function(...Object.keys(dependencies), implementation + "; return clearCompletedDeletionJobs;")(...Object.values(dependencies));
+    await clear();
+    assert.deepEqual(refreshes, changeUser ? [] : ["aliases", "accounts", "groups"]);
+    assert.deepEqual(messages, changeUser ? [] : ["已清空已完成任务"]);
+  }
 });
 
 test("cancellation confirms remaining scope and ignores a stale administrator", async () => {

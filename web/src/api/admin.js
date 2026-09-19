@@ -1220,6 +1220,18 @@ export async function cancelAliasDeletionJob(jobId, csrfToken, options = {}) {
   return normalizeAliasDeletionJob(data);
 }
 
+export async function clearCompletedAliasDeletionJobs(csrfToken, options = {}) {
+  const data = await apiRequest("/aliases/batch/jobs/clear-completed", {
+    method: "POST", csrfToken, signal: options.signal,
+  });
+  if (!Number.isSafeInteger(data?.cleared) || data.cleared < 0 ||
+      !Array.isArray(data.cleared_job_ids) || data.cleared > data.cleared_job_ids.length ||
+      !data.cleared_job_ids.every((id) => typeof id === "string" && id.length > 0)) {
+    throw Object.assign(new Error("清空任务响应异常，请稍后重试。"), { code: "INVALID_RESPONSE" });
+  }
+  return { cleared: data.cleared, clearedJobIds: data.cleared_job_ids };
+}
+
 export async function getAuditLogs(options = {}) {
   const query = listQuery(options);
   const data = await apiRequest(`/audit?${query}`, {
