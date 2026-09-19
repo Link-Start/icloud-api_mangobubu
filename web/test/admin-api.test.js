@@ -776,6 +776,7 @@ test("async alias deletion sends the operation ID once and maps the 202 snapshot
     jobId: operationId, status: "running", requested: 9, processed: 2,
     deleted: 1, failed: 1, requestId: "request-42",
     waits: [], deferred: 0,
+    pending: null, cancelled: 0, cancelRequested: false, accounts: [],
     createdAt: raw.created_at, updatedAt: raw.updated_at,
     results: [
       { id: 91, address: "deleted@icloud.com", deleted: true, code: "", message: "", localRetained: false },

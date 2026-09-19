@@ -789,55 +789,47 @@ paths:
     delete:
       tags: [Administration]
       operationId: deleteAliasesFromApple
-      summary: 从 Apple 批量永久删除隐私邮箱
+      summary: 从 Apple 批量永久删除隐私邮箱并支持持久队列
       description: |
         仅接受已经完成 Apple 登录、邮箱模式为 `icloud` 且主号没有同步错误的隐私邮箱。
-        服务会先检查本次请求中的全部邮箱和主号，在第一项远端变更前完成资格校验；随后对每个
-        邮箱调用 Apple 的停用（必要时）和永久删除流程。只有 Apple 端确认该地址已经删除后，
-        才删除本地记录；新一次读取的 Apple 目录确认地址已不存在时，也可清理本地记录，
-        旧缓存中的缺失本身不构成确认。返回结果按邮箱逐项报告；明确失败项的本地记录保留，已成功删除的
-        其他项目不会回滚。等待 Apple 目录确认的邮箱和自定义邮箱不适用此接口。
+        服务在创建新任务前预检全部邮箱和主号；执行时再次核对当前会话、身份及目录。
+        对每个邮箱先预占删除额度，再调用 Apple 的停用（必要时）和永久删除流程。
+        只有 Apple 确认已删除，或最新完整目录确认地址已不存在，才清理本地记录。
+        等待 Apple 目录确认的本地候选也须先核对远端；自定义邮箱不适用此接口。
+        明确失败项保留本地记录；其他已完成项目不回滚。
 
-        省略 `async` 时保留原同步行为及 200 响应。`async=1` 时正文使用
-        AdminAsyncDeleteAliasesRequest，必须带 `operation_id`：16–128 个 ASCII 字母、数字、
-        `-` 或 `_`，建议使用 UUID；返回 202 任务快照，不等待整批远端删除完成。
-        请求体 Schema 的 oneOf 描述两种正文结构；query 与正文的联动约束由服务校验，
-        异步模式省略或提供无效 `operation_id` 返回 400。
+        省略 `async` 时保留同步行为及 200 响应，额度不足项目立即返回等待信息。
+        `async=1` 时正文使用 AdminAsyncDeleteAliasesRequest，必须带 `operation_id`：
+        16–128 个 ASCII 字母、数字、`-` 或 `_`，建议 UUID；返回 202 持久队列快照。
+        query 与正文的联动约束由服务校验；异步模式缺少或提供无效 operation_id 返回 400。
+        `job_id` 等于 operation_id，任务身份、幂等键、读取和取消均按管理员隔离。
+        同一管理员以相同键和完全相同、顺序一致的 alias_ids 重试，返回原任务，包括终态，
+        不重新执行；先查幂等键再预检，已删除的本地 ID 不影响原任务重试。
+        同键不同列表（含顺序变化）返回 409 IDEMPOTENCY_CONFLICT。
+        响应丢失时直接 GET /aliases/batch/jobs/<原 operation_id>；页面恢复时可查询任务列表。
 
-        `job_id` 等于 `operation_id`，任务身份、幂等键和读取均按管理员隔离；
-        不同管理员可使用相同键创建各自的任务。同一管理员以相同键和完全相同、顺序一致的
-        `alias_ids` 重复提交，返回原任务（包括已 completed/interrupted 的任务），不重复
-        删除也不新占名额。服务先查幂等键，再预检新任务的邮箱，已删除的本地 ID 不影响此类重试。
-        同一管理员的同键并发提交也按此幂等约定处理，仅创建一个任务。
-        同一管理员的同键不同列表（含顺序变化）返回 409 IDEMPOTENCY_CONFLICT。
-        客户端在首次提交前保存原键和原列表；响应丢失时优先直接
-        GET /aliases/batch/jobs/<原 operation_id>，无需先收到 job_id。未保存键时可用 jobs/latest
-        找回当前管理员任务；不要因超时生成新键或重排、删减原列表。
+        同一管理员可有多个 active 任务，不同主号没有执行并发上限。
+        队列按可信 Apple 主体共享 FIFO 顺序，多个本地主号连接同一 Apple 主体时合并处理。
+        不同任务中相同邮箱的 active 工作共享一次删除；取消仅退出当前任务的订阅，
+        其他任务仍需要的工作继续执行。任务的取消项单独计数，不计入 failed。
 
-        每管理员最多 1 个 active（queued/running）任务，服务全局最多 2 个；新任务遇到
-        当前管理员已有 active 任务返回 409 BATCH_DELETE_IN_PROGRESS，服务满返回
-        429 BATCH_DELETE_BUSY，后台尚未启动或正在关闭返回 503 BATCH_DELETE_UNAVAILABLE。
-        凭据正在轮换时也返回 409 BATCH_DELETE_IN_PROGRESS；不同管理员的同键任务互不冲突。
-        后台运行上限 2 小时，提交请求的断开不取消已接收任务；管理会话和凭据轮换保护仍然适用。
-        任务进度与逐项 audit 在同一事务中持久化，停止服务有界等待收尾；重启将遗留
-        未终结任务标为 interrupted，不自动重放。interrupted 时 HTTP 合成的剩余项使用
-        BATCH_DELETE_INTERRUPTED，表示远端结果待核查；这些项计入 failed、不计入 processed，
-        local_retained 为 false 且在 JSON 中省略，不证明本地已删除或仍在。
+        单条、同步批量和后台删除共用持久额度：每个 Apple 主体最近 60 分钟最多 200 个，
+        恢复额度留出 5 秒缓冲；该值是部署删除策略，不是整点重置计数。
+        1000 个项目可跨多个窗口自动继续，无三次限流恢复次数或整任务两小时上限。
+        额度不足时先排队，不提前停用邮箱；新的完整目录确认已不存在的地址不消耗新额度。
+        外部客户端操作可能使 Apple 更早限流。存在 Retry-After 时遵守该时间，并与本地额度
+        恢复时间取较晚者；没有时间提示时冷却一小时。等待只影响对应主体，不增加失败数。
 
-        同一账号逐条处理并复用 validate/directory，沿用响应更新后的滚动会话；
-        每个任务内不同账号最多 2 路活动执行，与全局最多 2 个 active 任务是两层限制。
-        限流等待只暂停对应主号且不占活动执行名额；其他未限流主号继续处理，
-        多个主号同时冷却也不会挡住后续正常主号。waits 可以与其他主号增长的 processed/deleted 同时出现。
-        异常时重新读取并验证远端状态，不以直接删除本地记录替代 Apple 确认。
-        后台模式同账号请求至少间隔 1 秒；出现限流按 60、120、240 秒退避等待，
-        Apple Retry-After 指定更长等待时尊重该值。每个主号在整批最多恢复 3 次，
-        等待保持 running 并返回 waits，不计为已处理或失败；结束等待后用新目录核对再继续，
-        不盲目重放停用或删除。持续受限时后续未执行项返回 APPLE_BATCH_DEFERRED，
-        可选 deferred 是 failed 的子集。同步兼容接口及单条删除不启用此后台等待策略。
-        冷却期间仍可开启或关闭自动创建隐私邮箱；开关只更新本地计划，不绕过 Apple 冷却。
-        同一主号的实际 Apple 操作仍串行，批量删除恢复前重新获取账号锁并检查身份及邮箱状态。
-        同账号、无异常且 N 个地址均需先停用的模拟调用计数可从 4N 降为 2N+2；这不是
-        固定加速比。实际时长和成功数仍取决于 Apple，单次 1000 项上限不是全部成功承诺。
+        排队和额度/冷却等待期间释放账号操作锁；实际执行以一封邮箱为单位，完成后释放锁，
+        让目录同步和自动创建穿插执行。恢复时重新读取会话与目录，单次执行有超时边界。
+        登录失效暂停对应主号，其他主号继续执行。关闭页面不取消任务，重启恢复 pending 项；
+        已发出请求但结果未落库的项目先核对最新目录，再决定后续处理。
+        升级前仅保存快照的旧任务仍在重启时变为 interrupted，不自动重放；旧任务的未知项
+        使用 BATCH_DELETE_INTERRUPTED，计入 failed 而不计入 processed，远端结果仍待核查。
+
+        凭据轮换期间提交返回 409 BATCH_DELETE_IN_PROGRESS；后台尚未启动或正在关闭时
+        返回 503 BATCH_DELETE_UNAVAILABLE。全量轮换只在实际单项执行期间被阻止，
+        队列等待不持有轮换锁；轮换导致授权版本失效后，该管理员的剩余订阅停止执行。
       security:
         - adminSession: []
       parameters:
@@ -898,6 +890,10 @@ paths:
                   processed: 0
                   deleted: 0
                   failed: 0
+                  pending: 3
+                  cancelled: 0
+                  cancel_requested: false
+                  accounts: []
                   results: []
                   request_id: 6oe7j0x3x3pJv9Dv
                   created_at: "2026-09-08T10:00:00Z"
@@ -929,6 +925,46 @@ paths:
         "503":
           $ref: "#/components/responses/AdminBatchAliasDeleteUnavailable"
 
+  /api/v1/aliases/batch/jobs:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: keys 卷中管理路径去掉首尾斜杠后的值
+      - url: https://HOST/admin
+        description: 固定兼容入口；会话认证和访问隔离规则相同
+    get:
+      tags: [Administration]
+      operationId: listAliasBatchDeleteJobs
+      summary: 查询当前管理员的 Apple 删除任务列表
+      description: |
+        返回当前管理员的全部 active（queued/running）任务，以及最近 20 个终态任务。
+        任务和逐主号进度来自持久队列；GET 不要求 X-CSRF-Token，也不会重新提交删除。
+        其他管理员的任务不在响应中。若需要查询更早的任务，使用原 operation_id 按 ID 读取。
+      security:
+        - adminSession: []
+      responses:
+        "200":
+          description: 当前管理员的任务列表；没有任务时 jobs 为空数组。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminAliasBatchDeleteCacheControl"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAliasBatchDeleteJobListResponse"
+              example:
+                data:
+                  jobs: []
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
   /api/v1/aliases/batch/jobs/latest:
     servers:
       - url: https://HOST/{admin_path}
@@ -945,11 +981,11 @@ paths:
       summary: 查询当前管理员最近的批量 Apple 删除任务
       description: |
         每次查询都校验有效管理 Session，优先返回当前管理员的 active（queued/running）任务；
-        没有 active 任务时，返回按创建时间最近的任务（同一时间按 job_id 降序），包括已完成或中断的任务。
-        当前管理员没有任务时返回 {"data":null}。页面恢复且未保存键时可据此找回任务；
+        多个 active 任务时优先返回最近创建的任务；没有 active 任务时返回最近的终态任务。
+        当前管理员没有任务时返回 {"data":null}。此路径保留兼容；多任务页面应使用列表接口，
         已知 operation_id 或 job_id 时应直接按该 ID 轮询以定位指定操作。GET 不要求 X-CSRF-Token。
-        正常进度只含已完成结果；interrupted 响应为其余项目合成 BATCH_DELETE_INTERRUPTED，
-        远端结果待核查，不承诺本地记录仍在。读取状态不会启动或重放任务。
+        新队列结果只含实际成功或失败项，取消通过 cancelled 计数。旧快照 interrupted 响应
+        仍为未知项目合成 BATCH_DELETE_INTERRUPTED；读取状态不会启动或重放任务。
       security:
         - adminSession: []
       responses:
@@ -1028,6 +1064,60 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/APIErrorEnvelope"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
+  /api/v1/aliases/batch/jobs/{jobID}/cancel:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: keys 卷中管理路径去掉首尾斜杠后的值
+      - url: https://HOST/admin
+        description: 固定兼容入口；会话认证、CSRF 和访问隔离规则相同
+    post:
+      tags: [Administration]
+      operationId: cancelAliasBatchDeleteJob
+      summary: 取消当前管理员某个 Apple 删除任务的剩余项
+      description: |
+        取消仅退出当前任务对剩余邮箱的订阅，已有成功或失败结果保留，取消数不计入 failed。
+        已经向 Apple 发出的操作继续完成结果核对；其他任务仍订阅的共享工作继续执行。
+        返回当前任务快照，cancel_requested 标记取消请求，全部项目终结后 status 为 completed。
+        重复取消和取消终态任务不会重新执行删除。请求无正文，需要有效管理 Session、
+        X-CSRF-Token 和同源校验；ID 格式无效或当前管理员名下无该任务均返回 404。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+        - name: jobID
+          in: path
+          required: true
+          description: 原提交的 operation_id，即 job_id；只操作当前管理员名下的任务。
+          schema:
+            type: string
+            minLength: 16
+            maxLength: 128
+            pattern: '^[A-Za-z0-9_-]{16,128}$'
+      responses:
+        "200":
+          description: 取消后的当前任务快照。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminAliasBatchDeleteCacheControl"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAliasBatchDeleteJobResponse"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminNotFound"
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
@@ -2713,6 +2803,21 @@ components:
       properties:
         data:
           $ref: "#/components/schemas/AdminAliasBatchDeleteJob"
+    AdminAliasBatchDeleteJobListResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [jobs]
+          properties:
+            jobs:
+              type: array
+              description: 当前管理员的全部 active 任务及最近 20 个终态任务。
+              items:
+                $ref: "#/components/schemas/AdminAliasBatchDeleteJob"
     AdminLatestAliasBatchDeleteJobResponse:
       type: object
       additionalProperties: false
@@ -2726,12 +2831,12 @@ components:
     AdminAliasBatchDeleteJob:
       type: object
       additionalProperties: false
-      required: [job_id, status, requested, processed, deleted, failed, results, request_id, created_at, updated_at]
+      required: [job_id, status, requested, processed, deleted, failed, pending, cancelled, cancel_requested, accounts, results, request_id, created_at, updated_at]
       description: |
-        持久化任务快照，不是可自动重放的队列。queued/running 为 active，completed/interrupted 为终态。
-        completed 只表示处理结束，不承诺整批成功。后台运行上限 2 小时；重启中断遗留 active 任务，
-        已保存结果继续可查，不自动重新删除。进度与对应逐项 audit 在同一事务中持久化，
-        该事务不覆盖 Apple 远端变更，因此中断后可能仍有结果待核查的项目。
+        持久化删除队列快照。queued/running 为 active，completed/interrupted 为终态。
+        completed 只表示所有项目已终结，可能包含失败和取消；等待额度的账号状态在 accounts 中。
+        新队列重启后恢复 pending 项，结果不明的在途项先核对远端；没有整任务两小时上限。
+        旧快照任务仍在重启时转为 interrupted，不自动重放。数据库进度事务不覆盖 Apple 远端变更。
       properties:
         job_id:
           type: string
@@ -2742,7 +2847,7 @@ components:
         status:
           type: string
           enum: [queued, running, completed, interrupted]
-          description: completed 表示本次处理结束而非全部成功；interrupted 表示任务已停止且不会自动重放。
+          description: completed 表示所有项目已终结，包括取消；interrupted 表示任务已停止且不自动重放。额度等待和暂停由 accounts.status 表达。
         requested:
           type: integer
           minimum: 1
@@ -2752,7 +2857,7 @@ components:
           type: integer
           minimum: 0
           maximum: 1000
-          description: 已持久化完成结果的项目数（成功或错误），最多 requested；不包括 HTTP 合成的中断剩余项。
+          description: 已持久化终结项数（成功、失败或取消），最多 requested；不包括旧快照 HTTP 合成的中断剩余项。
         deleted:
           type: integer
           minimum: 0
@@ -2763,20 +2868,40 @@ components:
           minimum: 0
           maximum: 1000
           description: |
-            results 中 deleted=false 的项目数；interrupted 时包含为未完成项合成的结果未知项，
-            不等于已确认远端删除失败的数量。此时 deleted+failed 可能大于 processed。
+            失败项数，不包含等待或取消。旧快照 interrupted 时包含未完成项的合成结果未知项，
+            不等于已确认远端删除失败的数量；此时 deleted+failed 可能大于 processed。
+        pending:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: 尚未终结的项目数，包含排队、等待、暂停和在途项目。
+        cancelled:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: 当前任务已退出删除工作且终结为取消的项目数；计入 processed，不计入 failed 或 results。
+        cancel_requested:
+          type: boolean
+          description: 是否已请求取消剩余项；已发出的 Apple 请求仍可完成结果核对。
+        accounts:
+          type: array
+          minItems: 0
+          maxItems: 1000
+          description: 按主号汇总的进度与额度。不同主号可同时执行；共享 Apple 主体的主号共享顺序和额度。
+          items:
+            $ref: "#/components/schemas/AdminAliasDeletionAccount"
         deferred:
           type: integer
           minimum: 0
           maximum: 1000
-          description: 因主号限流预算耗尽而尚未执行的 APPLE_BATCH_DEFERRED 项目数，是 failed 的子集；零时可省略。
+          description: 旧快照中 APPLE_BATCH_DEFERRED 项目数，是 failed 的子集；新队列额度等待不终结为 deferred，零时可省略。
         waits:
           type: array
-          maxItems: 2
+          maxItems: 1000
           description: |
-            当前进程中等待限流恢复的主号，按 account_id 排序；仅 active 任务返回，空时省略。
-            等待不产生项目结果或增加 processed/failed，结束等待后清除。重启后任务为 interrupted，
-            不恢复这些临时计时状态。客户端继续 GET 原任务，不应另建删除请求。
+            当前等待额度或 Apple 限流恢复的主号，按 account_id 排序；空时省略。
+            等待不产生项目结果或增加 processed/failed；新队列等待状态与额度可在重启后恢复。
+            客户端继续 GET 原任务，不因等待另建删除请求。
           items:
             $ref: "#/components/schemas/AdminAliasDeletionWait"
         results:
@@ -2784,11 +2909,10 @@ components:
           minItems: 0
           maxItems: 1000
           description: |
-            按原 alias_ids 顺序返回。非 interrupted 时只含已有完成结果的项目，初始可为空数组，
-            不为待处理项预填成功或失败。interrupted 时保留已有结果，并为尚无完成结果的项目
-            合成 deleted=false、code=BATCH_DELETE_INTERRUPTED 和待核查 message；这些项的
-            local_retained 为 false，序列化时省略，不证明远端仍存在，也不证明本地已删除或仍在。
-            合成项计入 failed，但不计入 processed；使用 processed 读取进度，
+            按原 alias_ids 顺序返回，只含实际成功或失败项；初始可为空数组，等待和取消不预填结果。
+            旧快照 interrupted 保留已有结果，并为未知项目合成 deleted=false、
+            code=BATCH_DELETE_INTERRUPTED 和待核查说明；合成项计入 failed，不计入 processed，
+            省略的 local_retained 不证明本地已删除或仍在。使用 processed 读取进度，
             不以 results.length 或 deleted+failed 代替已处理数量。
           items:
             $ref: "#/components/schemas/AdminAliasBatchDeleteItem"
@@ -2803,10 +2927,61 @@ components:
           type: string
           format: date-time
           description: 任务最近一次持久化更新时间，UTC RFC 3339 格式，可含小数秒。
+    AdminAliasDeletionAccount:
+      type: object
+      additionalProperties: false
+      required: [account_id, account_email, status, requested, deleted, failed, pending, cancelled, used, limit]
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          minimum: 1
+        account_email:
+          type: string
+          format: email
+        status:
+          type: string
+          enum: [queued, running, waiting, paused, completed, cancelled, interrupted]
+          description: waiting 表示额度或 Apple 冷却等待；paused 表示需修复登录等状态，后台会重新检查。
+        requested:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        deleted:
+          type: integer
+          minimum: 0
+          maximum: 1000
+        failed:
+          type: integer
+          minimum: 0
+          maximum: 1000
+        pending:
+          type: integer
+          minimum: 0
+          maximum: 1000
+        cancelled:
+          type: integer
+          minimum: 0
+          maximum: 1000
+        used:
+          type: integer
+          minimum: 0
+          description: 此 Apple 主体当前滚动窗口已占用的删除额度；包含其他入口和任务的用量。
+        limit:
+          type: integer
+          const: 200
+          description: 部署采用的每 60 分钟删除额度。
+        retry_at:
+          type: string
+          format: date-time
+          description: UTC 预计恢复或重新检查时间；不是完成时间保证。
+        wait_reason:
+          type: string
+          description: 等待或暂停的稳定原因标识。
     AdminAliasDeletionWait:
       type: object
       additionalProperties: false
-      required: [account_id, alias_id, operation, retry_at, attempt, max_attempts]
+      required: [account_id, alias_id, operation, retry_at, used, limit]
       properties:
         account_id:
           type: integer
@@ -2823,14 +2998,25 @@ components:
         retry_at:
           type: string
           format: date-time
-          description: UTC 预计重试时间；由本地退避及 Apple Retry-After 的较长者决定，不是成功保证。
+          description: UTC 预计恢复时间；取本地额度恢复与 Apple 冷却的较晚时间，不是成功保证。
+        reason:
+          type: string
+          description: 额度等待或 Apple 冷却等稳定原因标识。
+        used:
+          type: integer
+          minimum: 0
+          description: 当前主体滚动窗口已占用的删除额度。
+        limit:
+          type: integer
+          const: 200
         attempt:
           type: integer
           minimum: 1
-          maximum: 3
+          description: 兼容诊断字段；新队列没有三次恢复次数限制，未设置时省略。
         max_attempts:
           type: integer
-          const: 3
+          minimum: 1
+          description: 兼容旧等待诊断字段；新队列未设置时省略。
         http_status:
           type: integer
           minimum: 100
@@ -2894,6 +3080,21 @@ components:
             true 表示本次失败处理保留了本地记录。实现中的 false 会在 JSON 中省略；
             中断剩余项及任务执行时本地记录已不存在的 NOT_FOUND 项不承诺保留，
             不应从字段省略推断本地记录已删除或仍在。
+        retry_at:
+          type: string
+          format: date-time
+          description: 同步调用遇到额度或冷却等待时的 UTC 预计恢复时间。
+        wait_reason:
+          type: string
+          description: 同步调用等待的稳定原因标识。
+        used:
+          type: integer
+          minimum: 0
+          description: 同步调用等待时当前主体已占用的删除额度。
+        limit:
+          type: integer
+          const: 200
+          description: 同步调用等待时适用的滚动窗口额度。
     AdminAlias:
       type: object
       additionalProperties: true
@@ -3392,7 +3593,7 @@ components:
       description: |
         批量删除的邮箱不满足 Apple 删除条件，例如主号尚未完成 Apple 登录、存在同步错误、
         使用自定义邮箱模式，或邮箱仍在等待 Apple 目录确认。
-        异步请求还包括 BATCH_DELETE_IN_PROGRESS（当前管理员已有 active 任务或凭据正在轮换）
+        异步请求还包括 BATCH_DELETE_IN_PROGRESS（凭据正在轮换）
         以及 IDEMPOTENCY_CONFLICT（同一管理员的原键绑定了不同 alias_ids 列表，包括顺序变化）。
         同键同列表重试返回 202 原任务，不另占名额；等待提交准入时请求取消可返回 BATCH_DELETE_INTERRUPTED。
       headers:
@@ -3405,11 +3606,11 @@ components:
           schema:
             $ref: "#/components/schemas/AdminAppleErrorResponse"
           examples:
-            activeJob:
+            credentialRotation:
               value:
                 error:
                   code: BATCH_DELETE_IN_PROGRESS
-                  message: 已有后台删除任务，请先查看该任务的进度
+                  message: 正在轮换凭证，请完成后重新登录再提交删除任务
                   request_id: 6oe7j0x3x3pJv9Dv
             idempotencyConflict:
               value:
@@ -3419,9 +3620,8 @@ components:
                   request_id: 6oe7j0x3x3pJv9Dv
     AdminBatchAliasDeleteBusy:
       description: |
-        异步新任务因服务全局已有 2 个 active 任务而暂缓接收（BATCH_DELETE_BUSY）；
-        稍后用原 operation_id 和原列表重试，已有任务的幂等重试不新占名额。
-        前置 Apple 会话检查若返回上游限流，也可返回 APPLE_RATE_LIMITED；按 error.code 区分。
+        前置 Apple 会话检查返回上游限流时可返回 APPLE_RATE_LIMITED。
+        不按当前活动任务数量拒绝提交；不同主号没有执行并发上限。
         此响应不保证 Retry-After 响应头。
       headers:
         X-Request-ID:
@@ -3434,8 +3634,8 @@ components:
             $ref: "#/components/schemas/AdminAppleErrorResponse"
           example:
             error:
-              code: BATCH_DELETE_BUSY
-              message: 后台删除任务已满，请稍后提交
+              code: APPLE_RATE_LIMITED
+              message: Apple 请求受限，请稍后重试
               request_id: 6oe7j0x3x3pJv9Dv
     AdminBatchAliasDeleteUnavailable:
       description: |

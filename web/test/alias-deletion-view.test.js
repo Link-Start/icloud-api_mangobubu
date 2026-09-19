@@ -1,16 +1,12 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { computed, createSSRApp, h, ref } from "vue";
+import { createSSRApp, h, ref } from "vue";
 import { renderToString } from "vue/server-renderer";
 
 import { normalizeAliasDeletionJob } from "../src/api/admin.js";
-import {
-  ALIAS_DELETION_OPERATION_LABELS,
-  formatAliasDeletionResultMessage,
-  isAliasDeletionJobActive,
-  isAliasDeletionJobTerminal,
-} from "../src/utils/aliasDeletionJob.js";
+import * as deletionUtils from "../src/utils/aliasDeletionJob.js";
+const { isAliasDeletionJobTerminal } = deletionUtils;
 import { formatTime } from "../src/utils/format.js";
 
 const viewPath = new URL("../src/views/AliasesView.vue", import.meta.url);
@@ -19,27 +15,17 @@ const deleteFunctions = source.slice(
   source.indexOf("function batchDeleteAccountState("),
   source.indexOf("async function copyAliases("),
 );
-const progressTemplate = source.match(/<section\s+v-if="deletionJob \|\| deletionState\.recovering[\s\S]*?<\/section>/)[0];
-const progressComputeds = source.slice(
-  source.indexOf("const deletionJob = computed("),
-  source.indexOf("function makeDeletionController("),
-);
-
-async function renderProgress(rawJob, statePatch = {}) {
-  const deletionState = ref({ job: normalizeAliasDeletionJob(rawJob), ...statePatch });
-  const values = Function("computed", "deletionState", `
-    ${progressComputeds}
-    return { deletionJob, deletionPercentage, deletionRecentFailures, deletionWaits,
-      deletionJobType, deletionStatusLabel };
-  `)(computed, deletionState);
+const componentSource = await readFile(new URL("../src/components/AliasDeletionQueue.vue", import.meta.url), "utf8");
+const progressTemplate = componentSource.slice(componentSource.indexOf("<template>") + 10, componentSource.indexOf("<script setup>")).trim().replace(/<\/template>$/, "");
+const progressFunctions = componentSource.slice(componentSource.indexOf("const expanded = ref("), componentSource.indexOf("</script>"));
+async function renderProgress(rawJobs, statePatch = {}, expanded = true) {
+  const jobs = (Array.isArray(rawJobs) ? rawJobs : rawJobs ? [rawJobs] : []).map(normalizeAliasDeletionJob);
+  const state = { jobs, ...statePatch };
+  const bindings = Function("ref", progressFunctions + "; return { expanded, setExpanded, recentFailures };")(ref);
+  if (expanded) for (const job of jobs) bindings.setExpanded(job.jobId, true);
   const app = createSSRApp({
     template: progressTemplate,
-    setup: () => ({
-      ...values, deletionState, deletionResultsExpanded: ref(true), deletingAliases: false,
-      ALIAS_DELETION_OPERATION_LABELS, formatAliasDeletionResultMessage,
-      isAliasDeletionJobActive, formatTime, Refresh: null,
-      refreshDeletionJob() {}, acknowledgeDeletionState() {},
-    }),
+    setup: () => ({ ...deletionUtils, ...bindings, state, busy: false, cancellingIds: [], formatTime }),
   });
   for (const name of ["el-tag", "el-button", "el-progress"]) {
     app.component(name, { setup: (_props, { slots }) => () => h("span", slots.default?.()) });
@@ -206,180 +192,135 @@ test("rejected submissions show the request error without claiming mailbox outco
   assert.equal(raced.warnings.length, 1);
 });
 
-test("page lifecycle starts recovery, stops polling, and isolates controllers on username changes", () => {
-  assert.match(source, /onMounted\(\(\) => \{\s*if \(auth\.state\.username\) void deletionController\.start\(\)/);
-  assert.match(source, /onBeforeUnmount\(\(\) => \{\s*viewActive = false;\s*deletionController\.stop\(\)/);
-  assert.match(source, /watch\(\(\) => auth\.state\.username, \(\) => \{\s*deletionController\.stop\(\);\s*deletionController = makeDeletionController\(\)/);
-  assert.match(source, /createAliasDeletionStorage\(ADMIN_BASE_PATH, username\)/);
-  assert.match(source, /auth\.state\.username !== username/);
-  assert.match(source, /deletionState\.operationId/);
-  for (const field of ["processed", "requested", "deleted", "failed"]) {
-    assert.match(source, new RegExp(`\\{\\{ deletionJob\\.${field} \\}\\}`));
-  }
-  assert.match(source, /formatAliasDeletionResultMessage\(failure\)/);
-  assert.match(source, /formatAliasDeletionResultMessage\(result\)/);
-  assert.doesNotMatch(progressTemplate, /本地记录已保留|v-html|dangerouslyUseHTMLString|raw_?body/i);
-  assert.match(source, /任务已中断，部分 Apple 结果待确认/);
-  assert.match(source, /不会自动重放剩余项/);
-  assert.doesNotMatch(source, /删除失败，结果待核对|近期失败原因/);
-  assert.match(source, /\.alias-deletion-progress\s*\{[^}]*overflow:\s*auto;[^}]*overflow-wrap:\s*anywhere;/);
-  assert.match(source, /\.alias-deletion-progress__header\s*\{[^}]*flex-wrap:\s*wrap;/);
-});
-
-test("terminal transitions clear selection and reload lists once, late cross-user callbacks are ignored", () => {
+test("terminal transitions refresh lists without clearing a selection for the next task", () => {
   const factory = source.slice(source.indexOf("function makeDeletionController("), source.indexOf("watch(() => auth.state.username"));
-  const refreshes = [];
-  const state = { value: {} };
-  const auth = { state: { username: "owner" } };
+  const refreshes = [], state = { value: { jobs: [] } }, auth = { state: { username: "owner" } };
   let options;
   const dependencies = {
-    auth, viewActive: true, deletionState: state, deletionResultsExpanded: { value: false },
-    startAliasDeletionJob() {}, getAliasDeletionJob() {}, getLatestAliasDeletionJob() {},
+    auth, viewActive: true, deletionState: state,
+    startAliasDeletionJob() {}, getAliasDeletionJob() {}, getAliasDeletionJobs() {}, cancelAliasDeletionJob() {},
     createAliasDeletionStorage() {}, ADMIN_BASE_PATH: "/admin", isAliasDeletionJobTerminal,
     createAliasDeletionController: (value) => { options = value; return {}; },
-    clearAliasSelection: () => refreshes.push("clear"),
-    loadAliases: async () => refreshes.push("aliases"),
-    loadAccounts: async () => refreshes.push("accounts"),
+    clearAliasSelection: () => assert.fail("existing task must not clear a new selection"),
+    loadAliases: async () => refreshes.push("aliases"), loadAccounts: async () => refreshes.push("accounts"),
     loadGroups: async () => refreshes.push("groups"),
   };
   Function(...Object.keys(dependencies), `${factory}; makeDeletionController();`)(...Object.values(dependencies));
-  options.onChange({ job: { jobId: "job", status: "queued" } });
-  options.onChange({ job: { jobId: "job", status: "running" } });
-  options.onChange({ job: { jobId: "job", status: "running", processed: 0, failed: 0, waits: [{ attempt: 1 }] } });
-  options.onChange({ job: { jobId: "job", status: "running", processed: 0, failed: 0, waits: [] } });
-  assert.deepEqual(refreshes, ["clear"]);
-  options.onChange({ job: { jobId: "job", status: "interrupted" } });
-  options.onChange({ job: { jobId: "job", status: "interrupted" } });
-  assert.deepEqual(refreshes, ["clear", "clear", "aliases", "accounts", "groups"]);
-  const previousState = state.value;
-  auth.state.username = "another";
-  options.onChange({ job: { jobId: "old-owner-job", status: "completed" } });
+  options.onChange({ jobs: [{ jobId: "one", status: "queued" }, { jobId: "two", status: "running" }] });
+  options.onChange({ jobs: [{ jobId: "one", status: "running" }, { jobId: "two", status: "running" }] });
+  assert.deepEqual(refreshes, []);
+  const finished = { jobs: [{ jobId: "one", status: "completed" }, { jobId: "two", status: "running" }] };
+  options.onChange(finished); options.onChange(finished);
+  assert.deepEqual(refreshes, ["aliases", "accounts", "groups"]);
+  const previousState = state.value; auth.state.username = "another";
+  options.onChange({ jobs: [{ jobId: "old-owner-job", status: "completed" }] });
   assert.equal(state.value, previousState);
 });
 
-test("waiting renders server retry times, attempts, IDs and fixed Chinese operations without final counts", async () => {
-  const raw = {
-    job_id: "waiting-job", status: "running", requested: 416, processed: 0,
-    deleted: 0, failed: 0, results: [],
-  };
-  const retryAt = "2026-09-08T01:08:23Z";
-  const waits = ["validate", "list", "deactivate", "delete"].map((operation, index) => ({
-    account_id: index === 3 ? 0 : 12, alias_id: index === 0 ? 0 : 91 + index,
-    operation, retry_at: retryAt, attempt: index % 3 + 1, max_attempts: 3,
-    http_status: 429, service_code: "UPSTREAM_SECRET", raw_body: "RAW_SECRET",
-    message: "<script>wait-secret</script>",
-  }));
-  const waiting = await renderProgress({ ...raw, waits });
-  assert.match(waiting.text, /以下主号触发 Apple 限流，等待后继续/);
-  assert.match(waiting.text, /执行中（主号限流等待）/);
-  assert.match(waiting.text, /仅上述主号等待；其他未限流主号继续处理/);
-  assert.match(waiting.text, /已处理 0 \/ 416； 成功删除 0；失败\/未执行 0/);
-  assert.match(waiting.text, /主号 ID 12/);
-  assert.match(waiting.text, /邮箱 ID 94/);
-  assert.doesNotMatch(waiting.text, /主号 ID 0|邮箱 ID 0|其中未执行/);
-  for (const label of ["校验", "获取邮箱列表", "停用邮箱", "删除邮箱"]) {
-    assert.ok(waiting.text.includes(label));
-  }
-  for (const attempt of [1, 2, 3]) assert.ok(waiting.text.includes(`第 ${attempt} 次重试（最多 3 次）`));
-  assert.ok(waiting.text.includes(`预计重试时间：${formatTime(retryAt, { seconds: true })}`));
-  assert.doesNotMatch(waiting.html, /UPSTREAM_SECRET|RAW_SECRET|wait-secret|<script>/);
-  for (const next of [raw, { ...raw, waits: [] }, { ...raw, status: "completed", waits }]) {
-    const resumed = await renderProgress(next);
-    assert.doesNotMatch(resumed.text, /触发 Apple 限流|主号限流等待|仅上述主号等待|预计重试时间/);
-    assert.match(resumed.text, next.status === "completed" ? /已完成/ : /执行中/);
-    assert.match(resumed.text, /已处理 0 \/ 416/);
-  }
+const rawJob = (patch = {}) => ({
+  job_id: "waiting-job", status: "running", requested: 1000, processed: 200,
+  deleted: 200, failed: 0, pending: 800, cancelled: 0, accounts: [], results: [],
+  created_at: "2026-09-19T01:00:00Z", ...patch,
+});
+const rawAccount = (patch = {}) => ({
+  account_id: 1, account_email: "first@icloud.com", status: "waiting",
+  requested: 1000, deleted: 200, failed: 0, pending: 800, cancelled: 0, used: 200, limit: 200,
+  retry_at: "2026-09-19T02:00:05Z", wait_reason: "quota", ...patch,
 });
 
-test("account-specific waits coexist with other accounts' completed results and ongoing progress", async () => {
-  const raw = {
-    job_id: "multi-account-job", status: "running", requested: 8, processed: 2,
-    deleted: 2, failed: 0,
-    results: [
-      { id: 201, address: "account-2-first@example.invalid", deleted: true },
-      { id: 301, address: "account-3-first@example.invalid", deleted: true },
-    ],
-    waits: [{
-      account_id: 1, alias_id: 101, operation: "delete",
-      retry_at: "2026-09-08T01:08:23Z", attempt: 1, max_attempts: 3,
-    }],
-  };
-  const waiting = await renderProgress(raw);
-  assert.match(waiting.text, /执行中（主号限流等待）/);
-  assert.match(waiting.text, /已处理 2 \/ 8； 成功删除 2；失败\/未执行 0/);
-  assert.match(waiting.text, /主号 ID 1 · 邮箱 ID 101/);
-  assert.doesNotMatch(waiting.text, /主号 ID [23]/);
-  assert.match(waiting.text, /仅上述主号等待；其他未限流主号继续处理/);
-  assert.match(waiting.text, /account-2-first@example.invalid： 已删除/);
-  assert.match(waiting.text, /account-3-first@example.invalid： 已删除/);
-
-  const progressed = await renderProgress({
-    ...raw, processed: 3, deleted: 3,
-    results: [...raw.results, { id: 302, address: "account-3-next@example.invalid", deleted: true }],
-  });
-  assert.match(progressed.text, /已处理 3 \/ 8； 成功删除 3；失败\/未执行 0/);
-  assert.match(progressed.text, /主号 ID 1 · 邮箱 ID 101/);
-  assert.match(progressed.text, /account-3-next@example.invalid： 已删除/);
-
-  const resumed = await renderProgress({ ...raw, waits: [] });
-  assert.match(resumed.text, /执行中/);
-  assert.match(resumed.text, /已处理 2 \/ 8； 成功删除 2；失败\/未执行 0/);
-  assert.doesNotMatch(resumed.text, /主号限流等待|触发 Apple 限流|仅上述主号等待|预计重试时间/);
-  assert.match(resumed.text, /account-2-first@example.invalid： 已删除/);
-  assert.match(resumed.text, /account-3-first@example.invalid： 已删除/);
+test("multiple tasks show independent account progress, hourly quota and recovery time", async () => {
+  const { html, text } = await renderProgress([
+    rawJob({ accounts: [rawAccount()] }),
+    rawJob({ job_id: "other", requested: 400, processed: 12, deleted: 12, pending: 388,
+      accounts: [rawAccount({ account_id: 2, account_email: "second@icloud.com", status: "running", requested: 400,
+        deleted: 12, pending: 388, used: 12, retry_at: null, wait_reason: "" })] }),
+  ]);
+  assert.match(text, /2 个进行中任务/);
+  assert.match(text, /已处理 200 \/ 1000；成功删除 200； 待执行 800；失败 0/);
+  assert.match(text, /已处理 12 \/ 400；成功删除 12； 待执行 388；失败 0/);
+  assert.match(text, /first@icloud.com/); assert.match(text, /second@icloud.com/);
+  assert.match(text, /最近 60 分钟额度 200 \/ 200/);
+  assert.match(text, /等待每小时额度恢复/);
+  assert.ok(text.includes(formatTime("2026-09-19T02:00:05Z", { seconds: true })));
+  assert.match(text, /最近 60 分钟额度 12 \/ 200/);
+  assert.match(text, /不同主号同时执行/); assert.match(text, /排队期间同步和创建照常进行/);
+  assert.equal((html.match(/取消剩余任务/g) || []).length, 2);
+  assert.doesNotMatch(text, /最多 3 次|第 1 次重试|每 2 秒/);
 });
 
-test("416 rate-limited results have one retention notice each in both failure previews and details", async () => {
+test("a logged-out account pauses independently and cancellation is separate from failure", async () => {
+  const { text } = await renderProgress([
+    rawJob({ accounts: [rawAccount({ status: "paused", wait_reason: "login_required", retry_at: null })] }),
+    rawJob({ job_id: "cancelled", status: "completed", processed: 1000, pending: 0, cancelled: 800, cancel_requested: true,
+      accounts: [rawAccount({ account_id: 2, status: "cancelled", pending: 0, cancelled: 800, wait_reason: "", retry_at: null })] }),
+  ]);
+  assert.match(text, /等待主号登录/); assert.match(text, /等待主号重新登录 Apple/);
+  assert.match(text, /已结束（含取消项）/); assert.match(text, /失败 0 ；已取消 800/);
+  assert.doesNotMatch(text, /失败 800|待执行 800；失败 800/);
+  assert.equal(deletionUtils.aliasDeletionPercentage(normalizeAliasDeletionJob(rawJob({ processed: 1000, cancelled: 800 }))), 100);
+  assert.equal(deletionUtils.aliasDeletionPercentage(normalizeAliasDeletionJob(rawJob({ processed: 500, cancelled: 300 }))), 50);
+  assert.equal(deletionUtils.aliasDeletionPending({ requested: 1000, processed: 500, cancelled: 300 }), 500);
+  assert.equal(deletionUtils.aliasDeletionJobLabel({ status: "running", accounts: [
+    { status: "waiting" }, { status: "paused" }, { status: "running" },
+  ] }), "执行中");
+});
+
+test("pending submissions and ordinary progress failures provide different messages", async () => {
+  const pending = await renderProgress([], { uncertain: true, operationId: "pending-operation", unmatched: true });
+  assert.match(pending.text, /尚未查到本次提交对应的任务/);
+  assert.match(pending.text, /确认后可继续添加任务/);
+  assert.match(pending.text, /已添加的队列照常执行/);
+  assert.match(pending.text, /pending-operation/);
+  const failedPoll = await renderProgress(rawJob(), { uncertain: true, operationId: "" });
+  assert.match(failedPoll.text, /任务进度暂未更新/);
+  assert.doesNotMatch(failedPoll.text, /确认后可继续添加任务/);
+});
+
+test("queue details escape result content and lazily render long result lists", async () => {
   const results = Array.from({ length: 416 }, (_, index) => ({
     id: index + 1, address: `alias-${index + 1}@example.invalid`, deleted: false,
     code: "APPLE_RATE_LIMITED", message: "Apple 限流；本地记录已保留", local_retained: true,
   }));
-  const { html, text } = await renderProgress({
-    job_id: "limited-job", status: "completed", requested: 416, processed: 416,
-    deleted: 0, failed: 416, results,
-  });
-  assert.match(text, /失败\/未执行 416/);
-  const preview = html.match(/<div class="alias-deletion-progress__failures">([\s\S]*?)<\/div>\s*<details/)[1];
-  const details = html.match(/<details[^>]*>([\s\S]*?)<\/details>/)[1];
-  assert.equal(preview.match(/本地记录已保留/g).length, 5);
-  assert.equal(details.match(/本地记录已保留/g).length, 416);
-  assert.doesNotMatch(text, /本地记录已保留[；; ]+本地记录已保留/);
+  const raw = rawJob({ status: "completed", requested: 416, processed: 416, deleted: 0, failed: 416, pending: 0, results });
+  const closed = await renderProgress(raw, {}, false);
+  assert.equal((closed.html.match(/本地记录已保留/g) || []).length, 5);
+  const open = await renderProgress(raw);
+  assert.equal((open.html.match(/本地记录已保留/g) || []).length, 421);
+  assert.doesNotMatch(open.text, /本地记录已保留[；; ]+本地记录已保留/);
+  const escaped = await renderProgress(rawJob({ failed: 1, results: [{ id: 1, deleted: false,
+    message: "<img src=x onerror=alert(1)>；本地记录已保留", local_retained: false }] }));
+  assert.doesNotMatch(escaped.html, /<img|<script/); assert.match(escaped.html, /&lt;img/);
 });
 
-test("deferred is a failed subset while unknown results remain pending in both displays", async () => {
-  const { html, text } = await renderProgress({
-    job_id: "deferred-job", status: "completed", requested: 416, processed: 416,
-    deleted: 0, failed: 416, deferred: 414,
-    results: [
-      { id: 1, deleted: false, code: "APPLE_BATCH_DEFERRED", message: "主号持续限流；本地记录已保留", local_retained: true },
-      { id: 2, deleted: false, code: "UNKNOWN", local_retained: false },
-      { id: 3, deleted: false, code: "UNKNOWN", message: "<img src=x onerror=alert(1)>；本地记录已保留", local_retained: false },
-    ],
-  });
-  assert.match(text, /失败\/未执行 416/);
-  assert.match(text, /其中未执行 414/);
-  assert.equal(text.match(/未执行：主号持续限流；本地记录已保留/g).length, 2);
-  assert.equal(text.match(/删除结果待确认；Apple \/ 本地状态待核对/g).length, 2);
-  assert.equal(text.match(/本地记录已保留/g).length, 2);
-  assert.doesNotMatch(text, /删除失败|APPLE_BATCH_DEFERRED/);
-  assert.doesNotMatch(html, /<img|<script/);
-  assert.match(html, /&lt;img/);
-  const unknown = await renderProgress(null, { uncertain: true, operationId: "pending-job", error: { code: "UNKNOWN" } });
-  assert.match(unknown.text, /结果待确认/);
-  assert.doesNotMatch(unknown.text, /失败|已处理|成功删除|本地记录已保留/);
+test("malformed optional metadata never hides task progress or exposes upstream bodies", async () => {
+  const { html, text } = await renderProgress(rawJob({ accounts: [null, { raw_body: "RAW_SECRET" }], waits: [
+    null, "RAW_SECRET", { account_id: 12, alias_id: 91, operation: "<script>secret</script>", retry_at: "RAW_SECRET" },
+  ] }));
+  assert.match(text, /已处理 200 \/ 1000/); assert.doesNotMatch(html, /RAW_SECRET|<script/);
 });
 
-test("malformed wait metadata cannot hide the original job or introduce HTML and raw-body secrets", async () => {
-  const { html, text } = await renderProgress({
-    job_id: "known-job", status: "running", requested: 416, processed: 7,
-    deleted: 6, failed: 1, deferred: 500, results: [],
-    waits: [null, "RAW_SECRET", { account_id: { secret: "RAW_SECRET" }, raw_body: "RAW_SECRET" }, {
-      account_id: 12, alias_id: 91, operation: "<img src=x onerror=alert(1)>",
-      retry_at: "<script>RAW_SECRET</script>", attempt: 1, max_attempts: 3,
-    }],
-  });
-  assert.match(text, /known-job/);
-  assert.match(text, /已处理 7 \/ 416； 成功删除 6；失败\/未执行 1/);
-  assert.doesNotMatch(html, /RAW_SECRET|<img|<script/);
-  assert.doesNotMatch(text, /主号限流等待|预计重试时间|其中未执行/);
+test("legacy interrupted tasks preserve the explicit reconciliation notice", async () => {
+  const { text } = await renderProgress(rawJob({ status: "interrupted", pending: null }));
+  assert.match(text, /此旧任务已中断，部分 Apple 结果待确认/);
+  assert.match(text, /不会自动重放旧任务的剩余项/);
+  assert.doesNotMatch(text, /取消剩余任务/);
+});
+
+test("cancellation confirms remaining scope and ignores a stale administrator", async () => {
+  const implementation = source.slice(source.indexOf("async function cancelDeletionJob("), source.indexOf("const selectedAliases = computed("));
+  for (const changeUser of [false, true]) {
+    const auth = { state: { username: "owner", csrfToken: "csrf" } }, calls = [], ids = { value: [] };
+    let message;
+    const dependencies = {
+      auth, viewActive: true, cancellingDeletionIds: ids,
+      deletionController: { cancel: async (...args) => calls.push(args) },
+      ElMessageBox: { confirm: async (value) => { message = value; if (changeUser) auth.state.username = "other"; } },
+      confirmationCancelled: () => false, showRequestError: assert.fail,
+    };
+    const cancel = Function(...Object.keys(dependencies), implementation + "; return cancelDeletionJob;")(...Object.values(dependencies));
+    await cancel("job-one");
+    assert.match(message, /取消本任务尚未执行的项目/); assert.match(message, /已删除的邮箱不会恢复/);
+    assert.deepEqual(calls, changeUser ? [] : [["job-one", "csrf"]]);
+    if (!changeUser) assert.deepEqual(ids.value, []);
+  }
 });

@@ -62,7 +62,7 @@ func TestAdminAPIAutoCreationTogglesDuringAppleBatchDeletionCooldown(t *testing.
 
 	clockBase := time.Now().UTC()
 	var clockOffset atomic.Int64
-	waiting, resume := make(chan struct{}), make(chan struct{})
+	env.server.now = func() time.Time { return clockBase.Add(time.Duration(clockOffset.Load())) }
 	// Both paths use the production keyed lock. A no-op fixture would hide the
 	// regression where deletion holds this lock throughout the Apple cooldown.
 	locker := syncer.New(env.store, env.cipher, nil, env.server.logger, time.Minute, 1)
@@ -70,15 +70,7 @@ func TestAdminAPIAutoCreationTogglesDuringAppleBatchDeletionCooldown(t *testing.
 		hmesync.WithClock(func() time.Time { return clockBase.Add(time.Duration(clockOffset.Load())) }),
 		hmesync.WithAliasDeletionWaiter(func(ctx context.Context, delay time.Duration) error {
 			if delay >= time.Minute {
-				if delay < 90*time.Second {
-					return fmt.Errorf("Apple Retry-After shortened to %s", delay)
-				}
-				close(waiting)
-				select {
-				case <-resume:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+				return fmt.Errorf("persistent queue slept inside account operation for %s", delay)
 			}
 			if err := ctx.Err(); err != nil {
 				return err
@@ -174,7 +166,7 @@ func TestAdminAPIAutoCreationTogglesDuringAppleBatchDeletionCooldown(t *testing.
 	if admission.Code != http.StatusAccepted {
 		t.Fatalf("deletion admission = %d %s", admission.Code, admission.Body.String())
 	}
-	waitTestAliasDeletionSignal(t, waiting)
+	waitTestAliasDeletionState(t, env, admin.ID, testAliasDeletionJobID, func(job domain.AliasDeletionJob) bool { return job.Items[0].State == domain.AliasDeletionWorkWaiting })
 	readProgress := func() adminAPIAliasDeletionJobDTO {
 		t.Helper()
 		response := env.request(t, http.MethodGet, "/admin/api/v1/aliases/batch/jobs/"+testAliasDeletionJobID, nil, "", []*http.Cookie{cookie}, "")
@@ -187,7 +179,7 @@ func TestAdminAPIAutoCreationTogglesDuringAppleBatchDeletionCooldown(t *testing.
 	if before.Status != domain.AliasDeletionJobRunning || before.Processed != 0 || before.Deleted != 0 || before.Failed != 0 || len(before.Results) != 0 || len(before.Waits) != 1 {
 		t.Fatalf("expected an unprocessed job waiting for Apple: %#v", before)
 	}
-	if wait := before.Waits[0]; wait.AccountID != account.ID || wait.AliasID != first.ID || wait.Operation != "validate" || wait.HTTPStatus != 429 || wait.Attempt != 1 {
+	if wait := before.Waits[0]; wait.AccountID != account.ID || wait.AliasID != first.ID || wait.Operation != "validate" || wait.HTTPStatus != 429 || wait.Reason != "upstream_rate_limit" {
 		t.Fatalf("unexpected Apple cooldown: %#v", wait)
 	}
 	for _, enabled := range []bool{false, true, false} {
@@ -202,7 +194,12 @@ func TestAdminAPIAutoCreationTogglesDuringAppleBatchDeletionCooldown(t *testing.
 		}
 	}
 
-	close(resume)
+	retryAt, err := time.Parse(time.RFC3339Nano, before.Waits[0].RetryAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clockOffset.Store(int64(retryAt.Sub(clockBase) + time.Second))
+	env.server.wakeAliasDeletionQueue()
 	job := waitTestAliasDeletionJob(t, env, admin.ID, testAliasDeletionJobID)
 	final := env.server.adminAPIAliasDeletionJobSnapshot(job)
 	stop()
@@ -210,8 +207,8 @@ func TestAdminAPIAutoCreationTogglesDuringAppleBatchDeletionCooldown(t *testing.
 	if final.Status != domain.AliasDeletionJobCompleted || final.Processed != 2 || final.Deleted != 2 || final.Failed != 0 || len(final.Waits) != 0 {
 		t.Fatalf("deletion did not resume after toggles: %#v", final)
 	}
-	if requests.Load() != 7 {
-		t.Fatalf("Apple requests after completion = %d, want 7", requests.Load())
+	if requests.Load() != 9 {
+		t.Fatalf("Apple requests after completion = %d, want 9", requests.Load())
 	}
 	schedule, err := env.store.GetAliasCreationSchedule(context.Background(), account.ID)
 	if err != nil || schedule.Enabled || len(schedule.PlannedAt) != 0 || schedule.NextRunAt != nil {

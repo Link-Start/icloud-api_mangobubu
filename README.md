@@ -75,14 +75,24 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 
 ## 批量 Apple 删除后台任务
 
-以下路径均相对于 `<admin-path>/api/v1`，固定兼容入口为 `/admin/api/v1`。提交和轮询都需要有效管理 Session；`DELETE` 还需 `X-CSRF-Token` 及同源校验。后台任务只脱离提交请求的连接生命周期，不免除管理会话和凭据轮换保护。
+“从 Apple 删除”使用持久化队列：同一主号按提交顺序逐条处理，不同主号同时执行，不设置主号执行并发上限；同一管理员可以提交多个任务。队列和删除额度按已验证的 Apple 账户身份归并，多个本地主号连接同一个 Apple 账户时共享额度及处理顺序。重复提交仍在排队或执行的邮箱会关联同一份删除工作，不会重复向 Apple 删除。
+
+部署采用每个 Apple 主体最近 60 分钟最多 200 个的删除策略，额度恢复额外留出 5 秒缓冲。单条删除、同步批量删除和后台队列共用数据库额度记录，重启、刷新页面、新建任务和切换管理员均不清零。先预占额度，再停用和永久删除邮箱；无额度时保留排队状态，邮箱不会仅因等待而提前停用。最新完整目录确认 Apple 已不存在的地址可直接清理本地记录，不消耗新的删除额度；请求结果不明时保留额度并先核对目录。
+
+例如主号额度充足时一次提交 1000 个邮箱，先处理最多 200 个，剩余项在额度逐步恢复后继续，约分五轮完成。计时基于每个删除名额的使用时间，不按整点清零；预计执行时间还受请求耗时、其他入口删除和 Apple 实际限流影响。官网、手机等外部操作不在本地额度账中：Apple 提前限流时，按 `Retry-After` 与本地额度恢复时间中的较晚时间等待；没有时间提示则进入一小时冷却。等待只影响对应主号，不增加失败数，也没有三次恢复次数或整任务两小时上限。
+
+排队和额度/冷却等待期间释放全部账号操作锁；实际删除以单封邮箱为锁定单位，完成该邮箱处理后释放，让同主号的目录同步和自动创建穿插执行。恢复删除时重新读取会话并核对最新目录。删除等待不占邮件同步或创建的执行名额；同主号的一次正在执行的 Apple 操作仍可能让其他操作短暂等待，单次执行有超时边界。
+
+以下路径均相对于 `<admin-path>/api/v1`，固定兼容入口为 `/admin/api/v1`。提交、取消和查询都需要有效管理 Session；`DELETE` 和 `POST` 还需 `X-CSRF-Token` 及同源校验。后台任务脱离提交连接和页面生命周期，关闭页面后继续执行。
 
 | 请求 | 成功响应 | 用途 |
 | --- | --- | --- |
-| `DELETE /aliases/batch`，正文 `{"alias_ids":[101,102]}` | `200 data {requested,deleted,failed,results}` | 保留原同步接口及结果格式 |
-| `DELETE /aliases/batch?async=1`，正文含 `alias_ids` 和 `operation_id` | `202 data {job_id,status,requested,processed,deleted,failed,results,request_id,created_at,updated_at}` | 提交后台任务，或取得幂等重试对应的原任务 |
-| `GET /aliases/batch/jobs/latest` | `200 data` 为任务对象或 `null` | 优先返回当前管理员的 active 任务，否则返回按创建时间最近的任务；没有任务时为 `null` |
-| `GET /aliases/batch/jobs/:jobID` | `200 data` 为任务对象 | 按 ID 轮询；ID 格式无效或当前管理员名下无该任务时返回 `404`，不泄露其他管理员的同 ID 任务 |
+| `DELETE /aliases/batch`，正文 `{"alias_ids":[101,102]}` | `200 data {requested,deleted,failed,results}` | 同步兼容接口；额度不足的项目立即返回等待信息，由调用方决定后续操作 |
+| `DELETE /aliases/batch?async=1`，正文含 `alias_ids` 和 `operation_id` | `202 data` 为任务对象 | 提交持久队列，或取得幂等重试对应的原任务 |
+| `GET /aliases/batch/jobs` | `200 data {jobs:[...]}` | 查询当前管理员的全部 active 任务及最近 20 个终态任务 |
+| `GET /aliases/batch/jobs/latest` | `200 data` 为任务对象或 `null` | 兼容入口，优先返回 active 任务，否则返回按创建时间最近的任务 |
+| `GET /aliases/batch/jobs/:jobID` | `200 data` 为任务对象 | 按 ID 查询；ID 格式无效或当前管理员名下无该任务时返回 `404` |
+| `POST /aliases/batch/jobs/:jobID/cancel` | `200 data` 为任务对象 | 取消此任务的剩余项，保留已有结果；已在途操作先完成结果核对 |
 
 异步请求示例正文：
 
@@ -93,37 +103,24 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 }
 ```
 
-`alias_ids` 为 1–1000 个不重复的正整数。异步模式必填 `operation_id`：16–128 个 ASCII 字母、数字、`-` 或 `_`。`job_id` 就是原 `operation_id`，任务身份和幂等键按管理员隔离；不同管理员可以使用相同 `operation_id` 创建各自的任务，读取只返回当前管理员名下的任务。客户端仍建议使用 UUID，并在首次提交前保存此键和原始 ID 列表（包括顺序）。
+`alias_ids` 为 1–1000 个不重复的正整数。异步模式必填 `operation_id`：16–128 个 ASCII 字母、数字、`-` 或 `_`。`job_id` 就是原 `operation_id`，任务身份和幂等键按管理员隔离；不同管理员可以使用相同 `operation_id` 创建各自的任务，读取和取消只作用于当前管理员名下的任务。客户端建议使用 UUID，并在首次提交前保存此键和原始 ID 列表（包括顺序）。
 
-若连接中断或响应丢失，优先直接 `GET /aliases/batch/jobs/<原 operation_id>`，即使尚未收到提交响应也可定位同一任务；页面恢复且未保存键时可查询 `jobs/latest`。同一管理员以相同 `operation_id` 和完全相同、顺序一致的 `alias_ids` 重试会返回原任务，包括并发重复提交，不重复删除；服务先查幂等键，再对新任务预检邮箱，因此原任务已经删除的本地 ID 不会使此类重试失败。原任务已 `completed` 或 `interrupted` 时也不会重新执行。不要因超时生成新键或重排、删减原列表。
+若连接中断或响应丢失，优先直接 `GET /aliases/batch/jobs/<原 operation_id>`，即使尚未收到提交响应也可定位同一任务；页面恢复时可查询任务列表。同一管理员以相同 `operation_id` 和完全相同、顺序一致的 `alias_ids` 重试会返回原任务，包括并发重复提交和终态任务，不重复执行。服务先查幂等键，再对新任务预检邮箱，因此原任务已删除的本地 ID 不影响此类重试。不要因超时生成新键或重排、删减原列表。
 
-任务状态为 `queued`、`running`、`completed`、`interrupted`，其中前两者属于 active。`completed` 表示本次处理已经结束，不表示所有地址删除成功；应结合 `deleted`、`failed` 和逐项结果判断。`processed` 只统计已持久化完成结果的项目，`requested` 表示请求总数；`request_id` 保留首次提交的追踪标识，与后续查询响应的 `X-Request-ID` 不必相同，`created_at`、`updated_at` 为 UTC RFC 3339 时间字符串（可含小数秒）。
+任务的 `queued`、`running` 属于 active；`completed`、`interrupted` 为终态。`completed` 表示处理结束，应结合 `deleted`、`failed` 和 `cancelled` 判断结果。新队列中，`requested` 为原请求总数，`processed=deleted+failed+cancelled`，`pending=requested-processed`；取消数计入已终结项目，不计入失败。`cancel_requested` 表示已请求取消剩余项，取消后的任务终态仍为 `completed`。新队列的 `results` 只返回实际成功或失败的项目并按原 ID 顺序排列，不为等待项或取消项预填结果。取消表示此任务退出剩余邮箱的删除工作；若其他任务仍订阅同一邮箱，共享删除工作继续执行，取消不撤销其他任务。
 
-正常进度的 `results` 只包含已有完成结果的项目，按原 ID 列表顺序返回，不为待处理项预填成功或失败；初始可为空数组，此时 `processed=deleted=failed=0`。每项包含 `id`、`address`、`deleted`，错误项可带 `code`、`message`、`local_retained`。`interrupted` 是例外：HTTP 响应会为尚无完成结果的剩余项合成 `code: BATCH_DELETE_INTERRUPTED`，说明“任务已中断，远端删除结果待核查”。这些项计入 `failed`，不计入 `processed`；其 `deleted: false` 不是远端仍存在的证明，`local_retained` 在实现中为 false、在 JSON 中省略，也不证明本地已经删除。不要把它们当作已完成项，也不要仅凭 `results.length` 或 `deleted+failed` 计算已处理进度。确认远端状态后再决定后续操作。
+`accounts` 按主号汇总请求、已删除、失败、待执行、取消和最近窗口额度 `used` / `limit`，状态为 `queued`、`running`、`waiting`、`paused`、`completed`、`cancelled` 或 `interrupted`。等待时可带 `retry_at`、`wait_reason`；`waits` 提供相关邮箱、操作和等待原因。等待中的主号可以与其他主号持续增长的删除进度同时出现。单条/同步删除达到额度时也返回 `retry_at`、`wait_reason`、`used`、`limit`，适合长时间等待的操作应使用后台队列。`request_id` 保留首次提交的追踪标识，时间字段采用 UTC RFC 3339。
 
-任务进度与对应逐项 audit 在同一事务中持久化；停止服务会取消后台执行并等待有界收尾，重启将遗留未终结任务标为 `interrupted`，不自动重放。已确认结果保留；本地任务/审计事务不等于 Apple 远端与数据库之间的原子事务，因此中断时仍可能存在待核查项目。后台运行上限为 2 小时；该上限不是完成全部删除的时长承诺。
+新队列持久化任务、每项阶段、额度和下次执行时间，重启后恢复尚未执行的项目；崩溃时已发出请求但没有确认结果的项目，先核对 Apple 最新完整目录后再决定是否继续。停用、删除和本地持久化不构成跨 Apple 与数据库的原子事务，已在途项目仍可能需要核对。升级前仅保存快照的旧任务沿用原规则：遗留 active 任务转为 `interrupted`，不自动重放；尚无结果项以 `BATCH_DELETE_INTERRUPTED` 提示远端结果待核查，计入 `failed` 而不计入 `processed`，也不承诺本地记录仍在。
 
-每个管理员最多 1 个 active 任务，服务全局最多 2 个。原任务的幂等重试不新占任务名额；其他提交及全量轮换按以下规则处理：
+Apple 登录失效会暂停对应主号，并每分钟重新检查；修复登录后自动继续，其余主号不受影响。真实失败按邮箱记录，等待和取消分别统计。全量凭据轮换只在实际单项执行期间被阻止，排队和等待期间可以轮换；轮换后原授权版本失效，该管理员的剩余订阅停止执行，需重新登录并按当前状态提交新任务。日志仅记录固定步骤名、状态码及受约束的业务码，不记录上游正文或登录凭据。
 
 | 条件 | HTTP / 错误码 | 调用方处理 |
 | --- | --- | --- |
-| 提交新任务时，当前管理员已有 active 任务或凭据正在轮换 | `409 BATCH_DELETE_IN_PROGRESS` | 查看当前管理员任务；轮换后重新登录 |
-| 提交新任务时，服务全局任务名额已满 | `429 BATCH_DELETE_BUSY` | 稍后重试同一操作 |
-| 同一管理员的相同 `operation_id` 携带不同 ID 列表（含顺序变化） | `409 IDEMPOTENCY_CONFLICT` | 核对原请求，保留原操作的键与列表绑定 |
-| 后台任务执行器尚未启动或正在关闭 | `503 BATCH_DELETE_UNAVAILABLE` | 等服务就绪后重试 |
-| 存在 active 删除任务时请求全量凭据轮换 | `409 BATCH_DELETE_IN_PROGRESS` | 等任务结束后再轮换；轮换不会占锁等待任务，从而阻塞进度轮询 |
-
-Apple 调用按账号组织：同一账号逐条处理，复用会话校验（validate）和目录（directory）结果，并沿用每次响应更新后的会话；每个任务内不同账号最多 2 路并发，这与全局最多 2 个 active 任务是两层限制。异常时会重新读取并验证远端状态，不会仅清理本地记录来跳过 Apple 确认；若新一次读取的 Apple 目录确认地址已不存在，可以清理对应本地记录，旧缓存中的缺失本身不构成确认。在同一账号、无异常且 N 个地址都需要先停用再删除的模拟请求计数中，复用可将 `4N` 次调用降到 `2N+2`；这只是请求次数示例，不是实际耗时或固定加速比。实际时长和成功数仍取决于 Apple 响应、限流、会话状态及异常复核，单次接收 1000 项不代表承诺 1000 项成功。
-
-后台删除对同一主号的请求设置至少 1 秒间隔；这是客户端的保守节流策略，不是 Apple 公布的配额。首次校验、读取目录或删除步骤出现限流时，任务保持 `running`，按 60、120、240 秒退避等待；若 Apple 提供更长的 `Retry-After`，采用更长等待。每个主号在同一批次最多恢复 3 次，成功读取或切换邮箱不会重置预算。等待结束后先用最新目录核对状态，再决定是否继续停用或删除，避免盲目重发已经成功的操作。会话失效、身份不匹配和持久化失败不按限流重试；停止服务及任务的 2 小时运行时限仍有效。
-
-等待期间响应可带 `waits` 数组，含 `account_id`、`alias_id`、`operation`、`retry_at`、`attempt`、`max_attempts`，以及可用时的 `http_status`、`service_code`。等待不是终态，不增加 `processed` 或 `failed`；这些信息是当前进程的诊断状态，页面刷新后仍可查询，重启后按原规则显示 `interrupted`，不恢复倒计时或重放删除。持续限流用尽恢复次数后，实际受限项返回 `APPLE_RATE_LIMITED`，同主号后续未尝试项返回 `APPLE_BATCH_DEFERRED`，并保留本地记录；可选 `deferred` 计数是 `failed` 的子集，不应再次相加。界面仅重试状态查询，不会因为限流另建删除任务。日志保留固定步骤名、状态码及受约束的业务码，不记录上游响应正文或登录凭据。
-
-后台删除对同一主号的请求设置至少 1 秒间隔；这是客户端的保守节流策略，不是 Apple 公布的配额。首次校验、读取目录或删除步骤出现限流时，任务保持 `running`，按 60、120、240 秒退避等待；若 Apple 提供更长的 `Retry-After`，采用更长等待。每个主号在同一批次最多恢复 3 次，成功读取或切换邮箱不会重置预算。等待结束后先用最新目录核对状态，再决定是否继续停用或删除，避免盲目重发已经成功的操作。会话失效、身份不匹配和持久化失败不按限流重试；停止服务及任务的 2 小时运行时限仍有效。
-
-等待期间响应可带 `waits` 数组，含 `account_id`、`alias_id`、`operation`、`retry_at`、`attempt`、`max_attempts`，以及可用时的 `http_status`、`service_code`。等待不是终态，不增加 `processed` 或 `failed`；这些信息是当前进程的诊断状态，页面刷新后仍可查询，重启后按原规则显示 `interrupted`，不恢复倒计时或重放删除。持续限流用尽恢复次数后，实际受限项返回 `APPLE_RATE_LIMITED`，同主号后续未尝试项返回 `APPLE_BATCH_DEFERRED`，并保留本地记录；可选 `deferred` 计数是 `failed` 的子集，不应再次相加。界面仅重试状态查询，不会因为限流另建删除任务。日志保留固定步骤名、状态码及受约束的业务码，不记录上游响应正文或登录凭据。
-
-限流等待只暂停对应主号：等待中的主号会让出任务内的执行名额，其他未限流主号继续处理，即使多个主号同时冷却也不会挡住后续正常主号。每个任务仍最多 2 个主号实际执行 Apple 操作；`waits` 可以与其他主号持续增长的 `processed`、`deleted` 同时出现。冷却等待也不会占用主号设置锁，期间仍可开启或关闭“自动创建隐私邮箱”；切换开关只更新本地计划，不会跳过 Apple 冷却。同一主号的实际 Apple 操作仍串行执行，批量删除恢复前会重新获取执行名额及账号锁，并检查身份及隐私邮箱状态。
+| 提交新任务时凭据正在轮换 | `409 BATCH_DELETE_IN_PROGRESS` | 等轮换结束并重新登录 |
+| 同一管理员的相同 `operation_id` 携带不同 ID 列表（含顺序变化） | `409 IDEMPOTENCY_CONFLICT` | 保留原操作的键与列表绑定 |
+| 后台任务执行器尚未启动或正在关闭 | `503 BATCH_DELETE_UNAVAILABLE` | 等服务就绪后重试原操作 |
+| 实际正在执行单项删除时请求全量凭据轮换 | `409 BATCH_DELETE_IN_PROGRESS` | 等当前执行完成后重试；轮换不持锁等待整批删除 |
 
 ## 管理端凭证与复制格式
 
@@ -145,7 +142,7 @@ alias@example.com----IMAP_PASSWORD----CLIENT_ID----REFRESH_TOKEN
 
 需要在凭据泄露后整体止损时，可在安装级随机管理前缀或固定兼容入口调用 `POST <admin-path>/api/v1/aliases/rotate-all-credentials`。该接口要求有效管理 Session、`X-CSRF-Token` 和当前管理员密码，并提交 JSON `{"confirmation":"ROTATE_ALL","current_password":"CURRENT_ADMIN_PASSWORD"}`。重认证具有独立限流；`current_password` 与 `confirmation` 只用于本次校验，不得写入访问日志、应用日志或审计详情。
 
-服务存在 `queued` 或 `running` 的批量 Apple 删除任务时，全量轮换返回 `409 BATCH_DELETE_IN_PROGRESS`，请等待任务结束后重试；此时不执行轮换，也不持有轮换锁等待后台删除，以保持任务进度可轮询。
+服务实际正在执行单项 Apple 删除时，全量轮换返回 `409 BATCH_DELETE_IN_PROGRESS`，请在当前执行结束后重试；排队或等待额度的删除任务不阻止轮换。轮换成功后，该管理员旧授权版本下的剩余删除订阅停止执行，其他管理员有效授权的共享工作仍可继续。轮换不持锁等待整批删除，以保持任务进度可轮询。
 
 全量轮换在同一事务中把所有 legacy alias 强制迁移为 v2，并为所有现有 v2 alias 轮换整套凭据。等待 Apple 目录确认的 alias 也会轮换；对应 `pending_alias_api_keys` 会同步更新为新凭证包的 API Key，原确认关系和领取流程保持不变。响应的 `data` 只返回 `total`、`rotated`、`migrated_legacy`、`rotated_v2`、`rotated_pending` 和固定为 `true` 的 `reauthentication_required`，不返回任何新凭据；其中 `rotated_pending` 是已轮换总数的子集。执行后，旧 legacy API Key 与 v1 直达链接，以及原 v2 API Key、派生链接、IMAP/OAuth 凭据和 access token 全部失效；邮件归档、消费/已读状态和 IMAP `Seen` 任务保留。管理员密码本身不变，但服务会提升执行管理员的 `password_version`、撤销该管理员的全部后台 Session，并清除随机管理路径与固定兼容路径的 Cookie，必须重新登录。
 

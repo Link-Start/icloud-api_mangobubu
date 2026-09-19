@@ -140,9 +140,11 @@ test("alias paging resets on filters and supports full batched display/export", 
   assert.match(source, /await controller\.submit\(selectedIds, auth\.state\.csrfToken\)/);
   assert.doesNotMatch(source, /await deleteAliases\(/);
   assert.match(source, /startJob: startAliasDeletionJob/);
-  assert.match(source, /deletionJob\.processed/);
-  assert.match(source, /formatAliasDeletionResultMessage\(failure\)/);
-  assert.match(source, /formatAliasDeletionResultMessage\(result\)/);
+  assert.match(source, /<AliasDeletionQueue[\s\S]*?:state="deletionState"/);
+  const queue = await readFile(new URL("../src/components/AliasDeletionQueue.vue", import.meta.url), "utf8");
+  assert.match(queue, /job\.processed/);
+  assert.match(queue, /formatAliasDeletionResultMessage\(failure\)/);
+  assert.match(queue, /formatAliasDeletionResultMessage\(result\)/);
 });
 
 test("latest-mail choices update both filter flags and reset cleanly", async () => {

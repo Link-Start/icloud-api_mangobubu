@@ -1,92 +1,116 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-
 import {
-  getAliasDeletionJob,
-  getLatestAliasDeletionJob,
-  startAliasDeletionJob,
-} from "../src/api/admin.js";
-import {
-  ALIAS_DELETION_POLL_INTERVAL_MS,
-  ALIAS_DELETION_REQUEST_TIMEOUT_MS,
-  createAliasDeletionController,
-  createAliasDeletionOperationId,
-  createAliasDeletionStorage,
-  formatAliasDeletionResultMessage,
-  isAliasDeletionJobActive,
-  isAliasDeletionJobTerminal,
+  ALIAS_DELETION_POLL_INTERVAL_MS, ALIAS_DELETION_REQUEST_TIMEOUT_MS,
+  createAliasDeletionController, createAliasDeletionOperationId, createAliasDeletionStorage,
+  formatAliasDeletionResultMessage, isAliasDeletionJobActive, isAliasDeletionJobTerminal,
 } from "../src/utils/aliasDeletionJob.js";
-
 const operationId = "63c21a27-6ef4-425f-a11c-edda65c29267";
 const job = (status = "running", patch = {}) => ({
   jobId: operationId, status, requested: 7, processed: 0, deleted: 0, failed: 0,
-  results: [], requestId: "request-42", ...patch,
+  pending: 7, cancelled: 0, cancelRequested: false, accounts: [], waits: [], results: [], ...patch,
 });
 const apiError = (status, code) => Object.assign(new Error(code), { status, code });
 const flushPromises = () => new Promise((resolve) => setImmediate(resolve));
-
 function deferred() {
-  let resolve;
-  let reject;
+  let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-
 function memoryStorage() {
   const values = new Map();
-  return {
-    values,
-    getItem: (key) => values.get(key) ?? null,
-    setItem: (key, value) => values.set(key, value),
-    removeItem: (key) => values.delete(key),
-  };
+  return { values, getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value), removeItem: (key) => values.delete(key) };
 }
-
 function fakeTimers() {
   let nextId = 0;
   const timers = new Map();
   return {
-    setTimeoutFn(callback, delay) {
-      const id = ++nextId;
-      timers.set(id, { callback, delay });
-      return id;
-    },
+    setTimeoutFn(callback, delay) { const id = ++nextId; timers.set(id, { callback, delay }); return id; },
     clearTimeoutFn: (id) => timers.delete(id),
     fireNext() {
-      const entry = timers.entries().next().value;
-      assert.ok(entry, "expected a scheduled timer");
-      const [id, timer] = entry;
-      timers.delete(id);
-      timer.callback();
-      return timer.delay;
+      const [id, timer] = timers.entries().next().value || [];
+      assert.ok(timer, "expected a scheduled timer");
+      timers.delete(id); timer.callback(); return timer.delay;
     },
     delays: () => [...timers.values()].map(({ delay }) => delay),
   };
 }
-
 function harness(overrides = {}) {
   const timers = fakeTimers();
   const memory = memoryStorage();
   const storage = createAliasDeletionStorage("/install/admin", "owner", memory);
-  const calls = [];
-  const changes = [];
+  const calls = [], changes = [], serverJobs = [];
+  let sequence = 0;
   const controller = createAliasDeletionController({
     storage,
-    createOperationId: () => operationId,
-    startJob: async (...args) => { calls.push(["DELETE", ...args]); return job("queued"); },
-    getJob: async (...args) => { calls.push(["GET", ...args]); return job(); },
-    getLatestJob: async (...args) => { calls.push(["latest", ...args]); return null; },
-    onChange: (state) => changes.push(state),
-    ...timers,
-    ...overrides,
+    createOperationId: () => sequence++ === 0 ? operationId : "next-operation-" + sequence,
+    startJob: async (ids, id, csrf, options) => {
+      calls.push(["DELETE", ids, id, csrf, options]);
+      const created = job("queued", { jobId: id }); serverJobs.push(created); return created;
+    },
+    getJob: async (id, options) => { calls.push(["GET", id, options]); return job("running", { jobId: id }); },
+    getJobs: async (options) => { calls.push(["list", options]); return [...serverJobs]; },
+    cancelJob: async (id, csrf, options) => {
+      calls.push(["cancel", id, csrf, options]);
+      const snapshot = job("completed", { jobId: id, processed: 7, cancelled: 7, pending: 0, cancelRequested: true });
+      const index = serverJobs.findIndex((item) => item.jobId === id);
+      serverJobs.splice(index, 1, snapshot); return snapshot;
+    },
+    onChange: (state) => changes.push(state), ...timers, ...overrides,
   });
-  return { controller, timers, storage, memory, calls, changes };
+  return { controller, timers, storage, memory, calls, changes, serverJobs };
 }
 
 test("operation IDs are UUIDs including the HTTP-compatible random-values fallback", () => {
   assert.equal(createAliasDeletionOperationId({ randomUUID: () => operationId }), operationId);
   assert.match(createAliasDeletionOperationId({ getRandomValues: (bytes) => bytes.fill(255) }),
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+});
+
+test("jobs omitted by the terminal history limit are resolved individually", async () => {
+  let complete = false;
+  const active = Array.from({ length: 25 }, (_, index) => job("running", { jobId: `history-job-${index}` }));
+  const finished = (value) => ({ ...value, status: "completed", processed: 7, deleted: 7, pending: 0 });
+  const queries = [];
+  const { controller, timers } = harness({
+    getJobs: async () => complete ? active.slice(5).map(finished) : active,
+    getJob: async (id) => { queries.push(id); return finished(active.find((value) => value.jobId === id)); },
+  });
+  await controller.start();
+  complete = true;
+  await controller.refresh();
+  assert.deepEqual(queries, active.slice(0, 5).map((value) => value.jobId));
+  assert.equal(controller.getState().jobs.length, 25);
+  assert.equal(controller.getState().jobs.filter(isAliasDeletionJobActive).length, 0);
+  assert.deepEqual(timers.delays(), []);
+  controller.stop();
+});
+
+test("pending confirmation preserves cancellation during missing-history lookups", async () => {
+  let complete = false;
+  const old = Array.from({ length: 25 }, (_, index) => job("running", { jobId: `old-job-${index}` }));
+  const reads = new Map(old.slice(0, 5).map((value) => [value.jobId, deferred()]));
+  const finished = (value) => ({ ...value, status: "completed", processed: 7, deleted: 7, pending: 0 });
+  const { controller } = harness({
+    getJobs: async () => complete ? [...old.slice(5).map(finished), job()] : old,
+    getJob: async (id) => id === operationId ? job() : reads.get(id).promise,
+    startJob: async () => { throw new Error("lost response"); },
+    cancelJob: async (id) => job("completed", { jobId: id, processed: 7, cancelled: 7, pending: 0, cancelRequested: true }),
+  });
+  await controller.start();
+  complete = true;
+  await controller.submit([91], "csrf");
+  await flushPromises();
+  await controller.cancel(operationId, "csrf");
+  const polling = controller.refresh();
+  for (const value of old.slice(0, 5)) reads.get(value.jobId).resolve(finished(value));
+  await polling;
+  const cancelled = controller.getState().jobs.find((value) => value.jobId === operationId);
+  assert.equal(cancelled.status, "completed");
+  assert.equal(cancelled.cancelled, 7);
+  assert.equal(controller.getState().blocked, false);
+  controller.stop();
 });
 
 test("storage is isolated by installation and username and writes only the operation ID", () => {
@@ -112,191 +136,6 @@ test("storage is isolated by installation and username and writes only the opera
   });
   assert.equal(disabled.read(), null);
   assert.doesNotThrow(() => { disabled.write({ operationId }); disabled.clear(); });
-});
-
-test("recovery blocks new submissions and latest null enables the first delete", async () => {
-  const { controller, calls, timers } = harness();
-  assert.equal(controller.getState().blocked, true);
-  assert.equal(await controller.submit([91], "csrf"), false);
-  assert.equal(await controller.start(), true);
-  assert.equal(await controller.start(), false);
-  assert.deepEqual(calls.map(([method]) => method), ["latest"]);
-  assert.equal(controller.getState().blocked, false);
-  assert.deepEqual(timers.delays(), []);
-  controller.stop();
-});
-
-test("submitting stores the ID before one short DELETE and blocks duplicates", async () => {
-  const response = deferred();
-  let submissions = 0;
-  const { controller, storage, timers } = harness({
-    startJob: (ids, id, csrfToken, { signal }) => {
-      submissions += 1;
-      assert.deepEqual(storage.read(), { operationId });
-      assert.deepEqual(ids, [91, 92]);
-      assert.equal(id, operationId);
-      assert.equal(csrfToken, "csrf");
-      assert.equal(signal.aborted, false);
-      return response.promise;
-    },
-  });
-  await controller.start();
-  const ids = [91, 92];
-  const submitted = controller.submit(ids, "csrf");
-  ids.push(93);
-  assert.equal(controller.getState().submitting, true);
-  assert.equal(await controller.submit([91], "csrf"), false);
-  assert.equal(await controller.refresh(), false);
-  assert.deepEqual(timers.delays(), [10_000]);
-  response.resolve(job("queued"));
-  assert.equal(await submitted, true);
-  assert.equal(submissions, 1);
-  assert.equal(controller.getState().blocked, true);
-  assert.deepEqual(timers.delays(), [2_000]);
-  controller.stop();
-});
-
-test("two-second polling is serial, deduplicates manual refresh, and keeps backend counters", async () => {
-  assert.equal(ALIAS_DELETION_POLL_INTERVAL_MS, 2_000);
-  assert.equal(ALIAS_DELETION_REQUEST_TIMEOUT_MS, 10_000);
-  const response = deferred();
-  let reads = 0;
-  const { controller, timers } = harness({
-    getJob: () => { reads += 1; return response.promise; },
-  });
-  await controller.start();
-  await controller.submit([91], "csrf");
-  assert.equal(timers.fireNext(), 2_000);
-  await flushPromises();
-  assert.equal(reads, 1);
-  const first = controller.refresh();
-  assert.equal(controller.refresh({ latest: true }), first);
-  assert.deepEqual(timers.delays(), [10_000]);
-  const snapshot = job("running", { processed: 2, deleted: 0, failed: 1, results: [{ id: 91, deleted: true }] });
-  response.resolve(snapshot);
-  await first;
-  assert.equal(controller.getState().job, snapshot);
-  assert.equal(controller.getState().job.deleted, 0);
-  assert.deepEqual(timers.delays(), [2_000]);
-  controller.stop();
-});
-
-test("rate-limit waits resume the original job with zero outcomes and never send another DELETE", async (t) => {
-  const originalFetch = globalThis.fetch;
-  t.after(() => { globalThis.fetch = originalFetch; });
-  const raw = {
-    job_id: operationId, status: "running", requested: 2, processed: 0,
-    deleted: 0, failed: 0, results: [],
-  };
-  const snapshots = [
-    ...[1, 2, 3].map((attempt) => ({ ...raw, waits: [{
-      account_id: 12, alias_id: 91, operation: "delete", attempt, max_attempts: 3,
-      retry_at: `2026-09-08T01:0${attempt}:00Z`, http_status: 429,
-    }] })),
-    new Error("offline"),
-    { ...raw, waits: [null, { operation: "<script>secret</script>" }], deferred: "secret" },
-    { ...raw },
-    { ...raw, processed: 1, deleted: 1, results: [{ id: 91, deleted: true }] },
-    { ...raw, status: "completed", processed: 2, deleted: 1, failed: 1, deferred: 1,
-      results: [{ id: 91, deleted: true }, { id: 92, deleted: false, code: "APPLE_BATCH_DEFERRED", local_retained: true }] },
-  ];
-  const requests = [];
-  globalThis.fetch = async (url, options) => {
-    requests.push({ url, options });
-    const snapshot = url.endsWith("/latest") ? null
-      : options.method === "DELETE" ? { ...raw, status: "queued" } : snapshots.shift();
-    if (snapshot instanceof Error) throw snapshot;
-    return new Response(JSON.stringify({ data: snapshot }), {
-      status: options.method === "DELETE" ? 202 : 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  };
-  const { controller, timers, storage, changes } = harness({
-    startJob: startAliasDeletionJob, getJob: getAliasDeletionJob, getLatestJob: getLatestAliasDeletionJob,
-  });
-  t.after(() => controller.stop());
-  await controller.start();
-  await controller.submit([91, 92], "csrf");
-  for (let index = 0; index < 8; index += 1) {
-    const previous = controller.getState().job;
-    assert.equal(timers.fireNext(), 2_000);
-    await controller.refresh();
-    const state = controller.getState();
-    assert.equal(state.job.jobId, operationId);
-    if (index < 6) {
-      assert.deepEqual([state.job.processed, state.job.deleted, state.job.failed, state.job.deferred], [0, 0, 0, 0]);
-      assert.equal(isAliasDeletionJobTerminal(state.job), false);
-    }
-    if (index < 3) assert.equal(state.job.waits[0].attempt, index + 1);
-    if (index === 3) {
-      assert.equal(state.uncertain, true);
-      assert.equal(state.job, previous);
-    } else {
-      assert.equal(state.uncertain, false);
-    }
-    if (index >= 4) assert.deepEqual(state.job.waits, []);
-    if (index < 7) {
-      assert.equal(state.blocked, true);
-      assert.equal(await controller.submit([91, 92], "csrf"), false);
-      assert.deepEqual(storage.read(), { operationId });
-      assert.deepEqual(timers.delays(), [2_000]);
-    }
-  }
-  assert.deepEqual([controller.getState().job.processed, controller.getState().job.failed, controller.getState().job.deferred], [2, 1, 1]);
-  assert.equal(controller.getState().blocked, false);
-  assert.equal(storage.read(), null);
-  assert.deepEqual(timers.delays(), []);
-  assert.equal(requests.filter(({ options }) => options.method === "DELETE").length, 1);
-  assert.equal(requests.filter(({ url }) => url.endsWith("/latest")).length, 1);
-  for (const { url, options } of requests.slice(2)) {
-    assert.equal(url, `/admin/api/v1/aliases/batch/jobs/${operationId}`);
-    assert.equal(options.method, "GET");
-    assert.equal(options.body, undefined);
-  }
-  assert.ok(changes.filter(({ job: snapshot }) => snapshot?.waits.length).every(({ job: snapshot }) =>
-    snapshot.processed === 0 && snapshot.failed === 0 && !isAliasDeletionJobTerminal(snapshot)));
-});
-
-test("polling keeps account waits while other accounts make progress on the same job", async (t) => {
-  const waits = [{ accountId: 1, aliasId: 101, operation: "delete", attempt: 1, maxAttempts: 3,
-    retryAt: "2026-09-10T01:05:00Z", httpStatus: 429 }];
-  const snapshots = [
-    job("running", { requested: 4, waits }),
-    job("running", { requested: 4, waits, processed: 1, deleted: 1,
-      results: [{ id: 201, deleted: true }] }),
-    job("running", { requested: 4, waits, processed: 2, deleted: 2,
-      results: [{ id: 201, deleted: true }, { id: 301, deleted: true }] }),
-    job("completed", { requested: 4, waits: [], processed: 4, deleted: 4,
-      results: [101, 102, 201, 301].map((id) => ({ id, deleted: true })) }),
-  ];
-  let polls = 0;
-  const { controller, timers, storage, calls } = harness({
-    getJob: async (id) => {
-      assert.equal(id, operationId);
-      return snapshots[polls++];
-    },
-  });
-  t.after(() => controller.stop());
-  await controller.start();
-  await controller.submit([101, 102, 201, 301], "csrf");
-  for (const snapshot of snapshots) {
-    assert.equal(timers.fireNext(), ALIAS_DELETION_POLL_INTERVAL_MS);
-    await controller.refresh();
-    const state = controller.getState();
-    assert.equal(state.job.jobId, operationId);
-    assert.deepEqual(state.job.waits, snapshot.waits);
-    assert.equal(state.job.processed, snapshot.processed);
-    assert.equal(state.job.deleted, snapshot.deleted);
-    assert.equal(state.job.failed, 0);
-    if (snapshot.status === "running") {
-      assert.deepEqual(storage.read(), { operationId });
-      assert.deepEqual(timers.delays(), [ALIAS_DELETION_POLL_INTERVAL_MS]);
-    }
-  }
-  assert.equal(polls, 4);
-  assert.equal(calls.filter(([method]) => method === "DELETE").length, 1);
-  assert.deepEqual(timers.delays(), []);
-  assert.equal(storage.read(), null);
 });
 
 test("result messages deduplicate retention notices and distinguish deferred and unknown outcomes", () => {
@@ -328,284 +167,285 @@ test("result messages deduplicate retention notices and distinguish deferred and
   assert.equal(formatAliasDeletionResultMessage({ deleted: true, message: "本地记录已保留" }), "已删除");
 });
 
-test("lost submit responses query operationId even when latest has an unrelated completed job", async () => {
-  const calls = [];
-  const { controller, storage } = harness({
-    getLatestJob: async () => { calls.push("latest"); return job("completed", { jobId: "old-job" }); },
-    startJob: async () => { calls.push("DELETE"); throw apiError(0, "NETWORK_ERROR"); },
-    getJob: async (id) => { calls.push(id); return job(); },
-  });
+
+test("empty recovery permits submission and all administrator tasks are restored", async () => {
+  const snapshots = [job(), job("queued", { jobId: "second" }), job("completed", { jobId: "older" })];
+  const { controller, storage, calls, timers } = harness({ getJobs: async () => snapshots });
+  assert.equal(controller.getState().blocked, false);
   await controller.start();
-  await controller.submit([91], "csrf");
-  await flushPromises();
-  assert.deepEqual(calls, ["latest", "DELETE", operationId]);
-  assert.equal(controller.getState().job.jobId, operationId);
-  await controller.refresh({ latest: true });
-  assert.equal(calls.at(-1), operationId);
-  assert.deepEqual(storage.read(), { operationId });
+  assert.deepEqual(controller.getState().jobs, snapshots);
+  assert.equal(controller.getState().blocked, false);
+  assert.equal(storage.read(), null);
+  assert.equal(await controller.start(), false);
+  assert.deepEqual(timers.delays(), [ALIAS_DELETION_POLL_INTERVAL_MS]);
+  assert.deepEqual(calls, []);
   controller.stop();
 });
 
-test("refresh recovery trusts saved operationId, not an older saved/latest job ID", async () => {
+test("one uncertain submit is stored before mutation; confirmed active jobs allow more submissions", async () => {
+  const response = deferred();
+  const { controller, storage, timers } = harness({
+    startJob: (ids, id, csrf, { signal }) => {
+      assert.deepEqual(storage.read(), { operationId });
+      assert.deepEqual(ids, [91, 92]); assert.equal(id, operationId); assert.equal(csrf, "csrf");
+      assert.equal(signal.aborted, false); return response.promise;
+    },
+  });
+  await controller.start();
+  const ids = [91, 92];
+  const submitted = controller.submit(ids, "csrf"); ids.push(93);
+  assert.equal(controller.getState().blocked, true);
+  assert.equal(await controller.submit([94], "csrf"), false);
+  assert.equal(await controller.refresh(), false);
+  assert.deepEqual(timers.delays(), [ALIAS_DELETION_REQUEST_TIMEOUT_MS]);
+  response.resolve(job("queued")); await submitted;
+  assert.equal(controller.getState().blocked, false);
+  assert.equal(storage.read(), null);
+  assert.deepEqual(timers.delays(), [2_000]);
+  controller.stop();
+});
+
+test("independent tasks and same-account appends remain visible without an execution cap", async () => {
+  const { controller, calls } = harness();
+  await controller.start();
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal(await controller.submit([100 + index], "csrf"), true);
+    assert.equal(controller.getState().blocked, false);
+  }
+  await controller.refresh();
+  assert.equal(controller.getState().jobs.length, 8);
+  assert.equal(new Set(controller.getState().jobs.map((item) => item.jobId)).size, 8);
+  assert.equal(calls.filter(([method]) => method === "DELETE").length, 8);
+  assert.equal(calls.filter(([method]) => method === "GET").length, 0);
+  controller.stop();
+});
+
+test("list polling is serial and continues until every active task finishes", async () => {
+  const response = deferred();
+  let reads = 0;
+  const first = job("running", { requested: 1000, processed: 200, deleted: 200, pending: 800 });
+  const second = job("running", { jobId: "second" });
+  const { controller, timers } = harness({
+    getJobs: async () => ++reads === 1 ? [first, second] : response.promise,
+  });
+  await controller.start();
+  assert.equal(timers.fireNext(), 2_000); await flushPromises();
+  const refresh = controller.refresh(); assert.equal(controller.refresh(), refresh);
+  assert.equal(reads, 2);
+  assert.deepEqual(timers.delays(), [10_000]);
+  response.resolve([first, { ...second, status: "completed", pending: 0 }]); await refresh;
+  assert.deepEqual(controller.getState().jobs.map((item) => item.pending), [800, 0]);
+  assert.equal(controller.getState().blocked, false);
+  assert.deepEqual(timers.delays(), [2_000]);
+  controller.stop();
+});
+
+test("quota waits keep pending separate from failures while another task progresses", async () => {
+  let stage = 0;
+  const waiting = job("running", { requested: 1000, processed: 200, deleted: 200, pending: 800,
+    accounts: [{ accountId: 1, status: "waiting", used: 200, limit: 200, pending: 800, waitReason: "quota" }] });
+  const { controller, storage } = harness({ getJobs: async () => [waiting,
+    job("running", { jobId: "second", processed: stage, deleted: stage, pending: 7 - stage })] });
+  await controller.start(); stage = 3; await controller.refresh();
+  assert.deepEqual(controller.getState().jobs.map((item) => [item.deleted, item.failed, item.pending]), [[200, 0, 800], [3, 0, 4]]);
+  assert.equal(controller.getState().jobs[0].accounts[0].used, 200);
+  assert.equal(controller.getState().blocked, false); assert.equal(storage.read(), null);
+  controller.stop();
+});
+
+test("failed progress queries preserve all tasks and do not block a new submit", async () => {
+  let reads = 0;
+  const known = job();
+  const { controller, timers } = harness({ getJobs: async () => {
+    if (reads++ === 0) return [known]; throw apiError(0, "NETWORK_ERROR");
+  } });
+  await controller.start(); await controller.refresh();
+  assert.deepEqual(controller.getState().jobs, [known]);
+  assert.equal(controller.getState().uncertain, true); assert.equal(controller.getState().blocked, false);
+  assert.equal(await controller.submit([100], "csrf"), true);
+  assert.deepEqual(timers.delays(), [2_000]);
+  controller.stop();
+});
+
+test("submitting during an older list read cannot lose the new task or regress its snapshot", async () => {
+  const response = deferred();
+  const completed = job("completed", { processed: 7, deleted: 7, pending: 0 });
+  const { controller } = harness({ getJobs: () => response.promise, startJob: async () => completed });
+  const started = controller.start(); await flushPromises();
+  assert.equal(controller.getState().blocked, false);
+  await controller.submit([100], "csrf");
+  response.resolve([job("queued")]); await started;
+  assert.equal(controller.getState().jobs[0], completed);
+  assert.equal(controller.getState().blocked, false);
+  controller.stop();
+});
+
+test("lost submit responses query the exact operation while keeping older task progress", async () => {
+  let listed = job("running", { jobId: "older", processed: 1 });
+  const response = deferred();
+  const { controller, storage, calls } = harness({
+    getJobs: async () => [listed], startJob: async () => { throw apiError(504, "GATEWAY_TIMEOUT"); },
+    getJob: (id) => { calls.push(["GET", id]); return response.promise; },
+  });
+  await controller.start();
+  listed = { ...listed, processed: 2 };
+  await controller.submit([100], "csrf"); await flushPromises();
+  assert.equal(controller.getState().operationId, operationId);
+  assert.equal(controller.getState().blocked, true);
+  assert.deepEqual(storage.read(), { operationId });
+  assert.equal(await controller.submit([101], "csrf"), false);
+  response.resolve(job()); await controller.refresh();
+  assert.equal(controller.getState().jobs.find((item) => item.jobId === "older").processed, 2);
+  assert.equal(controller.getState().jobs.length, 2);
+  assert.equal(controller.getState().blocked, false);
+  assert.equal(storage.read(), null);
+  assert.deepEqual(calls, [["GET", operationId]]);
+  controller.stop();
+});
+
+test("a missing pending ID stays unresolved even if the list contains unrelated tasks", async () => {
   const memory = memoryStorage();
   const storage = createAliasDeletionStorage("/admin", "owner", memory);
+  storage.write({ operationId, jobId: "wrong-job" });
+  let reads = 0;
+  const { controller, timers } = harness({ storage,
+    getJobs: async () => [job("running", { jobId: "another" })],
+    getJob: async (id) => { assert.equal(id, operationId); reads++; throw apiError(404, "NOT_FOUND"); },
+  });
+  assert.equal(controller.getState().blocked, true);
+  await controller.start();
+  assert.equal(controller.getState().unmatched, true); assert.equal(controller.getState().jobs.length, 1);
+  timers.fireNext(); await flushPromises();
+  assert.equal(reads, 2); assert.deepEqual(storage.read(), { operationId });
+  assert.equal(controller.acknowledgeUnmatched(), true); await flushPromises();
+  assert.equal(storage.read(), null); assert.equal(controller.getState().blocked, false);
+  assert.equal(controller.getState().jobs[0].jobId, "another");
+  controller.stop();
+});
+
+test("stored legacy operation IDs recover by ID and list without replaying DELETE", async () => {
+  const memory = memoryStorage(), storage = createAliasDeletionStorage("/admin", "owner", memory);
   storage.write({ operationId });
-  const key = [...memory.values.keys()][0];
-  memory.setItem(key, JSON.stringify({ operationId, jobId: "wrong-job", previousJobId: "old-job" }));
-  const { controller, calls } = harness({ storage });
+  const { controller, calls } = harness({ storage, getJobs: async () => [job("running", { jobId: "second" })] });
   await controller.start();
   assert.deepEqual(calls.map(([method, id]) => [method, id]), [["GET", operationId]]);
-  assert.equal(controller.getState().job.jobId, operationId);
+  assert.equal(controller.getState().jobs.length, 2);
+  assert.equal(storage.read(), null); assert.equal(controller.getState().blocked, false);
   controller.stop();
 });
 
-test("404 after a lost response stays unknown and retries only the same job", async () => {
-  let queries = 0;
-  const { controller, timers, storage, calls } = harness({
-    startJob: async () => { throw apiError(504, "GATEWAY_TIMEOUT"); },
-    getJob: async (id) => { assert.equal(id, operationId); queries += 1; throw apiError(404, "NOT_FOUND"); },
-  });
-  await controller.start();
-  await controller.submit([91], "csrf");
-  await flushPromises();
-  assert.equal(controller.getState().job, null);
-  assert.equal(controller.getState().uncertain, true);
-  assert.equal(controller.getState().unmatched, true);
-  assert.equal(controller.getState().blocked, true);
-  assert.equal(await controller.submit([91], "csrf"), false);
-  assert.deepEqual(storage.read(), { operationId });
-  timers.fireNext();
-  await flushPromises();
-  assert.equal(queries, 2);
-  assert.equal(calls.length, 1, "latest was queried only before submission");
-  assert.equal(controller.acknowledgeUnmatched(), true);
-  assert.equal(controller.getState().blocked, true, "reconciliation must check latest before allowing another submit");
-  await flushPromises();
-  assert.equal(storage.read(), null);
-  assert.equal(controller.getState().blocked, false);
-  assert.equal(calls.length, 2);
-  controller.stop();
-});
-
-test("409 follows the administrator's active job instead of retrying the rejected operation", async () => {
-  let latestCalls = 0;
-  let deletes = 0;
-  const { controller, storage, timers } = harness({
-    getLatestJob: async () => ++latestCalls === 1 ? null : job("queued", { jobId: "other-active-job" }),
-    startJob: async () => { deletes += 1; throw apiError(409, "BATCH_DELETE_IN_PROGRESS"); },
-    getJob: async (id) => { assert.equal(id, "other-active-job"); return job("running", { jobId: id }); },
-  });
-  await controller.start();
-  await controller.submit([91], "csrf");
-  await flushPromises();
-  assert.equal(latestCalls, 2);
-  assert.deepEqual(storage.read(), { operationId: "other-active-job" });
-  timers.fireNext();
-  await flushPromises();
-  assert.equal(deletes, 1);
-  assert.equal(controller.getState().blocked, true);
-  controller.stop();
-});
-
-test("definite 429/503 and validation rejections release the pending ID without automatic retries", async () => {
+test("definite admission rejections release pending evidence without replay", async () => {
   for (const [status, code] of [[429, "BATCH_DELETE_BUSY"], [503, "BATCH_DELETE_UNAVAILABLE"], [400, "VALIDATION_FAILED"], [409, "IDEMPOTENCY_CONFLICT"]]) {
     const error = apiError(status, code);
-    const { controller, storage, timers, calls } = harness({ startJob: async () => { throw error; } });
-    await controller.start();
-    await assert.rejects(controller.submit([91], "csrf"), (actual) => actual === error);
-    assert.equal(storage.read(), null);
-    assert.equal(controller.getState().blocked, false);
-    assert.equal(controller.getState().uncertain, false);
-    assert.deepEqual(timers.delays(), []);
-    assert.equal(calls.length, 1);
-    controller.stop();
+    const { controller, storage, timers } = harness({ startJob: async () => { throw error; } });
+    await controller.start(); await assert.rejects(controller.submit([91], "csrf"), (actual) => actual === error);
+    assert.equal(storage.read(), null); assert.equal(controller.getState().blocked, false);
+    assert.deepEqual(timers.delays(), []); controller.stop();
   }
 });
 
-test("network, gateway and malformed submission responses retain pending evidence and only retry GET", async () => {
-  for (const [status, code] of [[0, "NETWORK_ERROR"], [408, "REQUEST_TIMEOUT"], [500, "INTERNAL_ERROR"], [503, "SERVICE_UNAVAILABLE"], [202, "INVALID_RESPONSE"], [429, "INVALID_RESPONSE"]]) {
-    let deletes = 0;
-    let reads = 0;
+test("unknown submit outcomes retry reads only and keep the submission slot reserved", async () => {
+  for (const [status, code] of [[0, "NETWORK_ERROR"], [408, "REQUEST_TIMEOUT"], [500, "INTERNAL_ERROR"], [503, "SERVICE_UNAVAILABLE"], [202, "INVALID_RESPONSE"]]) {
+    let deletes = 0, reads = 0;
     const { controller, storage, timers } = harness({
-      startJob: async () => { deletes += 1; throw apiError(status, code); },
-      getJob: async () => { reads += 1; throw apiError(0, "NETWORK_ERROR"); },
+      startJob: async () => { deletes++; throw apiError(status, code); },
+      getJob: async () => { reads++; throw apiError(0, "NETWORK_ERROR"); },
     });
-    await controller.start();
-    await controller.submit([91], "csrf");
-    await flushPromises();
-    assert.equal(controller.getState().uncertain, true);
-    assert.equal(controller.getState().job, null);
-    assert.deepEqual(storage.read(), { operationId });
-    timers.fireNext();
-    await flushPromises();
-    assert.equal(reads, 2);
-    assert.equal(deletes, 1);
-    controller.stop();
+    await controller.start(); await controller.submit([91], "csrf"); await flushPromises();
+    assert.equal(controller.getState().uncertain, true); assert.equal(controller.getState().blocked, true);
+    assert.deepEqual(storage.read(), { operationId }); timers.fireNext(); await flushPromises();
+    assert.equal(reads, 2); assert.equal(deletes, 1); controller.stop();
   }
 });
 
-test("unknown job IDs, statuses and counters never replace the confirmed snapshot", async () => {
-  for (const bad of [null, job("completed", { jobId: "wrong-id" }), job("unexpected"), job("completed", { processed: null })]) {
-    const { controller, storage } = harness({ getJob: async () => bad });
-    await controller.start();
-    await controller.submit([91], "csrf");
-    const confirmed = controller.getState().job;
-    await controller.refresh();
-    assert.equal(controller.getState().job, confirmed);
+test("invalid list responses preserve confirmed snapshots and retry reads", async () => {
+  for (const invalid of [null, {}, [null], [job("unexpected")], [job("completed", { processed: null })]]) {
+    let reads = 0;
+    const known = job();
+    const { controller } = harness({ getJobs: async () => reads++ === 0 ? [known] : invalid });
+    await controller.start(); await controller.refresh();
+    assert.deepEqual(controller.getState().jobs, [known]);
     assert.equal(controller.getState().error.code, "INVALID_RESPONSE");
-    assert.equal(controller.getState().uncertain, true);
-    assert.deepEqual(storage.read(), { operationId });
-    controller.stop();
+    assert.equal(controller.getState().blocked, false); controller.stop();
   }
 });
 
-test("a failed latest lookup keeps retrying latest instead of accepting the old completed job", async () => {
-  const oldJob = job("completed", { jobId: "old-job" });
-  let reads = 0;
-  const { controller, timers } = harness({
-    getLatestJob: async () => {
-      reads += 1;
-      if (reads === 1) return oldJob;
-      if (reads === 2) throw apiError(0, "NETWORK_ERROR");
-      return job();
-    },
-    getJob: async () => assert.fail("retried the old completed job instead of latest"),
-  });
-  await controller.start();
-  await controller.refresh({ latest: true });
-  assert.equal(controller.getState().job, oldJob);
-  assert.equal(controller.getState().blocked, true);
-  timers.fireNext();
-  await flushPromises();
-  assert.equal(reads, 3);
-  assert.equal(controller.getState().job.jobId, operationId);
-  controller.stop();
+test("mismatched submit response is reconciled only by the original ID", async () => {
+  const { controller, calls, storage } = harness({ startJob: async () => job("completed", { jobId: "wrong-job" }) });
+  await controller.start(); await controller.submit([91], "csrf"); await flushPromises();
+  assert.equal(calls.find(([method]) => method === "GET")[1], operationId);
+  assert.deepEqual(controller.getState().jobs.map((item) => item.jobId), [operationId]);
+  assert.equal(storage.read(), null); controller.stop();
 });
 
-test("an immediate terminal/idempotent submit response is accepted without polling or replay", async () => {
-  const snapshot = job("completed", { processed: 7, deleted: 5, failed: 2 });
-  const { controller, storage, timers, calls } = harness({ startJob: async () => snapshot });
-  await controller.start();
-  await controller.submit([91], "csrf");
-  assert.equal(controller.getState().job, snapshot);
+test("cancelling one job preserves another task and keeps cancelled counts out of failures", async () => {
+  const { controller, calls } = harness();
+  await controller.start(); await controller.submit([91], "csrf"); await controller.submit([92], "csrf");
+  assert.equal(await controller.cancel(operationId, "csrf"), true); await flushPromises();
+  const cancelled = controller.getState().jobs.find((item) => item.jobId === operationId);
+  assert.deepEqual([cancelled.cancelled, cancelled.failed, cancelled.pending], [7, 0, 0]);
+  assert.equal(controller.getState().jobs.filter(isAliasDeletionJobActive).length, 1);
   assert.equal(controller.getState().blocked, false);
-  assert.equal(storage.read(), null);
-  assert.deepEqual(timers.delays(), []);
-  assert.equal(calls.length, 1);
+  assert.equal(await controller.cancel(operationId, "csrf"), false);
+  assert.equal(calls.filter(([method]) => method === "cancel").length, 1);
   controller.stop();
 });
 
-test("a mismatched successful submit response remains unknown until operationId is queried", async () => {
-  const { controller, calls } = harness({ startJob: async () => job("completed", { jobId: "unrelated-job" }) });
-  await controller.start();
-  await controller.submit([91], "csrf");
-  await flushPromises();
-  assert.equal(calls.at(-1)[0], "GET");
-  assert.equal(calls.at(-1)[1], operationId);
-  assert.equal(controller.getState().job.jobId, operationId);
-  controller.stop();
-});
-
-test("completed and interrupted jobs stop polling without replaying incomplete items", async () => {
-  for (const status of ["completed", "interrupted"]) {
-    const snapshot = job(status, { processed: 2, deleted: 1, failed: 6 });
-    assert.equal(isAliasDeletionJobActive(snapshot), false);
-    assert.equal(isAliasDeletionJobTerminal(snapshot), true);
-    const { controller, storage, timers } = harness({ getJob: async () => snapshot });
-    await controller.start();
-    await controller.submit([91], "csrf");
-    await controller.refresh();
-    assert.equal(controller.getState().job, snapshot);
-    assert.equal(storage.read(), null);
-    assert.equal(controller.getState().blocked, false);
-    assert.deepEqual(timers.delays(), []);
-    controller.stop();
-  }
-});
-
-test("recovery without storage uses latest and persists active jobs for the next refresh", async () => {
-  const { controller, storage } = harness({ getLatestJob: async () => job("queued") });
-  await controller.start();
-  assert.deepEqual(storage.read(), { operationId });
-  controller.stop();
-  const restored = harness({ storage });
-  await restored.controller.start();
-  assert.equal(restored.calls[0][0], "GET");
-  restored.controller.stop();
-});
-
-test("short request deadlines abort the read or submission and schedule only GET retries", async () => {
-  for (const mutation of [false, true]) {
-    let signal;
-    const hanging = (options) => {
-      signal = options.signal;
-      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new DOMException("timeout", "AbortError")), { once: true }));
-    };
-    const { controller, timers, calls } = harness(mutation
-      ? { startJob: (_ids, _id, _csrf, options) => hanging(options) }
-      : { getLatestJob: hanging });
-    if (mutation) await controller.start();
-    const request = mutation ? controller.submit([91], "csrf") : controller.start();
-    await flushPromises();
-    assert.equal(timers.fireNext(), 10_000);
-    assert.equal(signal.aborted, true);
-    await request;
-    await flushPromises();
-    if (mutation) {
-      assert.equal(calls.at(-1)[0], "GET");
-      assert.equal(controller.getState().job.jobId, operationId);
-    } else {
-      assert.equal(controller.getState().uncertain, true);
-    }
-    assert.deepEqual(timers.delays(), [2_000]);
-    controller.stop();
-  }
-});
-
-test("stop aborts in-flight reads and ignores late responses without clearing stored IDs", async () => {
+test("cancel requests deduplicate per job without blocking another submission", async () => {
   const response = deferred();
-  let signal;
-  const { controller, changes, timers, storage } = harness({
-    getJob: (_id, options) => { signal = options.signal; return response.promise; },
-  });
-  await controller.start();
-  await controller.submit([91], "csrf");
-  const request = controller.refresh();
-  await flushPromises();
-  controller.stop();
-  assert.equal(signal.aborted, true);
-  const updates = changes.length;
-  response.resolve(job("completed"));
-  await request;
-  assert.equal(changes.length, updates);
-  assert.deepEqual(storage.read(), { operationId });
-  assert.deepEqual(timers.delays(), []);
-  assert.equal(await controller.refresh(), false);
+  const { controller } = harness({ cancelJob: () => response.promise });
+  await controller.start(); await controller.submit([91], "csrf");
+  const cancelled = controller.cancel(operationId, "csrf");
+  assert.equal(await controller.cancel(operationId, "csrf"), false);
+  assert.deepEqual(controller.getState().cancelling, [operationId]);
+  assert.equal(await controller.submit([92], "csrf"), true);
+  response.resolve(job("running", { cancelRequested: true })); await cancelled; await flushPromises();
+  assert.deepEqual(controller.getState().cancelling, []); controller.stop();
 });
 
-test("stop before a scheduled request starts prevents even the initial GET", async () => {
+test("all completed or interrupted snapshots stop polling without replaying remaining items", async () => {
+  const snapshots = [job("completed"), job("interrupted", { jobId: "interrupted" })];
+  const { controller, calls, timers } = harness({ getJobs: async () => snapshots });
+  await controller.start();
+  assert.ok(controller.getState().jobs.every(isAliasDeletionJobTerminal));
+  assert.equal(controller.getState().blocked, false); assert.deepEqual(calls, []);
+  assert.deepEqual(timers.delays(), []); controller.stop();
+});
+
+test("read deadlines abort the fetch and schedule the next query", async () => {
+  let signal;
+  const { controller, timers } = harness({ getJobs: (options) => {
+    signal = options.signal;
+    return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new DOMException("timeout", "AbortError")), { once: true }));
+  } });
+  const request = controller.start(); await flushPromises();
+  assert.equal(timers.fireNext(), 10_000); assert.equal(signal.aborted, true);
+  await request; assert.deepEqual(timers.delays(), [2_000]);
+  assert.equal(controller.getState().blocked, false); controller.stop();
+});
+
+test("stop aborts reads and ignores late results from a previous administrator", async () => {
+  const response = deferred(); let signal;
+  const { controller, changes, timers } = harness({ getJobs: (options) => { signal = options.signal; return response.promise; } });
+  const request = controller.start(); await flushPromises(); controller.stop();
+  assert.equal(signal.aborted, true); const updates = changes.length;
+  response.resolve([job()]); await request;
+  assert.equal(changes.length, updates); assert.deepEqual(controller.getState().jobs, []);
+  assert.deepEqual(timers.delays(), []); assert.equal(await controller.refresh(), false);
+});
+
+test("stop before request microtask avoids the initial fetch", async () => {
   const { controller, calls, timers } = harness();
-  const request = controller.start();
-  controller.stop();
-  await request;
-  assert.deepEqual(calls, []);
-  assert.deepEqual(timers.delays(), []);
+  const request = controller.start(); controller.stop(); await request;
+  assert.deepEqual(calls, []); assert.deepEqual(timers.delays(), []);
 });
 
-test("unmount during submit leaves the request and background job alone for later recovery", async () => {
-  const response = deferred();
-  let signal;
-  const { controller, storage, timers, changes } = harness({
-    startJob: (_ids, _id, _csrf, options) => { signal = options.signal; return response.promise; },
-  });
-  await controller.start();
-  const request = controller.submit([91], "csrf");
-  controller.stop();
-  assert.equal(signal.aborted, false);
-  const updates = changes.length;
-  response.resolve(job("completed"));
-  await request;
-  assert.equal(changes.length, updates);
-  assert.deepEqual(storage.read(), { operationId });
+test("unmount during submit preserves operation evidence without cancelling remote work", async () => {
+  const response = deferred(); let signal;
+  const { controller, storage, timers, changes } = harness({ startJob: (_ids, _id, _csrf, options) => { signal = options.signal; return response.promise; } });
+  await controller.start(); const request = controller.submit([91], "csrf"); controller.stop();
+  assert.equal(signal.aborted, false); const updates = changes.length;
+  response.resolve(job("completed")); await request;
+  assert.equal(changes.length, updates); assert.deepEqual(storage.read(), { operationId });
   assert.deepEqual(timers.delays(), []);
 });

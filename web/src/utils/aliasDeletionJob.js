@@ -32,11 +32,11 @@ export function formatAliasDeletionResultMessage(result) {
 }
 
 export function isAliasDeletionJobActive(job) {
-  return job?.status === "queued" || job?.status === "running";
+  return ["queued", "running", "waiting", "paused"].includes(job?.status);
 }
 
 export function isAliasDeletionJobTerminal(job) {
-  return job?.status === "completed" || job?.status === "interrupted";
+  return ["completed", "interrupted", "cancelled"].includes(job?.status);
 }
 
 export function createAliasDeletionOperationId(crypto = globalThis.crypto) {
@@ -98,11 +98,49 @@ function validJob(job, expectedId) {
   return job;
 }
 
-/** A single request at a time; errors retry reads, never replay the mutation. */
+export function aliasDeletionJobLabel(job) {
+  if (job?.cancelRequested && isAliasDeletionJobActive(job)) return "正在取消剩余项";
+  if (job?.status === "completed" && job.cancelled > 0) return "已结束（含取消项）";
+  if (isAliasDeletionJobActive(job)) {
+    const accounts = job.accounts || [];
+    if (accounts.some((account) => account.status === "running")) return "执行中";
+    if (accounts.some((account) => account.status === "paused" && account.waitReason === "login_required")) return "等待主号登录";
+    if (accounts.some((account) => account.status === "paused")) return "已暂停，等待恢复";
+    if (accounts.some((account) => account.status === "waiting") || job.waits?.length) return "等待后继续";
+  }
+  return { queued: "排队中", running: "执行中", waiting: "等待后继续", paused: "等待主号登录", completed: "已完成", interrupted: "已中断", cancelled: "已取消" }[job?.status] || "查询中";
+}
+
+export function aliasDeletionJobType(job) {
+  if (job?.status === "interrupted" || job?.failed > 0) return "warning";
+  if (job?.status === "completed") return job.cancelled > 0 ? "info" : "success";
+  return "info";
+}
+
+export function aliasDeletionPending(job) {
+  return Number.isSafeInteger(job?.pending) ? job.pending
+    : Math.max(0, (job?.requested || 0) - (job?.processed || 0));
+}
+
+export function aliasDeletionPercentage(job) {
+  return job?.requested ? Math.min(100, Math.max(0,
+    (job.processed || 0) / job.requested * 100)) : 0;
+}
+
+export function aliasDeletionWaitLabel(reason) {
+  return { quota: "等待每小时额度恢复", upstream_rate_limit: "等待 Apple 恢复请求额度", login_required: "等待主号重新登录 Apple" }[reason] || "等待后继续";
+}
+
+export function aliasDeletionAccountLabel(status) {
+  return { queued: "排队中", running: "执行中", waiting: "等待后继续", paused: "已暂停", completed: "已完成", cancelled: "已取消", interrupted: "已中断" }[status] || "排队中";
+}
+
+/** One list poll at a time; active jobs never occupy the submission slot. */
 export function createAliasDeletionController({
   startJob,
   getJob,
-  getLatestJob,
+  getJobs,
+  cancelJob,
   storage,
   onChange = () => {},
   createOperationId = createAliasDeletionOperationId,
@@ -113,7 +151,7 @@ export function createAliasDeletionController({
 }) {
   let pending = storage?.read() || null;
   let state = {
-    job: null,
+    jobs: [],
     operationId: pending?.operationId || "",
     recovering: true,
     submitting: false,
@@ -121,19 +159,20 @@ export function createAliasDeletionController({
     uncertain: Boolean(pending),
     unmatched: false,
     error: null,
-    blocked: true,
+    blocked: Boolean(pending),
+    cancelling: [],
   };
   let stopped = false;
   let started = false;
   let timer = null;
   let inFlight = null;
-  let readController = null;
+  const readControllers = new Set();
+  const revisions = new Map();
 
   function update(patch) {
     if (stopped) return;
     state = { ...state, ...patch, operationId: pending?.operationId || "" };
-    state.blocked = state.recovering || state.submitting || state.checking ||
-      state.uncertain || isAliasDeletionJobActive(state.job);
+    state.blocked = state.submitting || Boolean(pending);
     onChange(state);
   }
 
@@ -147,21 +186,31 @@ export function createAliasDeletionController({
     storage?.clear();
   }
 
-  function accept(job) {
-    if (job) validJob(job);
-    if (isAliasDeletionJobTerminal(job)) {
-      clearPending();
-    } else if (job) {
-      pending = { operationId: job.jobId };
-      storage?.write(pending);
+  function mergeJobs(jobs, expectedRevisions) {
+    const merged = new Map(state.jobs.map((job) => [job.jobId, job]));
+    for (const job of jobs) {
+      if (expectedRevisions && revisions.get(job.jobId) !== expectedRevisions.get(job.jobId)) continue;
+      merged.set(job.jobId, job);
+      revisions.set(job.jobId, (revisions.get(job.jobId) || 0) + 1);
     }
-    update({ job, error: null, uncertain: false, unmatched: false, recovering: false });
+    let terminalCount = 0;
+    const sorted = [...merged.values()].sort((a, b) =>
+      Number(isAliasDeletionJobActive(b)) - Number(isAliasDeletionJobActive(a)) ||
+      (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0));
+    update({ jobs: sorted.filter((job) => isAliasDeletionJobActive(job) || ++terminalCount <= 100) });
+  }
+
+  function acceptSubmission(job, operationId) {
+    validJob(job, operationId);
+    clearPending();
+    mergeJobs([job]);
+    update({ error: null, uncertain: false, unmatched: false });
   }
 
   function schedule() {
     clearTimer();
     if (stopped || inFlight || state.submitting) return;
-    if (state.recovering || state.uncertain || isAliasDeletionJobActive(state.job)) {
+    if (state.recovering || state.uncertain || state.jobs.some(isAliasDeletionJobActive)) {
       timer = setTimeoutFn(() => {
         timer = null;
         void refresh();
@@ -171,43 +220,85 @@ export function createAliasDeletionController({
 
   async function shortRequest(request, { read = false } = {}) {
     const controller = new AbortController();
-    if (read) readController = controller;
+    if (read) readControllers.add(controller);
     const deadline = setTimeoutFn(() => controller.abort(), timeoutMs);
     try {
       return await request({ signal: controller.signal });
     } finally {
       clearTimeoutFn(deadline);
-      if (readController === controller) readController = null;
+      readControllers.delete(controller);
     }
   }
 
-  function refresh({ latest = false } = {}) {
+  function refresh() {
     if (stopped) return Promise.resolve(false);
     if (inFlight) return inFlight;
     if (state.submitting) return Promise.resolve(false);
     clearTimer();
     update({ checking: true });
-    // The operation ID IS the job ID, even when the DELETE response was lost.
-    // Never let latest (including a manual refresh) replace unresolved evidence.
-    const jobId = pending?.operationId || (!latest && !state.recovering && state.job?.jobId);
+    const operationId = pending?.operationId;
+    const expectedRevisions = new Map(revisions);
     const request = Promise.resolve().then(async () => {
+      if (stopped) return false;
       try {
+        // A lost response is reconciled by its exact ID. The list is fetched too,
+        // so an unresolved submission cannot hide progress on earlier tasks.
+        const requests = [shortRequest(getJobs, { read: true })];
+        if (operationId) requests.push(shortRequest((options) => getJob(operationId, options), { read: true }));
+        const [listed, confirmed] = await Promise.allSettled(requests);
         if (stopped) return false;
-        const job = await shortRequest(
-          (options) => jobId ? getJob(jobId, options) : getLatestJob(options),
-          { read: true },
-        );
-        if (stopped) return false;
-        if (job || jobId) validJob(job, jobId);
-        accept(job);
-        return true;
+        let listError = null;
+        let confirmationRevision = expectedRevisions.get(operationId);
+        try {
+          if (listed.status === "rejected") throw listed.reason;
+          if (!Array.isArray(listed.value)) throw Object.assign(new Error("任务列表响应异常。"), { code: "INVALID_RESPONSE" });
+          listed.value.forEach((job) => validJob(job));
+          const listedIds = new Set(listed.value.map((job) => job.jobId));
+          const missingActive = state.jobs.filter((job) => isAliasDeletionJobActive(job) &&
+            expectedRevisions.has(job.jobId) && revisions.get(job.jobId) === expectedRevisions.get(job.jobId) &&
+            !listedIds.has(job.jobId));
+          mergeJobs(listed.value, expectedRevisions);
+          confirmationRevision = revisions.get(operationId);
+          // The list includes every active job, but only recent terminal jobs.
+          // Resolve older jobs individually when many complete between polls.
+          const recovered = await Promise.allSettled(missingActive.map((job) =>
+            shortRequest((options) => getJob(job.jobId, options), { read: true })));
+          if (stopped) return false;
+          for (let index = 0; index < recovered.length; index++) {
+            const result = recovered[index];
+            if (result.status === "fulfilled") {
+              try { mergeJobs([validJob(result.value, missingActive[index].jobId)], expectedRevisions); }
+              catch (error) { listError ||= error; }
+            } else { listError ||= result.reason; }
+          }
+        } catch (error) { listError = error; }
+
+        // A new submit can start while this list read is pending. Never clear
+        // that newer operation's evidence or replace it with list/latest data.
+        if (operationId && pending?.operationId === operationId) {
+          try {
+            if (confirmed.status === "rejected") throw confirmed.reason;
+            validJob(confirmed.value, operationId);
+            if (revisions.get(operationId) === confirmationRevision) {
+              acceptSubmission(confirmed.value, operationId);
+            } else {
+              // Cancellation may finish while missing-history lookups are in
+              // flight. Confirmation resolves submission evidence, not that
+              // newer job result.
+              clearPending();
+              update({ error: null, uncertain: false, unmatched: false });
+            }
+          } catch (error) {
+            update({ error, recovering: false, uncertain: true,
+              unmatched: error?.status === 404 && error?.code === "NOT_FOUND" });
+            return false;
+          }
+        }
+        if (!pending) update({ error: listError, uncertain: Boolean(listError), unmatched: false });
+        update({ recovering: Boolean(listError) });
+        return !listError;
       } catch (error) {
-        update({
-          error,
-          recovering: !jobId,
-          uncertain: true,
-          unmatched: Boolean(jobId && error?.status === 404 && error?.code === "NOT_FOUND"),
-        });
+        update({ error, recovering: true, uncertain: true });
         return false;
       } finally {
         update({ checking: false });
@@ -225,28 +316,25 @@ export function createAliasDeletionController({
     start() {
       if (started || stopped) return inFlight || Promise.resolve(false);
       started = true;
-      return refresh({ latest: true });
+      return refresh();
     },
     refresh,
     async submit(ids, csrfToken) {
-      if (stopped || state.blocked || inFlight || !ids.length) return false;
+      if (stopped || state.blocked || !ids.length) return false;
       const operationId = createOperationId();
       pending = { operationId };
       storage?.write(pending);
       clearTimer();
-      update({ job: null, submitting: true, error: null, unmatched: false });
+      update({ submitting: true, error: null, unmatched: false, uncertain: false });
       try {
         const job = await shortRequest(
           (options) => startJob([...ids], operationId, csrfToken, options),
         );
         if (stopped) return false;
-        accept(validJob(job, operationId));
+        acceptSubmission(job, operationId);
       } catch (error) {
         if (stopped) return false;
-        if (error?.status === 409 && error?.code === "BATCH_DELETE_IN_PROGRESS") {
-          clearPending();
-          update({ job: null, recovering: true, uncertain: true, error });
-        } else if ((error?.status >= 400 && error.status < 500 && error.status !== 408 && error.code !== "INVALID_RESPONSE") ||
+        if ((error?.status >= 400 && error.status < 500 && error.status !== 408 && error.code !== "INVALID_RESPONSE") ||
                    (error?.status === 503 && error.code === "BATCH_DELETE_UNAVAILABLE")) {
           clearPending();
           throw error;
@@ -255,7 +343,7 @@ export function createAliasDeletionController({
         }
       } finally {
         update({ submitting: false });
-        if (!stopped && (state.uncertain || state.recovering)) void refresh({ latest: true });
+        if (!stopped && pending) void refresh();
         else schedule();
       }
       return true;
@@ -265,14 +353,28 @@ export function createAliasDeletionController({
       if (stopped || !state.unmatched || state.checking) return false;
       clearPending();
       clearTimer();
-      update({ job: null, error: null, uncertain: false, unmatched: false, recovering: true });
-      void refresh({ latest: true });
+      update({ error: null, uncertain: false, unmatched: false, recovering: true });
+      void refresh();
       return true;
+    },
+    async cancel(jobId, csrfToken) {
+      const job = state.jobs.find((item) => item.jobId === jobId);
+      if (stopped || !cancelJob || !isAliasDeletionJobActive(job) || job.cancelRequested || state.cancelling.includes(jobId)) return false;
+      update({ cancelling: [...state.cancelling, jobId] });
+      try {
+        const cancelled = await shortRequest((options) => cancelJob(jobId, csrfToken, options));
+        if (stopped) return false;
+        mergeJobs([validJob(cancelled, jobId)]);
+        return true;
+      } finally {
+        update({ cancelling: state.cancelling.filter((id) => id !== jobId) });
+        if (!stopped) void refresh();
+      }
     },
     stop() {
       stopped = true;
       clearTimer();
-      readController?.abort();
+      for (const controller of readControllers) controller.abort();
     },
   };
 }

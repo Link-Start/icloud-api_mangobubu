@@ -1058,6 +1058,14 @@ export async function deleteAliases(ids, csrfToken) {
   };
 }
 
+function aliasDeletionTimestamp(value) {
+  return typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
+    Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+const aliasDeletionWaitReasons = new Set(["quota", "upstream_rate_limit", "login_required"]);
+
 function normalizeAliasDeletionWait(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const accountId = firstDefined(raw, "account_id", "accountId", "AccountID");
@@ -1066,18 +1074,28 @@ function normalizeAliasDeletionWait(raw) {
   const retryAt = firstDefined(raw, "retry_at", "retryAt", "RetryAt");
   const attempt = firstDefined(raw, "attempt", "Attempt");
   const maxAttempts = firstDefined(raw, "max_attempts", "maxAttempts", "MaxAttempts");
+  const reason = firstDefined(raw, "reason", "Reason");
+  const hasReason = aliasDeletionWaitReasons.has(reason);
   if (![accountId, aliasId].every((id) => Number.isSafeInteger(id) && id >= 0) ||
       (accountId === 0 && aliasId === 0) ||
       typeof operation !== "string" || !Object.hasOwn(ALIAS_DELETION_OPERATION_LABELS, operation) ||
-      typeof retryAt !== "string" ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(retryAt) ||
-      !Number.isFinite(Date.parse(retryAt)) ||
-      !Number.isSafeInteger(attempt) || attempt < 1 || attempt > 3 || maxAttempts !== 3) {
+      (!aliasDeletionTimestamp(retryAt) && reason !== "login_required") ||
+      (!hasReason && (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > 3 || maxAttempts !== 3))) {
     return null;
   }
 
   // Optional metadata is allowlisted; never carry upstream bodies into the view.
-  const wait = { accountId, aliasId, operation, retryAt, attempt, maxAttempts };
+  const wait = { accountId, aliasId, operation, retryAt: aliasDeletionTimestamp(retryAt) };
+  if (hasReason) {
+    wait.reason = reason;
+    for (const [field, upper] of [["used", "Used"], ["limit", "Limit"]]) {
+      const value = firstDefined(raw, field, upper);
+      if (Number.isSafeInteger(value) && value >= 0) wait[field] = value;
+    }
+  } else {
+    wait.attempt = attempt;
+    wait.maxAttempts = maxAttempts;
+  }
   const httpStatus = firstDefined(raw, "http_status", "httpStatus", "HTTPStatus");
   const serviceCode = firstDefined(raw, "service_code", "serviceCode", "ServiceCode");
   if (Number.isSafeInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) {
@@ -1087,6 +1105,26 @@ function normalizeAliasDeletionWait(raw) {
     wait.serviceCode = serviceCode;
   }
   return wait;
+}
+
+function normalizeAliasDeletionAccount(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const accountId = firstDefined(raw, "account_id", "accountId", "AccountID");
+  const status = firstDefined(raw, "status", "Status");
+  if (!Number.isSafeInteger(accountId) || accountId < 1 ||
+      !["queued", "running", "waiting", "paused", "completed", "cancelled", "interrupted"].includes(status)) return null;
+  const account = { accountId, status };
+  for (const name of ["requested", "deleted", "failed", "pending", "cancelled", "used", "limit"]) {
+    const value = firstDefined(raw, name, name[0].toUpperCase() + name.slice(1));
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    account[name] = value;
+  }
+  const email = firstDefined(raw, "account_email", "accountEmail", "AccountEmail");
+  const waitReason = firstDefined(raw, "wait_reason", "waitReason", "WaitReason");
+  account.accountEmail = typeof email === "string" ? email : "";
+  account.retryAt = aliasDeletionTimestamp(firstDefined(raw, "retry_at", "retryAt", "RetryAt"));
+  account.waitReason = aliasDeletionWaitReasons.has(waitReason) ? waitReason : "";
+  return account;
 }
 
 export function normalizeAliasDeletionJob(raw) {
@@ -1106,6 +1144,7 @@ export function normalizeAliasDeletionJob(raw) {
   const failed = count("failed", "Failed");
   const deferred = count("deferred", "Deferred");
   const waits = firstDefined(job, "waits", "Waits");
+  const accounts = firstDefined(job, "accounts", "Accounts");
   return {
     jobId: firstDefined(job, "job_id", "jobId", "JobID") || "",
     status: firstDefined(job, "status", "Status") || "",
@@ -1113,6 +1152,10 @@ export function normalizeAliasDeletionJob(raw) {
     processed: count("processed", "Processed"),
     deleted: count("deleted", "Deleted"),
     failed,
+    pending: count("pending", "Pending"),
+    cancelled: count("cancelled", "Cancelled") || 0,
+    cancelRequested: firstDefined(job, "cancel_requested", "cancelRequested", "CancelRequested") === true,
+    accounts: Array.isArray(accounts) ? accounts.map(normalizeAliasDeletionAccount).filter(Boolean) : [],
     deferred: deferred !== null && failed !== null && deferred <= failed ? deferred : 0,
     waits: Array.isArray(waits) ? waits.map(normalizeAliasDeletionWait).filter(Boolean) : [],
     results: rawResults.map((rawResult) => ({
@@ -1158,6 +1201,21 @@ export async function getAliasDeletionJob(jobId, options = {}) {
 export async function getLatestAliasDeletionJob(options = {}) {
   const data = await apiRequest("/aliases/batch/jobs/latest", {
     signal: options.signal,
+  });
+  return normalizeAliasDeletionJob(data);
+}
+
+export async function getAliasDeletionJobs(options = {}) {
+  const data = await apiRequest("/aliases/batch/jobs", { signal: options.signal });
+  if (!Array.isArray(data?.jobs)) {
+    throw Object.assign(new Error("任务列表响应异常，请稍后刷新。"), { code: "INVALID_RESPONSE" });
+  }
+  return data.jobs.map(normalizeAliasDeletionJob);
+}
+
+export async function cancelAliasDeletionJob(jobId, csrfToken, options = {}) {
+  const data = await apiRequest(`/aliases/batch/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST", csrfToken, signal: options.signal,
   });
   return normalizeAliasDeletionJob(data);
 }

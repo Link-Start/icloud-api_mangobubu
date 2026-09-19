@@ -20,9 +20,9 @@ func (f aliasDeletionRoundTripFunc) RoundTrip(request *http.Request) (*http.Resp
 	return f(request)
 }
 
-func TestDeleteAliasesRealClientUses2NPlus2InterceptedRequests(t *testing.T) {
+func TestDeleteAliasesRealClientRefreshesEveryItem(t *testing.T) {
 	const count = 8
-	service, repo, ids, full := newAliasDeletionBatchFixture(t, count, &fakeAppleClient{}, &fakeLocker{})
+	service, repo, ids, full := newAliasDeletionBatchFixture(t, count, &fakeAppleClient{}, newFakeAcquiringLocker())
 	active := make(map[string]bool)
 	for _, remote := range full.Aliases {
 		active[remote.AnonymousID] = true
@@ -105,14 +105,14 @@ func TestDeleteAliasesRealClientUses2NPlus2InterceptedRequests(t *testing.T) {
 			t.Errorf("item %d failed: %s", outcome.AliasID, Code(outcome.Err))
 		}
 	}
-	if requests != 2*count+2 || validates != 1 || lists != 1 || len(active) != 0 {
-		t.Errorf("intercepted requests=%d want=%d validate=%d list=%d remaining=%d", requests, 2*count+2, validates, lists, len(active))
+	if requests != 4*count || validates != count || lists != count || len(active) != 0 {
+		t.Errorf("intercepted requests=%d want=%d validate=%d list=%d remaining=%d", requests, 4*count, validates, lists, len(active))
 	}
 	assertStoredAppleSessionToken(t, service, repo, 3, fmt.Sprintf("wire-%d", requests))
 }
 
 func TestAliasDeletionRecoveryRealClientPersistentThrottleDefers416Items(t *testing.T) {
-	service, repo, ids, _ := newAliasDeletionBatchFixture(t, 416, &fakeAppleClient{}, &fakeLocker{})
+	service, repo, ids, _ := newAliasDeletionBatchFixture(t, 416, &fakeAppleClient{}, newFakeAcquiringLocker())
 	clock := &aliasDeletionMockClock{value: service.now()}
 	WithClock(clock.now)(service)
 	WithAliasDeletionWaiter(clock.wait)(service)
@@ -164,7 +164,7 @@ func TestAliasDeletionRecoveryRealClientPersistentThrottleDefers416Items(t *test
 			t.Errorf("item %d=%v want=%s and preserved local record", i, outcome.Err, want)
 		}
 	}
-	for i, delay := range []time.Duration{90 * time.Second, 2 * time.Minute, 4 * time.Minute} {
+	for i, delay := range []time.Duration{90 * time.Second, 90 * time.Second, 90 * time.Second} {
 		if gap := callTimes[i+1].Sub(callTimes[i]); gap != delay {
 			t.Errorf("wire retry %d delay=%s want=%s", i+1, gap, delay)
 		}
@@ -181,7 +181,7 @@ func TestAliasDeletionRecoveryRealClient429BodyTimeoutHonorsRetryAfter(t *testin
 	for _, operation := range []string{"validate", "list", "deactivate", "delete"} {
 		for _, scenario := range []string{"recovered", "job cancelled", "exhausted"} {
 			t.Run(operation+"/"+scenario, func(t *testing.T) {
-				service, repo, ids, directory := newAliasDeletionBatchFixture(t, 2, &fakeAppleClient{}, &fakeLocker{})
+				service, repo, ids, directory := newAliasDeletionBatchFixture(t, 2, &fakeAppleClient{}, newFakeAcquiringLocker())
 				clock := &aliasDeletionMockClock{value: service.now()}
 				WithClock(clock.now)(service)
 				WithAliasDeletionWaiter(clock.wait)(service)
@@ -301,7 +301,7 @@ func TestAliasDeletionRecoveryRealClient429BodyTimeoutHonorsRetryAfter(t *testin
 						t.Errorf("cancelled job retried/waited: out=%v waits=%v calls=%v", out, waits, calls)
 					}
 				case "exhausted":
-					if len(waits) != 6 || limited != 4 || requests > 10 || Code(out[0].Err) != CodeRateLimited || Code(out[1].Err) != CodeBatchDeferred || !errors.Is(out[0].Err, context.DeadlineExceeded) {
+					if len(waits) != 6 || limited != 4 || requests > 13 || Code(out[0].Err) != CodeRateLimited || Code(out[1].Err) != CodeBatchDeferred || !errors.Is(out[0].Err, context.DeadlineExceeded) {
 						t.Errorf("body timeout exhaustion misclassified: out=%v waits=%v calls=%v", out, waits, calls)
 					}
 				}

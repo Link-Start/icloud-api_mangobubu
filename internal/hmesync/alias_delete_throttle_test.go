@@ -161,7 +161,10 @@ func TestAliasDeletionRecoveryReadOnlyThrottle(t *testing.T) {
 				if len(waits) != 2 || !waits[0].Waiting || waits[1].Waiting {
 					t.Fatalf("wait start/clear=%v", waits)
 				}
-				wantDelay := max(time.Minute, serverDelay)
+				wantDelay := serverDelay
+				if wantDelay <= 0 {
+					wantDelay = time.Hour
+				}
 				want := AliasDeletionWait{AccountID: 3, AliasID: f.ids[0], Operation: operation,
 					RetryAt: failedAt.Add(wantDelay), Attempt: 1, MaxAttempts: 3, Waiting: true, HTTPStatus: 429, ServiceCode: "-41015"}
 				if waits[0] != want {
@@ -178,7 +181,11 @@ func TestAliasDeletionRecoveryReadOnlyThrottle(t *testing.T) {
 				if gap := f.calls[failedIndex+1].at.Sub(f.calls[failedIndex].at); gap != wantDelay {
 					t.Errorf("retry gap=%s want=%s", gap, wantDelay)
 				}
-				if len(f.calls) != 7 || f.repo.hasAlias(f.ids[0]) || f.repo.hasAlias(f.ids[1]) {
+				wantCalls := 9
+				if operation == "list" {
+					wantCalls = 10
+				}
+				if len(f.calls) != wantCalls || f.repo.hasAlias(f.ids[0]) || f.repo.hasAlias(f.ids[1]) {
 					t.Error("recovered batch did not finish with bounded calls")
 				}
 				f.assertPaced()
@@ -224,8 +231,8 @@ func TestAliasDeletionRecoveryFreshDirectoryPreventsMutationReplay(t *testing.T)
 				if operation == "delete" {
 					failedIndex = 3
 				}
-				if next := f.calls[failedIndex+1]; next.operation != "list" || next.at.Sub(f.calls[failedIndex].at) != 5*time.Minute {
-					t.Errorf("next call=%v: expected fresh read after server cooldown", next)
+				if next := f.calls[failedIndex+1]; next.operation != "validate" || next.at.Sub(f.calls[failedIndex].at) != 5*time.Minute || f.calls[failedIndex+2].operation != "list" {
+					t.Errorf("next call=%v: expected revalidation and fresh read after server cooldown", next)
 				}
 				wantDeactivate, wantDelete := int32(2), int32(2)
 				if !applied {
@@ -284,7 +291,7 @@ func TestAliasDeletionRecoveryExhaustionDefersUnattemptedItems(t *testing.T) {
 					limitedCalls++
 				}
 			}
-			if limitedCalls != 4 || len(f.calls) > 10 {
+			if limitedCalls != 4 || len(f.calls) > 13 {
 				t.Errorf("unbounded calls=%d limited=%d", len(f.calls), limitedCalls)
 			}
 			for i := range 3 {
@@ -299,7 +306,7 @@ func TestAliasDeletionRecoveryExhaustionDefersUnattemptedItems(t *testing.T) {
 					cooldowns = append(cooldowns, delay)
 				}
 			}
-			if !reflect.DeepEqual(cooldowns, []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute}) {
+			if !reflect.DeepEqual(cooldowns, []time.Duration{time.Hour, time.Hour, time.Hour}) {
 				t.Errorf("fallback delays=%v", cooldowns)
 			}
 			f.assertPaced()
@@ -417,7 +424,7 @@ func TestAliasDeletionRecoveryCancellationClearsWaitBeforeOutcomes(t *testing.T)
 	}
 }
 
-func TestAliasDeletionRecoveryProductionTimerPacesAndRespectsJobDeadline(t *testing.T) {
+func TestAliasDeletionRecoveryProductionTimerHasNoBatchDeadline(t *testing.T) {
 	for _, limited := range []bool{false, true} {
 		t.Run(fmt.Sprint(limited), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -440,19 +447,19 @@ func TestAliasDeletionRecoveryProductionTimerPacesAndRespectsJobDeadline(t *test
 					t.Fatalf("production timer out=%v err=%v", out, err)
 				}
 				if limited {
-					if len(callTimes) != 1 || time.Since(start) != 2*time.Hour || len(waits) != 2 || waits[1].Waiting {
-						t.Fatalf("job cap calls=%v elapsed=%v waits=%v", callTimes, time.Since(start), waits)
+					if len(callTimes) != 4 || time.Since(start) != 9*time.Hour || len(waits) != 6 || waits[5].Waiting {
+						t.Fatalf("long server cooldown calls=%v elapsed=%v waits=%v", callTimes, time.Since(start), waits)
 					}
 					if waits[0].RetryAt.Sub(start) != 3*time.Hour {
 						t.Error("long server delay was shortened to a retry within the job deadline")
 					}
 					for _, outcome := range out {
-						if !errors.Is(outcome.Err, context.DeadlineExceeded) {
-							t.Errorf("job deadline result=%v", outcome)
+						if !errors.Is(outcome.Err, ErrRateLimited) {
+							t.Errorf("server throttle result=%v", outcome)
 						}
 					}
 				} else {
-					if len(callTimes) != 6 || out[0].Err != nil || out[1].Err != nil || len(waits) != 0 {
+					if len(callTimes) != 8 || out[0].Err != nil || out[1].Err != nil || len(waits) != 0 {
 						t.Errorf("healthy paced batch out=%v calls=%v waits=%v", out, callTimes, waits)
 					}
 					for i := 1; i < len(callTimes); i++ {
@@ -686,14 +693,14 @@ func TestAliasDeletionRecoveryNonThrottleReconciliationSharesServerDelay(t *test
 			if err != nil || len(out) != 1 || out[0].Err != nil || f.client.deleteCalls.Load() != 1 || f.repo.hasAlias(f.ids[0]) {
 				t.Fatalf("reconciliation out=%v err=%v", out, err)
 			}
-			if f.calls[4].operation != "list" || f.calls[4].at.Sub(f.calls[3].at) != 90*time.Second {
+			if f.calls[4].operation != "validate" || f.calls[5].operation != "list" || f.calls[4].at.Sub(f.calls[3].at) != 90*time.Second {
 				t.Errorf("reconciliation skipped Retry-After: %v", f.calls)
 			}
 			if len(starts) < 1 || starts[0].Attempt != 0 || starts[0].Operation != "list" || starts[0].HTTPStatus != 503 {
 				t.Errorf("read-only server wait=%v", starts)
 			}
 			if readLimited {
-				if len(starts) != 2 || starts[1].Attempt != 1 || len(f.calls) != 6 || f.calls[5].at.Sub(f.calls[4].at) != 5*time.Minute {
+				if len(starts) != 2 || starts[1].Attempt != 1 || len(f.calls) != 8 || f.calls[6].at.Sub(f.calls[5].at) != 5*time.Minute {
 					t.Errorf("reconcile retry did not share cooldown: waits=%v calls=%v", starts, f.calls)
 				}
 			}

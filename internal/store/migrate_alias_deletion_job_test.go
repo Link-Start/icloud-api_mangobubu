@@ -55,6 +55,9 @@ func TestAliasDeletionJobSQLiteV8ConvergenceIsAdditiveAndReentrant(t *testing.T)
 					if _, err := raw.ExecContext(ctx, createAliasDeletionJobsTable); err != nil {
 						t.Fatal(err)
 					}
+					if _, err := raw.ExecContext(ctx, `CREATE UNIQUE INDEX alias_deletion_jobs_active_admin_idx ON alias_deletion_jobs(admin_id) WHERE status IN ('queued', 'running')`); err != nil {
+						t.Fatal(err)
+					}
 					mustCreateAliasDeletionJob(t, s, job)
 				}
 				for pass := range 3 {
@@ -149,7 +152,9 @@ func TestAliasDeletionJobPostgresConvergenceAllSupportedVersions(t *testing.T) {
 						!strings.HasPrefix(normalized, "create table if not exists ") &&
 						!strings.HasPrefix(normalized, "create index if not exists ") &&
 						!strings.HasPrefix(normalized, "create unique index if not exists ") {
-						t.Errorf("non-additive job convergence: %s", normalized)
+						if normalized != normalizeSQL(createAliasDeletionJobsActiveIndex) {
+							t.Errorf("unexpected destructive job convergence: %s", normalized)
+						}
 					}
 					if (pass == 1 || version == 8) && strings.HasPrefix(normalized, "update schema_migrations set version") {
 						t.Errorf("v8 convergence unnecessarily rewrote schema version: %s", normalized)
@@ -218,7 +223,6 @@ func assertAliasDeletionJobSQLiteSchema(t *testing.T, db *sql.DB) {
 		want string
 	}{
 		{"alias_deletion_jobs_admin_created_idx", "on alias_deletion_jobs(admin_id, created_at desc, id desc)"},
-		{"alias_deletion_jobs_active_admin_idx", "on alias_deletion_jobs(admin_id) where status in ('queued', 'running')"},
 	} {
 		var statement string
 		if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`, index.name).Scan(&statement); err != nil {
@@ -227,5 +231,12 @@ func assertAliasDeletionJobSQLiteSchema(t *testing.T, db *sql.DB) {
 		if !strings.Contains(normalizeSQL(statement), index.want) {
 			t.Errorf("index %s = %s", index.name, statement)
 		}
+	}
+	var activeIndexCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'alias_deletion_jobs_active_admin_idx'`).Scan(&activeIndexCount); err != nil {
+		t.Fatal(err)
+	}
+	if activeIndexCount != 0 {
+		t.Fatal("obsolete single-active-job index remains")
 	}
 }

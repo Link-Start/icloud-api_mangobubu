@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -31,6 +32,11 @@ type HMESyncService interface {
 // implements it and reports each item's result independently.
 type HMEBatchDeletionService interface {
 	DeleteAliases(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error)
+}
+
+type HMEQueuedDeletionService interface {
+	PrepareAliasDeletion(context.Context, int64) (domain.AliasDeletionWork, error)
+	DeleteQueuedAlias(context.Context, domain.AliasDeletionWork) error
 }
 
 type adminAPIAppleAuthRequest struct {
@@ -358,9 +364,13 @@ func (s *Server) adminAPIAppleCreatedAliases(created []hmesync.CreatedAlias) ([]
 }
 
 type adminAPIAppleError struct {
-	Status  int
-	Code    string
-	Message string
+	Status     int
+	Code       string
+	Message    string
+	RetryAt    time.Time
+	WaitReason string
+	Used       int
+	Limit      int
 }
 
 func adminAPIAppleServiceUnavailable() adminAPIAppleError {
@@ -372,6 +382,10 @@ func adminAPIAppleServiceUnavailable() adminAPIAppleError {
 }
 
 func classifyAdminAPIAppleError(err error) adminAPIAppleError {
+	var wait *hmesync.AliasDeletionWaitError
+	if errors.As(err, &wait) {
+		return adminAPIAppleError{Status: http.StatusTooManyRequests, Code: hmesync.CodeRateLimited, Message: "该主号删除额度正在恢复，请等待后继续", RetryAt: wait.RetryAt, WaitReason: wait.Reason, Used: wait.Used, Limit: wait.Limit}
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return adminAPIAppleError{Status: http.StatusGatewayTimeout, Code: hmesync.CodeUpstreamError, Message: "Apple 服务响应超时，请稍后再试"}
 	}
@@ -479,7 +493,15 @@ func (s *Server) adminAPIFinishAppleAliasDeleteFailure(
 ) {
 	apiErr = adminAPIAppleAliasDeleteFailure(apiErr)
 	s.auditAppleAliasDeleteFailure(c, adminSession, aliasID, apiErr)
-	writeAdminAPIError(c, apiErr.Status, apiErr.Code, apiErr.Message)
+	writeAdminAPIAppleError(c, apiErr)
+}
+
+func writeAdminAPIAppleError(c *gin.Context, apiErr adminAPIAppleError) {
+	if apiErr.RetryAt.IsZero() {
+		writeAdminAPIError(c, apiErr.Status, apiErr.Code, apiErr.Message)
+		return
+	}
+	c.JSON(apiErr.Status, gin.H{"error": gin.H{"code": apiErr.Code, "message": apiErr.Message, "request_id": requestID(c), "retry_at": apiErr.RetryAt.UTC().Format(time.RFC3339Nano), "wait_reason": apiErr.WaitReason, "used": apiErr.Used, "limit": apiErr.Limit}})
 }
 
 func adminAPIAppleAliasDeleteFailure(apiErr adminAPIAppleError) adminAPIAppleError {

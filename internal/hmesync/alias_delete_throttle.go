@@ -20,7 +20,6 @@ var ErrBatchDeferred = errors.New("Apple batch item deferred without execution")
 const (
 	aliasDeletionRequestInterval = time.Second
 	aliasDeletionMaxRecoveries   = 3
-	aliasDeletionRecoveryLimit   = 2 * time.Hour
 )
 
 // AliasDeletionWait is transient account wait state, not an item outcome. Attempt
@@ -41,8 +40,9 @@ type AliasDeletionWait struct {
 type aliasDeletionRecoveryKey struct{}
 
 // WithAliasDeletionRecovery opts DeleteAliases into paced, bounded throttle
-// recovery. DeleteAlias and batches without this context retain their original
-// semantics. A nil report still enables recovery, without wait notifications.
+// recovery. All entry points share the durable hourly quota; DeleteAlias and
+// batches without this context return wait state immediately. A nil report
+// still enables recovery, without wait notifications.
 // Reports run synchronously while account locks may be held and can arrive
 // concurrently for different accounts: callers must synchronize shared state
 // and must not re-enter account operations. Every wait start is paired with
@@ -115,17 +115,17 @@ func (b *aliasDeletionBatch) beforeRequest(ctx context.Context, operation string
 		return err
 	}
 	r := b.recovery
-	if r == nil {
-		return nil
-	}
-	if err := b.waitServerDelay(ctx, operation); err != nil {
-		return err
-	}
-	if r.requested {
-		if err := b.s.waitAliasDeletion(ctx, aliasDeletionRequestInterval-b.s.now().Sub(r.lastRequest)); err != nil {
+	if r != nil {
+		if err := b.waitServerDelay(ctx, operation); err != nil {
 			return err
 		}
+		if r.requested {
+			if err := b.s.waitAliasDeletion(ctx, aliasDeletionRequestInterval-b.s.now().Sub(r.lastRequest)); err != nil {
+				return err
+			}
+		}
 	}
+	b.operation = operation
 	// A long cooldown must not make earlier identity/pending checks stale.
 	account, err := b.s.repo.GetAccount(ctx, b.accountID)
 	if err != nil {
@@ -135,22 +135,31 @@ func (b *aliasDeletionBatch) beforeRequest(ctx context.Context, operation string
 		b.stopped = wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		return b.stopped
 	}
-	alias, err := b.repo.GetAlias(ctx, r.aliasID)
+	if err := b.checkWork(ctx, operation == "deactivate" || operation == "delete"); err != nil {
+		return err
+	}
+	alias, err := b.repo.GetAlias(ctx, b.aliasID)
+	if b.work != nil && errors.Is(err, store.ErrNotFound) {
+		alias = domain.Alias{ID: b.aliasID, AccountID: b.work.AccountID, Address: b.work.Address}
+		err = nil
+	}
 	if err != nil {
 		return err
 	}
-	if alias.AccountID != b.accountID || domain.NormalizeEmail(alias.Address) != r.address {
+	if alias.AccountID != b.accountID || domain.NormalizeEmail(alias.Address) != b.address {
 		b.stopped = wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		return b.stopped
 	}
-	if !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending && !b.initialPending[r.aliasID] {
+	if !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending && !b.initialPending[b.aliasID] {
 		return wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, store.ErrAliasConfirmationPending)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	r.lastRequest = b.s.now()
-	r.requested = true
+	if r != nil {
+		r.lastRequest = b.s.now()
+		r.requested = true
+	}
 	return nil
 }
 
@@ -165,14 +174,23 @@ func (b *aliasDeletionBatch) recoverThrottle(ctx context.Context, operation stri
 		return err
 	}
 	r := b.recovery
-	if r.attempts >= aliasDeletionMaxRecoveries {
+	var wait *AliasDeletionWaitError
+	quotaWait := errors.As(cause, &wait) && wait.Reason == "quota"
+	if !quotaWait && r.attempts >= aliasDeletionMaxRecoveries {
 		// Return the actual throttle to this item, but explicitly distinguish all
 		// subsequent unattempted items. Never clear a stopped account to retry.
 		b.stopped = wrapError(CodeBatchDeferred, ErrBatchDeferred, cause)
 		return cause
 	}
-	r.attempts++
-	delay := max(time.Minute<<uint(r.attempts-1), r.nextServerDelay)
+	if !quotaWait {
+		r.attempts++
+	}
+	delay := r.nextServerDelay
+	if wait != nil {
+		delay = max(delay, wait.RetryAt.Sub(b.s.now()))
+	} else if delay <= 0 {
+		delay = time.Hour
+	}
 	r.nextServerDelay = 0
 	b.valid = false
 	return b.reportWait(ctx, operation, cause, delay)
@@ -205,17 +223,72 @@ func (b *aliasDeletionBatch) reportWait(ctx context.Context, operation string, c
 	if errors.As(cause, &upstream) && upstream != nil {
 		state.HTTPStatus, state.ServiceCode = upstream.StatusCode, upstream.ServiceCode
 	}
+	clearWait := func() {}
 	if r.report != nil {
-		defer func() {
-			state.Waiting = false
-			r.report(state)
-		}()
+		cleared := false
+		clearWait = func() {
+			if !cleared {
+				cleared = true
+				state.Waiting = false
+				r.report(state)
+			}
+		}
+		defer clearWait()
 		r.report(state)
 	}
 	err := b.waitCooldown(ctx, delay)
+	clearWait()
 	if err != nil && ctx.Err() == nil && b.stopped == nil {
 		// A failing injected waiter must not let the next item bypass a cooldown.
 		b.stopped = err
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// Both locks were released. A directory sync, creation or login may have
+	// rotated credentials during the wait, so the old in-memory session is
+	// never sent again. Recheck immutable identity before accepting the reload.
+	if err := b.beforeResume(ctx); err != nil {
+		return err
+	}
+	wasReady := b.ready
+	b.ready, b.valid = false, false
+	b.directory = nil
+	if wasReady && b.stopped == nil {
+		return b.initialize(ctx)
+	}
+	b.record, b.session, err = b.s.loadSession(ctx, b.accountID)
+	if err != nil {
+		return err
+	}
+	subject, err := aliasDeletionSubject(b.session)
+	if err != nil {
+		return err
+	}
+	if subject != b.subject || b.work != nil && !sameEmail(b.work.AppleID, b.record.AppleID) {
+		return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+	}
+	return nil
+}
+
+func (b *aliasDeletionBatch) beforeResume(ctx context.Context) error {
+	account, err := b.s.repo.GetAccount(ctx, b.accountID)
+	if err != nil {
+		return err
+	}
+	if !sameEmail(account.Email, b.account.Email) || domain.NormalizeMailboxType(account.MailboxType) != domain.NormalizeMailboxType(b.account.MailboxType) {
+		return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+	}
+	b.account = account
+	alias, err := b.repo.GetAlias(ctx, b.aliasID)
+	if err != nil {
+		return err
+	}
+	if alias.AccountID != b.accountID || domain.NormalizeEmail(alias.Address) != b.address {
+		return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+	}
+	if !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending && !b.initialPending[b.aliasID] {
+		return wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, store.ErrAliasConfirmationPending)
+	}
+	return b.checkWork(ctx, false)
 }

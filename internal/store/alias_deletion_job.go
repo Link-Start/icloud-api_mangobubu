@@ -16,8 +16,8 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// ErrAliasDeletionJobConflict covers duplicate job IDs, an existing active job
-// for the owner, and attempts to overwrite a terminal progress snapshot.
+// ErrAliasDeletionJobConflict covers duplicate job IDs, stale work claims,
+// and attempts to overwrite a terminal progress snapshot.
 var ErrAliasDeletionJobConflict = errors.New("alias deletion job conflict")
 
 const maxAliasDeletionJobItems = 1000
@@ -54,26 +54,38 @@ func (s *Store) CreateAliasDeletionJob(ctx context.Context, job domain.AliasDele
 
 // GetAliasDeletionJob deliberately treats another owner's job as missing.
 func (s *Store) GetAliasDeletionJob(ctx context.Context, id string, adminID int64) (domain.AliasDeletionJob, error) {
-	return scanAliasDeletionJob(s.queryRowContext(ctx,
+	job, err := scanAliasDeletionJob(s.queryRowContext(ctx,
 		`SELECT `+aliasDeletionJobColumns+` FROM alias_deletion_jobs WHERE id = ? AND admin_id = ?`,
 		strings.TrimSpace(id), adminID))
+	if err == nil {
+		err = s.hydrateDeletionJobMetadata(ctx, &job)
+	}
+	return job, err
 }
 
 // GetLatestAliasDeletionJob orders by the existing Unix-nanosecond timestamp
 // representation, with a deterministic job-ID tie break for equal timestamps.
 func (s *Store) GetLatestAliasDeletionJob(ctx context.Context, adminID int64) (domain.AliasDeletionJob, error) {
-	return scanAliasDeletionJob(s.queryRowContext(ctx,
+	job, err := scanAliasDeletionJob(s.queryRowContext(ctx,
 		`SELECT `+aliasDeletionJobColumns+` FROM alias_deletion_jobs
 		 WHERE admin_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, adminID))
+	if err == nil {
+		err = s.hydrateDeletionJobMetadata(ctx, &job)
+	}
+	return job, err
 }
 
 // GetActiveAliasDeletionJob is independent of the latest historical job so
 // callers can check for in-flight work before inspecting possibly deleted IDs.
 func (s *Store) GetActiveAliasDeletionJob(ctx context.Context, adminID int64) (domain.AliasDeletionJob, error) {
-	return scanAliasDeletionJob(s.queryRowContext(ctx,
+	job, err := scanAliasDeletionJob(s.queryRowContext(ctx,
 		`SELECT `+aliasDeletionJobColumns+` FROM alias_deletion_jobs
 		 WHERE admin_id = ? AND status IN ('queued', 'running')
 		 ORDER BY created_at DESC, id DESC LIMIT 1`, adminID))
+	if err == nil {
+		err = s.hydrateDeletionJobMetadata(ctx, &job)
+	}
+	return job, err
 }
 
 // SaveAliasDeletionJob atomically replaces progress and optionally appends its
@@ -96,7 +108,8 @@ func (s *Store) SaveAliasDeletionJob(ctx context.Context, job domain.AliasDeleti
 
 	result, err := s.txExecContext(ctx, tx, `
 		UPDATE alias_deletion_jobs SET items_json = ?, status = ?, updated_at = ?
-		WHERE id = ? AND admin_id = ? AND status IN ('queued', 'running')`,
+		WHERE id = ? AND admin_id = ? AND status IN ('queued', 'running')
+		AND NOT EXISTS(SELECT 1 FROM alias_deletion_job_metadata m WHERE m.admin_id = alias_deletion_jobs.admin_id AND m.job_id = alias_deletion_jobs.id AND m.queue_version = 1)`,
 		itemsJSON, job.Status, timestamp(job.UpdatedAt), job.ID, job.AdminID)
 	if err != nil {
 		return fmt.Errorf("save alias deletion job: %w", aliasDeletionJobWriteError(err))
@@ -133,7 +146,8 @@ func (s *Store) SaveAliasDeletionJob(ctx context.Context, job domain.AliasDeleti
 func (s *Store) InterruptAliasDeletionJobs(ctx context.Context) error {
 	_, err := s.execContext(ctx, `
 		UPDATE alias_deletion_jobs SET status = ?, updated_at = ?
-		WHERE status IN ('queued', 'running')`,
+		WHERE status IN ('queued', 'running')
+		AND NOT EXISTS(SELECT 1 FROM alias_deletion_job_metadata m WHERE m.admin_id = alias_deletion_jobs.admin_id AND m.job_id = alias_deletion_jobs.id AND m.queue_version = 1)`,
 		domain.AliasDeletionJobInterrupted, timestamp(s.now()))
 	if err != nil {
 		return fmt.Errorf("interrupt alias deletion jobs: %w", err)

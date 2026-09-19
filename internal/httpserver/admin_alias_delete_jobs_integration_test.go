@@ -54,6 +54,8 @@ func TestAliasDeletionJobTwentyAndThousandContinuePastFourteenAfterDisconnect(t 
 			directoryJSON := adminAPITestJSON(t, map[string]any{"success": true, "result": directory})
 			start, pastFourteen, continueBatch := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			var requests, deleted atomic.Int32
+			virtualNow := time.Now
+			var deletionTimes []time.Time
 			client, err := apple.NewClient(apple.Config{Transport: batchDeletionTestTransport(func(request *http.Request) (*http.Response, error) {
 				requests.Add(1)
 				body := `{"success":true}`
@@ -92,6 +94,17 @@ func TestAliasDeletionJobTwentyAndThousandContinuePastFourteenAfterDisconnect(t 
 								return nil, request.Context().Err()
 							}
 						}
+						now := virtualNow()
+						used := 0
+						for _, at := range deletionTimes {
+							if now.Sub(at) < time.Hour {
+								used++
+							}
+						}
+						if used >= 200 {
+							return nil, fmt.Errorf("fixture observed more than 200 deletes in a rolling hour")
+						}
+						deletionTimes = append(deletionTimes, now)
 						delete(remoteActive, payload.ID)
 						deleted.Add(1)
 					}
@@ -107,6 +120,8 @@ func TestAliasDeletionJobTwentyAndThousandContinuePastFourteenAfterDisconnect(t 
 			// real network request or waits a thousand real-world seconds.
 			clockBase := time.Now().UTC()
 			var clockOffset atomic.Int64
+			virtualNow = func() time.Time { return clockBase.Add(time.Duration(clockOffset.Load())) }
+			env.server.now = virtualNow
 			service, err := hmesync.New(env.store, env.cipher, client, batchDeletionTestLocker{},
 				hmesync.WithClock(func() time.Time { return clockBase.Add(time.Duration(clockOffset.Load())) }),
 				hmesync.WithAliasDeletionWaiter(func(ctx context.Context, delay time.Duration) error {
@@ -156,7 +171,8 @@ func TestAliasDeletionJobTwentyAndThousandContinuePastFourteenAfterDisconnect(t 
 				t.Fatalf("progress after original connection closed = %d %#v", progress.Code, partial)
 			}
 			close(continueBatch)
-			deadline := time.Now().Add(time.Minute)
+			deadline := time.Now().Add(4 * time.Minute)
+			waitRounds := 0
 			var result adminAPIAliasDeletionJobDTO
 			for {
 				job, err := env.store.GetAliasDeletionJob(context.Background(), testAliasDeletionJobID, admin.ID)
@@ -166,6 +182,17 @@ func TestAliasDeletionJobTwentyAndThousandContinuePastFourteenAfterDisconnect(t 
 				result = adminAPIAliasDeletionJobFromRecord(job)
 				if !aliasDeletionJobActive(result.Status) {
 					break
+				}
+				for _, wait := range result.Waits {
+					retryAt, err := time.Parse(time.RFC3339Nano, wait.RetryAt)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if retryAt.After(virtualNow()) {
+						clockOffset.Store(int64(retryAt.Sub(clockBase) + time.Second))
+						waitRounds++
+						env.server.wakeAliasDeletionQueue()
+					}
 				}
 				if time.Now().After(deadline) {
 					t.Fatalf("fixture exceeded deadline at %d/%d", result.Processed, count)
@@ -177,8 +204,11 @@ func TestAliasDeletionJobTwentyAndThousandContinuePastFourteenAfterDisconnect(t 
 			if result.Status != domain.AliasDeletionJobCompleted || result.Requested != count || result.Deleted != count || result.Processed != count || result.Failed != 0 || len(remoteActive) != 0 {
 				t.Fatalf("large batch = status:%s requested:%d deleted:%d processed:%d failed:%d remote:%d", result.Status, result.Requested, result.Deleted, result.Processed, result.Failed, len(remoteActive))
 			}
-			if requests.Load() != int32(2*count+2) {
-				t.Fatalf("Apple requests = %d, want %d", requests.Load(), 2*count+2)
+			if requests.Load() < int32(4*count) {
+				t.Fatalf("fresh per-item reconciliation missing: requests=%d", requests.Load())
+			}
+			if count == 1000 && waitRounds < 4 {
+				t.Fatalf("1000 deletions did not cross the expected hourly waits: %d", waitRounds)
 			}
 			var localAliases, audits int
 			if err := env.store.DB().QueryRow("SELECT COUNT(*) FROM aliases WHERE account_id = ?", account.ID).Scan(&localAliases); err != nil {

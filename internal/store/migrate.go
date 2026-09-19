@@ -118,6 +118,11 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 			return fmt.Errorf("converge sqlite schema: %w", err)
 		}
 	}
+	for _, statement := range append(append([]string{}, aliasDeletionQueueSchemaStatements...), quotaSchemaStatements...) {
+		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
+			return fmt.Errorf("converge sqlite deletion queue: %w", err)
+		}
+	}
 	// Keep validating the durable v6 compatibility tables after repairing them;
 	// this catches malformed hand-edited databases before workers issue writes.
 	if err := s.convergeSQLiteV6Schema(ctx, tx); err != nil {
@@ -231,6 +236,11 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 	for _, statement := range postgresSchemaConvergence {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
 			return fmt.Errorf("converge postgres schema: %w", err)
+		}
+	}
+	for _, statement := range append(append([]string{}, aliasDeletionQueueSchemaStatements...), quotaSchemaStatements...) {
+		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
+			return fmt.Errorf("converge postgres deletion queue: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -577,8 +587,7 @@ const createAliasDeletionJobsTable = `CREATE TABLE IF NOT EXISTS alias_deletion_
 const createAliasDeletionJobsLatestIndex = `CREATE INDEX IF NOT EXISTS alias_deletion_jobs_admin_created_idx
 		ON alias_deletion_jobs(admin_id, created_at DESC, id DESC)`
 
-const createAliasDeletionJobsActiveIndex = `CREATE UNIQUE INDEX IF NOT EXISTS alias_deletion_jobs_active_admin_idx
-		ON alias_deletion_jobs(admin_id) WHERE status IN ('queued', 'running')`
+const createAliasDeletionJobsActiveIndex = `DROP INDEX IF EXISTS alias_deletion_jobs_active_admin_idx`
 
 var sqliteSchemaConvergence = []string{
 	createAliasDeletionJobsTable,

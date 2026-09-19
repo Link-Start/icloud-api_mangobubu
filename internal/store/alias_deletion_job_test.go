@@ -84,7 +84,7 @@ func TestAliasDeletionJobOwnerIsolationAndLatest(t *testing.T) {
 	assertAliasDeletionJobAuditCount(t, s, 0)
 }
 
-func TestAliasDeletionJobConflictAndActiveLimit(t *testing.T) {
+func TestAliasDeletionJobConflictAndTerminalProtection(t *testing.T) {
 	t.Parallel()
 	for _, initial := range []string{domain.AliasDeletionJobQueued, domain.AliasDeletionJobRunning} {
 		for _, terminal := range []string{domain.AliasDeletionJobCompleted, domain.AliasDeletionJobInterrupted} {
@@ -99,7 +99,6 @@ func TestAliasDeletionJobConflictAndActiveLimit(t *testing.T) {
 				mustCreateAliasDeletionJob(t, s, job)
 				for _, conflicting := range []domain.AliasDeletionJob{
 					job,
-					aliasDeletionJobTestFixture("second-active", owner.ID),
 				} {
 					if err := s.CreateAliasDeletionJob(ctx, conflicting); !errors.Is(err, ErrAliasDeletionJobConflict) {
 						t.Fatalf("conflicting create error = %v", err)
@@ -145,7 +144,7 @@ func TestAliasDeletionJobConflictAndActiveLimit(t *testing.T) {
 	}
 }
 
-func TestAliasDeletionJobConcurrentCreateAllowsOneActiveOwner(t *testing.T) {
+func TestAliasDeletionJobConcurrentCreateAllowsMultipleActiveJobs(t *testing.T) {
 	t.Parallel()
 	s := openAliasDeletionJobTestStore(t, filepath.Join(t.TempDir(), "concurrent.db"))
 	owner := createAliasDeletionJobTestAdmin(t, s, "owner")
@@ -173,8 +172,8 @@ func TestAliasDeletionJobConcurrentCreateAllowsOneActiveOwner(t *testing.T) {
 			t.Fatalf("concurrent create error = %v", err)
 		}
 	}
-	if created != 1 {
-		t.Fatalf("successful concurrent creates = %d, want 1", created)
+	if created != attempts {
+		t.Fatalf("successful concurrent creates = %d, want %d", created, attempts)
 	}
 }
 

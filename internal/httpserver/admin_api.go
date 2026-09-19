@@ -88,6 +88,8 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.GET("/aliases", s.adminAPIListAliases)
 	protected.PATCH("/aliases/group", s.adminAPIMoveAliasesToGroup)
 	protected.DELETE("/aliases/batch", s.adminAPIDeleteAliases)
+	protected.GET("/aliases/batch/jobs", s.adminAPIListAliasDeletionJobs)
+	protected.POST("/aliases/batch/jobs/:jobID/cancel", s.adminAPICancelAliasDeletionJob)
 	protected.GET("/aliases/batch/jobs/latest", s.adminAPIGetLatestAliasDeletionJob)
 	protected.GET("/aliases/batch/jobs/:jobID", s.adminAPIGetAliasDeletionJob)
 	protected.GET("/aliases/:id", s.adminAPIGetAlias)

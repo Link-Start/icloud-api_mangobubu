@@ -22,10 +22,11 @@ type aliasThrottleDeadlineBody struct{}
 func (aliasThrottleDeadlineBody) Read([]byte) (int, error) { return 0, context.DeadlineExceeded }
 func (aliasThrottleDeadlineBody) Close() error             { return nil }
 
+// Actual Apple throttles become a durable timer; the worker never sleeps while
+// holding the account or credential rotation locks.
 func TestAliasDeletionJobWaitsOnFirstAppleThrottleWithoutFailingRemainingItems(t *testing.T) {
 	for _, scenario := range []struct{ stop, bodyTimeout bool }{{}, {stop: true}, {bodyTimeout: true}, {stop: true, bodyTimeout: true}} {
 		t.Run(fmt.Sprintf("stop=%t/body-timeout=%t", scenario.stop, scenario.bodyTimeout), func(t *testing.T) {
-			stopWhileWaiting := scenario.stop
 			env := newAdminAPITestEnv(t)
 			cookie, csrf, admin := env.createSession(t, "throttle-wait-admin", "unused-password")
 			account := adminAPITestCreateAccount(t, env, "throttle-owner@icloud.com")
@@ -33,9 +34,7 @@ func TestAliasDeletionJobWaitsOnFirstAppleThrottleWithoutFailingRemainingItems(t
 			second := adminAPITestCreateDeleteAlias(t, env, account.ID, "throttle-second@icloud.com")
 			directory := apple.ListResult{SelectedForwardTo: account.Email, ForwardToEmails: []string{account.Email}}
 			for _, alias := range []domain.Alias{first, second} {
-				directory.Aliases = append(directory.Aliases, apple.Alias{
-					HME: alias.Address, AnonymousID: fmt.Sprint(alias.ID), ForwardToEmail: account.Email, IsActive: true,
-				})
+				directory.Aliases = append(directory.Aliases, apple.Alias{HME: alias.Address, AnonymousID: fmt.Sprint(alias.ID), ForwardToEmail: account.Email, IsActive: true})
 			}
 			directoryJSON := adminAPITestJSON(t, map[string]any{"success": true, "result": directory})
 			var requests, validates atomic.Int32
@@ -43,15 +42,15 @@ func TestAliasDeletionJobWaitsOnFirstAppleThrottleWithoutFailingRemainingItems(t
 				requests.Add(1)
 				status := http.StatusOK
 				headers := http.Header{"Content-Type": []string{"application/json"}}
-				body := `{"success":true}`
+				body := "{\"success\":true}"
 				switch request.URL.Path {
 				case "/setup/ws/1/validate":
 					if validates.Add(1) == 1 {
 						status = http.StatusTooManyRequests
 						headers.Set("Retry-After", "90")
-						body = `{"success":false}`
+						body = "{\"success\":false}"
 					} else {
-						body = `{"dsInfo":{"dsid":"42","primaryEmail":"throttle-apple@example.com","hsaVersion":2},"hsaTrustedBrowser":true,"webservices":{"premiummailsettings":{"url":"https://p01-maildomainws.icloud.com"}}}`
+						body = "{\"dsInfo\":{\"dsid\":\"42\",\"primaryEmail\":\"throttle-apple@example.com\",\"hsaVersion\":2},\"hsaTrustedBrowser\":true,\"webservices\":{\"premiummailsettings\":{\"url\":\"https://p01-maildomainws.icloud.com\"}}}"
 					}
 				case "/v2/hme/list":
 					body = string(directoryJSON)
@@ -70,28 +69,18 @@ func TestAliasDeletionJobWaitsOnFirstAppleThrottleWithoutFailingRemainingItems(t
 			}
 			clockBase := time.Now().UTC()
 			var clockOffset atomic.Int64
-			waiting, resume := make(chan struct{}), make(chan struct{})
-			service, err := hmesync.New(env.store, env.cipher, client, batchDeletionTestLocker{},
-				hmesync.WithClock(func() time.Time { return clockBase.Add(time.Duration(clockOffset.Load())) }),
-				hmesync.WithAliasDeletionWaiter(func(ctx context.Context, delay time.Duration) error {
-					if delay >= time.Minute {
-						if delay < 90*time.Second {
-							return errors.New("server Retry-After was shortened")
-						}
-						close(waiting)
-						select {
-						case <-resume:
-						case <-ctx.Done():
-							return ctx.Err()
-						}
-					}
-					if err := ctx.Err(); err != nil {
-						return err
-					}
-					clockOffset.Add(int64(delay))
-					return nil
-				}),
-			)
+			clock := func() time.Time { return clockBase.Add(time.Duration(clockOffset.Load())) }
+			env.server.now = clock
+			service, err := hmesync.New(env.store, env.cipher, client, batchDeletionTestLocker{}, hmesync.WithClock(clock), hmesync.WithAliasDeletionWaiter(func(ctx context.Context, delay time.Duration) error {
+				if delay >= time.Minute {
+					return errors.New("worker slept through persistent cooldown")
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				clockOffset.Add(int64(delay))
+				return nil
+			}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -104,102 +93,93 @@ func TestAliasDeletionJobWaitsOnFirstAppleThrottleWithoutFailingRemainingItems(t
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = env.store.UpsertAppleWebSession(context.Background(), domain.AppleWebSession{
-				AccountID: account.ID, AppleID: session.AppleID, Region: "global", Authenticated: true,
-				Ciphertext: ciphertext, LastValidatedAt: &session.ValidatedAt,
-			})
-			if err != nil {
+			if _, err := env.store.UpsertAppleWebSession(context.Background(), domain.AppleWebSession{AccountID: account.ID, AppleID: session.AppleID, Region: "global", Authenticated: true, Ciphertext: ciphertext, LastValidatedAt: &session.ValidatedAt}); err != nil {
 				t.Fatal(err)
 			}
 			env.server.SetHMESyncService(service)
 			stop, stopped := startTestAliasDeletionJobs(t, env)
-			response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch?async=1", adminAPITestJSON(t, map[string]any{
-				"alias_ids": []int64{first.ID, second.ID}, "operation_id": testAliasDeletionJobID,
-			}), "application/json", []*http.Cookie{cookie}, csrf)
-			if response.Code != http.StatusAccepted {
-				t.Fatalf("admission = %d %s", response.Code, response.Body.String())
-			}
-			waitTestAliasDeletionSignal(t, waiting)
-			progress := env.request(t, http.MethodGet, "/admin/api/v1/aliases/batch/jobs/"+testAliasDeletionJobID, nil, "", []*http.Cookie{cookie}, "")
-			state := decodeTestAliasDeletionJob(t, progress)
-			if progress.Code != http.StatusOK || state.Status != domain.AliasDeletionJobRunning || state.Processed != 0 || state.Failed != 0 || len(state.Results) != 0 || len(state.Waits) != 1 {
-				t.Fatalf("throttle was fanned out as completed failures: %d %#v", progress.Code, state)
+			submitTestDeletionJob(t, env, cookie, csrf, testAliasDeletionJobID, first.ID, second.ID)
+			job := waitTestAliasDeletionState(t, env, admin.ID, testAliasDeletionJobID, func(job domain.AliasDeletionJob) bool { return job.Items[0].State == domain.AliasDeletionWorkWaiting })
+			state := env.server.adminAPIAliasDeletionJobSnapshot(job)
+			if state.Processed != 0 || state.Pending != 2 || state.Failed != 0 || len(state.Results) != 0 || len(state.Waits) != 1 || len(state.Accounts) != 1 || state.Accounts[0].Status != "waiting" {
+				t.Fatalf("throttle became failure: %#v", state)
 			}
 			wait := state.Waits[0]
-			if wait.AccountID != account.ID || wait.AliasID != first.ID || wait.Operation != "validate" || wait.HTTPStatus != 429 || wait.Attempt != 1 || wait.MaxAttempts != 3 || requests.Load() != 1 {
-				t.Fatalf("waiting evidence = %#v requests=%d", wait, requests.Load())
+			if wait.AccountID != account.ID || wait.AliasID != first.ID || wait.Operation != "validate" || wait.HTTPStatus != 429 || wait.Reason != "upstream_rate_limit" || requests.Load() != 1 {
+				t.Fatalf("wait=%#v requests=%d", wait, requests.Load())
 			}
 			retryAt, err := time.Parse(time.RFC3339Nano, wait.RetryAt)
 			if err != nil || retryAt.Before(clockBase.Add(90*time.Second)) {
-				t.Fatalf("Retry-After deadline = %q err=%v", wait.RetryAt, err)
+				t.Fatalf("retry_at=%s err=%v", wait.RetryAt, err)
 			}
-			if stopWhileWaiting {
+			if scenario.stop {
 				stop()
 				waitTestAliasDeletionSignal(t, stopped)
-			} else {
-				close(resume)
-			}
-			job := waitTestAliasDeletionJob(t, env, admin.ID, testAliasDeletionJobID)
-			final := env.server.adminAPIAliasDeletionJobSnapshot(job)
-			if len(final.Waits) != 0 {
-				t.Error("cooldown leaked into terminal snapshot")
-			}
-			if stopWhileWaiting {
-				if final.Status != domain.AliasDeletionJobInterrupted || final.Deleted != 0 || requests.Load() != 1 {
-					t.Fatalf("shutdown sent another request or lost interruption: %#v requests=%d", final, requests.Load())
+				persisted, err := env.store.GetAliasDeletionJob(context.Background(), testAliasDeletionJobID, admin.ID)
+				if err != nil || persisted.Items[0].Done || persisted.Status == domain.AliasDeletionJobInterrupted || requests.Load() != 1 {
+					t.Fatalf("shutdown lost waiting queue: %#v err=%v", persisted, err)
 				}
-			} else if final.Status != domain.AliasDeletionJobCompleted || final.Deleted != 2 || final.Failed != 0 {
-				t.Fatalf("cooldown recovery failed: %#v", final)
+			} else {
+				clockOffset.Store(int64(retryAt.Sub(clockBase) + time.Second))
+				env.server.wakeAliasDeletionQueue()
+				final := adminAPIAliasDeletionJobFromRecord(waitTestAliasDeletionJob(t, env, admin.ID, testAliasDeletionJobID))
+				if final.Deleted != 2 || final.Failed != 0 || len(final.Waits) != 0 {
+					t.Fatalf("cooldown recovery=%#v", final)
+				}
 			}
 		})
 	}
 }
 
-func TestAliasDeletionWaitStateIsOwnerScopedAndNotACompletedResult(t *testing.T) {
-	env := newAdminAPITestEnv(t)
-	job := domain.AliasDeletionJob{ID: testAliasDeletionJobID, AdminID: 1, Status: domain.AliasDeletionJobRunning,
-		Items: []domain.AliasDeletionJobItem{{ID: 9, Address: "pending@icloud.com"}},
+func TestAliasDeletionWaitSnapshotUsesDurableStateAndSanitizedDiagnostics(t *testing.T) {
+	job := domain.AliasDeletionJob{ID: testAliasDeletionJobID, AdminID: 1, Status: domain.AliasDeletionJobRunning, Items: []domain.AliasDeletionJobItem{
+		{ID: 9, AccountID: 3, Address: "pending@icloud.com", State: domain.AliasDeletionWorkWaiting, RetryAt: time.Now().Add(time.Hour), WaitReason: "quota", Used: 200, Limit: 200, Operation: "secret-token-url", HTTPStatus: -1, ServiceCode: "secret=cookie-value"},
+	}}
+	state := adminAPIAliasDeletionJobFromRecord(job)
+	if state.Processed != 0 || state.Failed != 0 || state.Pending != 1 || len(state.Waits) != 1 {
+		t.Fatalf("waiting counted as completed=%#v", state)
 	}
-	wait := hmesync.AliasDeletionWait{AccountID: 3, AliasID: 9, Operation: "delete", RetryAt: time.Now().Add(time.Minute), Attempt: 1, MaxAttempts: 3, Waiting: true, HTTPStatus: 200, ServiceCode: "-41015"}
-	env.server.recordAliasDeletionWait(job, wait)
-	snapshot := env.server.adminAPIAliasDeletionJobSnapshot(job)
-	if len(snapshot.Waits) != 1 || snapshot.Processed != 0 || snapshot.Failed != 0 || snapshot.Deleted != 0 {
-		t.Fatalf("wait counted as a result: %#v", snapshot)
+	wait := state.Waits[0]
+	if wait.Operation != "" || wait.HTTPStatus != 0 || wait.ServiceCode != "" || wait.Used != 200 || wait.Limit != 200 {
+		t.Fatalf("unsafe diagnostics=%#v", wait)
 	}
-	other := job
-	other.AdminID = 2
-	if len(env.server.adminAPIAliasDeletionJobSnapshot(other).Waits) != 0 {
-		t.Error("same job ID leaked another administrator's wait")
-	}
-	wait.Waiting = false
-	env.server.recordAliasDeletionWait(job, wait)
-	if len(env.server.adminAPIAliasDeletionJobSnapshot(job).Waits) != 0 {
-		t.Error("wait was not cleared")
-	}
-	job.Items[0] = domain.AliasDeletionJobItem{ID: 9, Address: "pending@icloud.com", Done: true, Code: "APPLE_BATCH_DEFERRED", LocalRetained: true}
-	snapshot = adminAPIAliasDeletionJobFromRecord(job)
-	if snapshot.Deferred != 1 || snapshot.Failed != 1 || snapshot.Deleted != 0 {
-		t.Fatalf("unattempted count = %#v", snapshot)
+	job.Items[0].Done = true
+	job.Items[0].State = domain.AliasDeletionWorkCancelled
+	state = adminAPIAliasDeletionJobFromRecord(job)
+	if state.Cancelled != 1 || state.Processed != 1 || state.Failed != 0 || state.Pending != 0 || len(state.Waits) != 0 {
+		t.Fatalf("cancel counted as failure=%#v", state)
 	}
 }
 
-func TestAliasDeletionWaitSanitizesProtocolDiagnostics(t *testing.T) {
+func TestAliasDeletionQuotaErrorsExposeRetryTime(t *testing.T) {
 	env := newAdminAPITestEnv(t)
-	job := domain.AliasDeletionJob{ID: testAliasDeletionJobID, AdminID: 1, Status: domain.AliasDeletionJobRunning}
-	env.server.recordAliasDeletionWait(job, hmesync.AliasDeletionWait{
-		AccountID: 3, AliasID: 4, Operation: "secret-token-url", ServiceCode: "secret=cookie-value", HTTPStatus: -1,
-		RetryAt: time.Now().Add(time.Minute), Attempt: 1, MaxAttempts: 3, Waiting: true,
+	cookie, csrf, _ := env.createSession(t, "quota-api-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "quota-api@icloud.com")
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "quota-api-alias@icloud.com")
+	retryAt := time.Now().UTC().Add(time.Hour)
+	wait := &hmesync.AliasDeletionWaitError{Reason: "quota", RetryAt: retryAt, Used: 200, Limit: 200}
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
+		},
+		deleteAlias: func(context.Context, int64) error { return wait },
+		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			return []hmesync.AliasDeletionOutcome{{AliasID: alias.ID, Err: wait}}, nil
+		},
 	})
-	state := env.server.adminAPIAliasDeletionJobSnapshot(job)
-	if len(state.Waits) != 1 || state.Waits[0].Operation != "" || state.Waits[0].ServiceCode != "" || state.Waits[0].HTTPStatus != 0 {
-		t.Fatalf("unsafe diagnostics were copied: %#v", state.Waits)
+	single := env.request(t, http.MethodDelete, fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID), nil, "", []*http.Cookie{cookie}, csrf)
+	if single.Code != http.StatusTooManyRequests || !strings.Contains(single.Body.String(), "retry_at") || !strings.Contains(single.Body.String(), retryAt.Format(time.RFC3339Nano)) {
+		t.Fatalf("single quota=%d %s", single.Code, single.Body.String())
+	}
+	batch := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{"alias_ids": []int64{alias.ID}}), "application/json", []*http.Cookie{cookie}, csrf)
+	if batch.Code != http.StatusOK || !strings.Contains(batch.Body.String(), "retry_at") || !strings.Contains(batch.Body.String(), retryAt.Format(time.RFC3339Nano)) {
+		t.Fatalf("batch quota=%d %s", batch.Code, batch.Body.String())
 	}
 }
 
 func TestAliasDeletionDeferredCauseDoesNotBecomeAnAppleRequestFailure(t *testing.T) {
-	err := errors.Join(hmesync.ErrBatchDeferred, hmesync.ErrRateLimited)
-	apiErr := adminAPIBatchAliasDeleteError(err)
+	apiErr := adminAPIBatchAliasDeleteError(errors.Join(hmesync.ErrBatchDeferred, hmesync.ErrRateLimited))
 	if apiErr.Code != hmesync.CodeBatchDeferred || !strings.Contains(apiErr.Message, "尚未执行") {
-		t.Fatalf("unattempted item misclassified: %#v", apiErr)
+		t.Fatalf("unattempted item misclassified=%#v", apiErr)
 	}
 }

@@ -114,8 +114,8 @@ func (f *aliasDeletionIsolationFixture) token(accountID int64, call int) string 
 func (f *aliasDeletionIsolationFixture) request(ctx context.Context, session apple.Session, operation, remoteID string) (apple.Session, error) {
 	accountID := f.accounts[session.AppleID]
 	f.locker.mu.Lock()
-	if accountID == 0 || f.locker.held[accountID] != 1 || len(f.locker.held) > 2 {
-		f.t.Error("Apple request escaped its account lock or exceeded two active accounts")
+	if accountID == 0 || f.locker.held[accountID] != 1 {
+		f.t.Error("Apple request escaped its account lock")
 	}
 	f.locker.mu.Unlock()
 	f.mu.Lock()
@@ -307,8 +307,8 @@ func (f *aliasDeletionIsolationFixture) assertLocksReleased() {
 	}
 	f.locker.mu.Lock()
 	defer f.locker.mu.Unlock()
-	if len(f.locker.held) != 0 || f.locker.max > 2 {
-		f.t.Errorf("account lock leaked or active account limit exceeded: held=%v max=%d", f.locker.held, f.locker.max)
+	if len(f.locker.held) != 0 {
+		f.t.Errorf("account lock leaked: held=%v", f.locker.held)
 	}
 	for accountID, states := range f.waits {
 		if len(states) != 2 || !states[0].Waiting || states[1].Waiting || states[0].AccountID != accountID || states[1].AccountID != accountID {
@@ -407,7 +407,7 @@ func TestAliasDeletionRecoveryCancellingCoolingAccountsPreservesHealthyResults(t
 	})
 }
 
-func TestAliasDeletionRecoveryOperationLockWaitersDoNotOccupyBatchCapacity(t *testing.T) {
+func TestAliasDeletionRecoveryCooldownReleasesOperationLocksForOtherWork(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newAliasDeletionIsolationFixture(t, "validate")
 		firstIDs := []int64{101, 201}
@@ -416,9 +416,18 @@ func TestAliasDeletionRecoveryOperationLockWaitersDoNotOccupyBatchCapacity(t *te
 		f.releaseInitialRequests()
 		f.assertWaiting(1)
 		f.assertWaiting(2)
-		// A second batch has two groups behind the first batch's operation
-		// locks. Those parked groups must not consume its two execution slots.
-		secondIDs := []int64{102, 202, 301, 302, 401, 402}
+		// Synchronization and creation use these same operation locks. Neither
+		// suspended deletion may retain the lock throughout the cooldown.
+		for _, accountID := range []int64{1, 2} {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			release, err := f.service.acquireOperation(ctx, accountID)
+			cancel()
+			if err != nil {
+				t.Fatalf("cooldown blocked account %d: %v", accountID, err)
+			}
+			release()
+		}
+		secondIDs := []int64{301, 302, 401, 402}
 		second := f.start(secondIDs)
 		defer second.stop()
 		synctest.Wait()
@@ -427,7 +436,7 @@ func TestAliasDeletionRecoveryOperationLockWaitersDoNotOccupyBatchCapacity(t *te
 		f.assertWaiting(2)
 		second.cancel()
 		f.assertFinished(second, secondIDs)
-		f.assertReported([]int64{102, 202}, context.Canceled)
+		f.assertReported(secondIDs, nil)
 		close(f.gates[2*time.Minute])
 		close(f.gates[3*time.Minute])
 		f.assertFinished(first, firstIDs)

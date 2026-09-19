@@ -484,6 +484,8 @@ func (s *Service) DeleteAlias(ctx context.Context, aliasID int64) error {
 	if aliasID < 1 {
 		return errors.New("alias ID must be positive")
 	}
+	ctx, cancel := context.WithTimeout(ctx, aliasDeletionItemTimeout)
+	defer cancel()
 	deleteRepo, ok := s.repo.(AliasDeletionRepository)
 	if !ok {
 		return errors.New("alias deletion persistence is unavailable")

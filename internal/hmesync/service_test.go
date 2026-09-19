@@ -1890,7 +1890,7 @@ func TestDeleteAliasesUsesAppleFirstWorkflowForEachAlias(t *testing.T) {
 	if client.deactivateCalls.Load() != 2 || client.deleteCalls.Load() != 2 {
 		t.Fatalf("Apple calls: deactivate=%d delete=%d", client.deactivateCalls.Load(), client.deleteCalls.Load())
 	}
-	wantEvents := "validate,list,deactivate:remote-one,delete:remote-one,local:41,deactivate:remote-two,delete:remote-two,local:42"
+	wantEvents := "validate,list,deactivate:remote-one,delete:remote-one,local:41,validate,list,deactivate:remote-two,delete:remote-two,local:42"
 	if got := strings.Join(events, ","); got != wantEvents {
 		t.Fatalf("batch operation order = %q, want %q", got, wantEvents)
 	}

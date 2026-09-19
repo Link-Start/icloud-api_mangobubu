@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -28,6 +29,10 @@ type adminAPIAliasBatchDeleteItemDTO struct {
 	Code          string `json:"code,omitempty"`
 	Message       string `json:"message,omitempty"`
 	LocalRetained bool   `json:"local_retained,omitempty"`
+	RetryAt       string `json:"retry_at,omitempty"`
+	WaitReason    string `json:"wait_reason,omitempty"`
+	Used          int    `json:"used,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
 }
 
 type adminAPIAliasBatchDeleteDTO struct {
@@ -127,6 +132,10 @@ func (s *Server) adminAPIDeleteAliases(c *gin.Context) {
 			}
 			item.Code = apiErr.Code
 			item.Message = apiErr.Message
+			if !apiErr.RetryAt.IsZero() {
+				item.RetryAt = apiErr.RetryAt.UTC().Format(time.RFC3339Nano)
+				item.WaitReason, item.Used, item.Limit = apiErr.WaitReason, apiErr.Used, apiErr.Limit
+			}
 			result.Failed++
 			s.auditAppleAliasDeleteFailure(c, adminSession, aliasID, apiErr)
 		}
@@ -141,16 +150,16 @@ func (s *Server) adminAPIPreflightAliasBatchDelete(
 	adminSession domain.Session,
 	aliasIDs []int64,
 ) (map[int64]domain.Alias, bool) {
-	aliases := make(map[int64]domain.Alias, len(aliasIDs))
+	aliases, err := s.store.GetAliasesByIDs(c.Request.Context(), aliasIDs)
+	if err != nil {
+		s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIBatchAliasDeleteError(err))
+		return nil, false
+	}
 	accounts := make(map[int64]domain.Account)
 	accountOrder := make([]int64, 0, len(aliasIDs))
 
 	for _, aliasID := range aliasIDs {
-		alias, err := s.store.GetAlias(c.Request.Context(), aliasID)
-		if err != nil {
-			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIBatchAliasDeleteError(err))
-			return nil, false
-		}
+		alias := aliases[aliasID]
 		// Pending auto-created aliases are eligible for deletion. The deletion
 		// service refreshes Apple's authoritative directory under the account
 		// lock and removes a locally staged row when Apple omits the address.
@@ -237,6 +246,10 @@ func (s *Server) adminAPIRunAliasBatchDelete(
 }
 
 func adminAPIBatchAliasDeleteError(err error) adminAPIAppleError {
+	var wait *hmesync.AliasDeletionWaitError
+	if errors.As(err, &wait) {
+		return classifyAdminAPIAppleError(err)
+	}
 	if hmesync.Code(err) == hmesync.CodeBatchDeferred || errors.Is(err, hmesync.ErrBatchDeferred) {
 		return adminAPIAppleError{
 			Status: http.StatusConflict, Code: hmesync.CodeBatchDeferred,
@@ -286,5 +299,5 @@ func (s *Server) adminAPIFinishBatchAliasDeleteFailure(
 		"request_id", requestID(c),
 	)
 	s.audit(c, &adminSession.AdminID, adminSession.Username, "delete", "alias", "batch", "failed", apiErr.Code)
-	writeAdminAPIError(c, apiErr.Status, apiErr.Code, apiErr.Message)
+	writeAdminAPIAppleError(c, apiErr)
 }

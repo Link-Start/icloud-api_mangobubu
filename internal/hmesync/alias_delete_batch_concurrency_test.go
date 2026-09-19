@@ -70,7 +70,7 @@ func (l *aliasDeletionKeyedLocker) WithAccountLock(ctx context.Context, id int64
 	return operation()
 }
 
-func TestDeleteAliasesTwoAccountsAtATimeOrderedResultsAndConcurrentProgress(t *testing.T) {
+func TestDeleteAliasesUnlimitedAccountsOrderedResultsAndConcurrentProgress(t *testing.T) {
 	now := time.Now().UTC()
 	base := newFakeRepository(domain.Account{}, now)
 	repo := &aliasDeletionAccountsRepository{fakeRepository: base, accounts: make(map[int64]domain.Account)}
@@ -97,8 +97,8 @@ func TestDeleteAliasesTwoAccountsAtATimeOrderedResultsAndConcurrentProgress(t *t
 	assertLock := func(id int64) {
 		locker.mu.Lock()
 		defer locker.mu.Unlock()
-		if locker.held[id] != 1 || len(locker.held) > 2 {
-			t.Error("account lock escaped or account concurrency exceeded two")
+		if locker.held[id] != 1 {
+			t.Error("Apple request escaped its account lock")
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
@@ -156,7 +156,11 @@ func TestDeleteAliasesTwoAccountsAtATimeOrderedResultsAndConcurrentProgress(t *t
 	var reportsMu sync.Mutex
 	reports := make(map[int64]int)
 	ctx = WithAliasDeletionProgress(ctx, func(outcome AliasDeletionOutcome) {
-		assertLock(outcome.AliasID / 100)
+		locker.mu.Lock()
+		if locker.held[outcome.AliasID/100] != 0 {
+			t.Error("progress callback retained the account lock")
+		}
+		locker.mu.Unlock()
 		if outcome.Err != nil || base.hasAlias(outcome.AliasID) {
 			t.Error("progress not completed durably")
 		}
@@ -178,26 +182,21 @@ func TestDeleteAliasesTwoAccountsAtATimeOrderedResultsAndConcurrentProgress(t *t
 	}
 	done := make(chan result, 1)
 	go func() { out, err := service.DeleteAliases(ctx, ids); done <- result{out, err} }()
-	firstTwo := make(map[int64]bool)
-	for range 2 {
+	firstAccounts := make(map[int64]bool)
+	for range 4 {
 		select {
 		case id := <-entered:
-			firstTwo[id] = true
+			firstAccounts[id] = true
 		case <-ctx.Done():
-			t.Fatal("two accounts did not validate concurrently")
+			t.Fatal("all four accounts did not validate concurrently")
 		}
 	}
-	if len(firstTwo) != 2 {
+	if len(firstAccounts) != 4 {
 		t.Fatal("same account used two workers")
-	}
-	select {
-	case <-entered:
-		t.Error("third account bypassed the worker limit")
-	case <-time.After(30 * time.Millisecond):
 	}
 	validateOnce.Do(func() { close(releaseValidate) })
 	progressAccounts := make(map[int64]bool)
-	for range 2 {
+	for range 4 {
 		select {
 		case id := <-progressEntered:
 			progressAccounts[id] = true
@@ -205,7 +204,7 @@ func TestDeleteAliasesTwoAccountsAtATimeOrderedResultsAndConcurrentProgress(t *t
 			t.Fatal("callbacks were buffered until batch completion or serialized globally")
 		}
 	}
-	if len(progressAccounts) != 2 {
+	if len(progressAccounts) != 4 {
 		t.Error("same-account callbacks overlapped")
 	}
 	progressOnce.Do(func() { close(releaseProgress) })
@@ -222,7 +221,7 @@ func TestDeleteAliasesTwoAccountsAtATimeOrderedResultsAndConcurrentProgress(t *t
 	case <-ctx.Done():
 		t.Fatal("concurrent batch did not finish")
 	}
-	if validates.Load() != 4 || lists.Load() != 4 || client.deleteCalls.Load() != 8 || client.deactivateCalls.Load() != 8 || locker.max != 2 {
+	if validates.Load() != 8 || lists.Load() != 8 || client.deleteCalls.Load() != 8 || client.deactivateCalls.Load() != 8 || locker.max != 4 {
 		t.Error("account concurrency or per-account request counts incorrect")
 	}
 	for id := int64(1); id <= 4; id++ {
@@ -230,9 +229,9 @@ func TestDeleteAliasesTwoAccountsAtATimeOrderedResultsAndConcurrentProgress(t *t
 	}
 }
 
-func TestDeleteAliasesHoldsOperationLockAcrossProgressAndCancelsWaiters(t *testing.T) {
+func TestDeleteAliasesReleasesOperationLockAcrossProgress(t *testing.T) {
 	client := &fakeAppleClient{}
-	service, repo, ids, full := newAliasDeletionBatchFixture(t, 3, client, &fakeLocker{})
+	service, repo, ids, full := newAliasDeletionBatchFixture(t, 4, client, &fakeLocker{})
 	var validates atomic.Int32
 	client.validate = func(_ context.Context, session apple.Session) (apple.Session, error) {
 		validates.Add(1)
@@ -267,17 +266,17 @@ func TestDeleteAliasesHoldsOperationLockAcrossProgressAndCancelsWaiters(t *testi
 	}
 	waiterCtx, cancelWaiter := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancelWaiter()
-	waiterOut, err := service.DeleteAliases(waiterCtx, ids[2:])
-	if err != nil || len(waiterOut) != 1 || !errors.Is(waiterOut[0].Err, context.DeadlineExceeded) {
-		t.Error("same-account batch bypassed operation lock")
+	waiterOut, err := service.DeleteAliases(waiterCtx, ids[2:3])
+	if err != nil || len(waiterOut) != 1 || waiterOut[0].Err != nil {
+		t.Error("progress callback blocked another same-account batch")
 	}
 	singleCtx, cancelSingle := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancelSingle()
-	if err := service.DeleteAlias(singleCtx, ids[2]); !errors.Is(err, context.DeadlineExceeded) {
-		t.Error("single deletion bypassed batch operation lock")
+	if err := service.DeleteAlias(singleCtx, ids[3]); err != nil {
+		t.Error("progress callback blocked single deletion")
 	}
-	if validates.Load() != 1 || client.deleteCalls.Load() != 1 || !repo.hasAlias(ids[2]) {
-		t.Error("waiting cancelled operations performed remote side effects")
+	if validates.Load() != 3 || client.deleteCalls.Load() != 3 || repo.hasAlias(ids[2]) || repo.hasAlias(ids[3]) {
+		t.Error("same-account work failed to interleave between completed items")
 	}
 	once.Do(func() { close(release) })
 	select {

@@ -34,7 +34,7 @@ func newAliasDeletionBatchFixture(t *testing.T, count int, client *fakeAppleClie
 	return service, repo, ids, directory
 }
 
-func TestDeleteAliasesReusesValidationDirectoryAndRollingSession(t *testing.T) {
+func TestDeleteAliasesRefreshesEachItemAndRollingSession(t *testing.T) {
 	for _, count := range []int{1, 5, 1000} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
 			client := &fakeAppleClient{}
@@ -73,13 +73,13 @@ func TestDeleteAliasesReusesValidationDirectoryAndRollingSession(t *testing.T) {
 				return advance(ctx, session), nil
 			}
 			client.deleteRemote = func(ctx context.Context, session apple.Session, id string) (apple.Session, error) {
-				if id != fmt.Sprintf("remote-%d", ids[localDeletes]) || calls != 3+2*localDeletes {
+				if id != fmt.Sprintf("remote-%d", ids[localDeletes]) || calls != 3+4*localDeletes {
 					t.Error("permanent deletion did not follow deactivation")
 				}
 				return advance(ctx, session), nil
 			}
 			repo.deleteAliasFn = func(ctx context.Context, id int64) error {
-				if ctx.Err() != nil || id != ids[localDeletes] || calls != 4+2*localDeletes || len(locker.token) != 0 {
+				if ctx.Err() != nil || id != ids[localDeletes] || calls != 4+4*localDeletes || len(locker.token) != 0 {
 					t.Error("local deletion ran before confirmed remote deletion or outside account lock")
 				}
 				localDeletes++
@@ -95,8 +95,8 @@ func TestDeleteAliasesReusesValidationDirectoryAndRollingSession(t *testing.T) {
 			if err != nil || len(outcomes) != count || reports != count || localDeletes != count {
 				t.Fatalf("batch completion: err=%v items=%d reports=%d local=%d", err, len(outcomes), reports, localDeletes)
 			}
-			if calls != 2*count+2 || validates != 1 || lists != 1 || client.deactivateCalls.Load() != int32(count) || client.deleteCalls.Load() != int32(count) {
-				t.Fatalf("network count: requests=%d want=%d validate=%d list=%d", calls, 2*count+2, validates, lists)
+			if calls != 4*count || validates != count || lists != count || client.deactivateCalls.Load() != int32(count) || client.deleteCalls.Load() != int32(count) {
+				t.Fatalf("network count: requests=%d want=%d validate=%d list=%d", calls, 4*count, validates, lists)
 			}
 			assertStoredAppleSessionToken(t, service, repo, 3, fmt.Sprintf("token-%d", calls))
 		})
@@ -249,10 +249,7 @@ func TestDeleteAliasesAmbiguityRefreshesEntireDirectoryAndNeverRollsBackSession(
 				if repo.hasAlias(ids[1]) != secondFailed || (outcomes[1].Err != nil) != secondFailed {
 					t.Error("second item used stale ownership or failed to recover")
 				}
-				wantLists := 2
-				if recovery == "read failed" {
-					wantLists++
-				}
+				wantLists := 3 // Initial read, ambiguity confirmation, then next item's fresh read.
 				wantMutations := 2
 				if operation == "delete" {
 					wantMutations++

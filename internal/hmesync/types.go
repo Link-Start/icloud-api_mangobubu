@@ -94,6 +94,18 @@ type AliasDeletionRepository interface {
 	DeleteAlias(context.Context, int64) error
 }
 
+// AliasDeletionQuotaRepository is shared by every deletion entry point. The
+// production store implements this durable rolling-hour allowance; optional
+// composition keeps older embedded repositories source compatible.
+type AliasDeletionQuotaRepository interface {
+	GetAliasDeletionQuota(context.Context, string, time.Time) (domain.AliasDeletionQuota, error)
+	ReserveAliasDeletionQuota(context.Context, string, string, time.Time) (domain.AliasDeletionQuota, error)
+	MarkAliasDeletionQuotaSent(context.Context, string, string, time.Time) error
+	CommitAliasDeletionQuota(context.Context, string, string, time.Time) error
+	ReleaseAliasDeletionQuota(context.Context, string, string) error
+	DeferAliasDeletionQuota(context.Context, string, time.Time) error
+}
+
 // AliasDeletionOutcome records one item in a batch deletion. Err is kept as a
 // typed error for the management API to classify without exposing upstream
 // details to the caller.

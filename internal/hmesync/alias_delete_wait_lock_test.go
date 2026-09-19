@@ -43,16 +43,16 @@ func TestAliasDeletionRecoveryReleasesAccountLockDuringCooldown(t *testing.T) {
 						return fmt.Errorf("account setting blocked by cooldown: %w", err)
 					}
 					defer release()
-					// Settings may run, but a second Apple flow must remain blocked
-					// so the cooling batch retains its rolling session and directory.
+					// Sync and creation must acquire the Apple operation lock while
+					// deletion is cooling; the next deletion reloads their session.
 					operationCtx, cancelOperation := context.WithTimeout(ctx, 10*time.Millisecond)
 					defer cancelOperation()
 					releaseOperation, err := f.service.acquireOperation(operationCtx, 3)
 					if releaseOperation != nil {
 						releaseOperation()
 					}
-					if !errors.Is(err, context.DeadlineExceeded) {
-						t.Error("cooldown released the Apple operation lock")
+					if err != nil {
+						t.Errorf("another Apple operation was blocked during deletion cooldown: %v", err)
 					}
 				}
 				return f.clock.wait(ctx, delay)

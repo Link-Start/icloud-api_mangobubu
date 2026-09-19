@@ -10,46 +10,59 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-
 	"icloud-api/internal/apple"
 	"icloud-api/internal/domain"
 	"icloud-api/internal/hmesync"
-	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
 )
 
 const (
-	aliasDeletionJobLimit    = 2
-	aliasDeletionJobTimeout  = 2 * time.Hour
-	aliasDeletionSaveTimeout = 5 * time.Second
+	aliasDeletionItemTimeout      = 5 * time.Minute
+	aliasDeletionSaveTimeout      = 5 * time.Second
+	aliasDeletionAdmissionTimeout = 2 * time.Minute
 )
 
 type aliasDeletionJobRuntime struct {
 	mu              sync.Mutex
 	ctx             context.Context
-	active          map[aliasDeletionJobKey]struct{}
-	waits           map[aliasDeletionJobKey]map[int64]adminAPIAliasDeletionWaitDTO
+	active          map[string]struct{}
+	blocked         map[string]struct{}
+	wake            chan struct{}
 	admission       chan struct{}
 	stopping        bool
 	rotationPending bool
 	wg              sync.WaitGroup
 }
 
-type aliasDeletionJobKey struct {
-	adminID int64
-	id      string
-}
-
 type adminAPIAliasDeletionJobDTO struct {
 	adminAPIAliasBatchDeleteDTO
-	JobID     string                         `json:"job_id"`
-	Status    string                         `json:"status"`
-	Processed int                            `json:"processed"`
-	RequestID string                         `json:"request_id"`
-	CreatedAt string                         `json:"created_at"`
-	UpdatedAt string                         `json:"updated_at"`
-	Deferred  int                            `json:"deferred,omitempty"`
-	Waits     []adminAPIAliasDeletionWaitDTO `json:"waits,omitempty"`
+	JobID           string                            `json:"job_id"`
+	Status          string                            `json:"status"`
+	Processed       int                               `json:"processed"`
+	Pending         int                               `json:"pending"`
+	Cancelled       int                               `json:"cancelled"`
+	CancelRequested bool                              `json:"cancel_requested"`
+	RequestID       string                            `json:"request_id"`
+	CreatedAt       string                            `json:"created_at"`
+	UpdatedAt       string                            `json:"updated_at"`
+	Deferred        int                               `json:"deferred,omitempty"`
+	Waits           []adminAPIAliasDeletionWaitDTO    `json:"waits,omitempty"`
+	Accounts        []adminAPIAliasDeletionAccountDTO `json:"accounts"`
+}
+
+type adminAPIAliasDeletionAccountDTO struct {
+	AccountID    int64  `json:"account_id"`
+	AccountEmail string `json:"account_email"`
+	Status       string `json:"status"`
+	Requested    int    `json:"requested"`
+	Deleted      int    `json:"deleted"`
+	Failed       int    `json:"failed"`
+	Pending      int    `json:"pending"`
+	Cancelled    int    `json:"cancelled"`
+	Used         int    `json:"used"`
+	Limit        int    `json:"limit"`
+	RetryAt      string `json:"retry_at,omitempty"`
+	WaitReason   string `json:"wait_reason,omitempty"`
 }
 
 type adminAPIAliasDeletionWaitDTO struct {
@@ -57,15 +70,17 @@ type adminAPIAliasDeletionWaitDTO struct {
 	AliasID     int64  `json:"alias_id"`
 	Operation   string `json:"operation"`
 	RetryAt     string `json:"retry_at"`
-	Attempt     int    `json:"attempt"`
-	MaxAttempts int    `json:"max_attempts"`
+	Reason      string `json:"reason,omitempty"`
+	Used        int    `json:"used"`
+	Limit       int    `json:"limit"`
+	Attempt     int    `json:"attempt,omitempty"`
+	MaxAttempts int    `json:"max_attempts,omitempty"`
 	HTTPStatus  int    `json:"http_status,omitempty"`
 	ServiceCode string `json:"service_code,omitempty"`
 }
 
-// StartAliasDeletionJobs must run once before serving HTTP in a single-writer
-// deployment. Interrupted jobs are observable but never automatically replayed:
-// a crash can happen between an irreversible Apple call and its local checkpoint.
+// New queue records resume with reconciliation after restart; legacy jobs
+// retain their interrupted outcome. Start once before serving HTTP.
 func (s *Server) StartAliasDeletionJobs(ctx context.Context) error {
 	runtime := &s.aliasDeletionJobs
 	runtime.mu.Lock()
@@ -73,34 +88,111 @@ func (s *Server) StartAliasDeletionJobs(ctx context.Context) error {
 	if runtime.ctx != nil {
 		return errors.New("alias deletion jobs already started")
 	}
-	if err := s.store.InterruptAliasDeletionJobs(ctx); err != nil {
+	if err := s.store.RecoverAliasDeletionQueue(ctx); err != nil {
 		return err
 	}
 	runtime.ctx = ctx
-	runtime.active = make(map[aliasDeletionJobKey]struct{})
+	runtime.active = make(map[string]struct{})
+	runtime.blocked = make(map[string]struct{})
+	runtime.wake = make(chan struct{}, 1)
 	return nil
 }
 
-// RunAliasDeletionJobs owns all accepted goroutines until their bounded
-// persistence has finished, so process shutdown does not close their database.
 func (s *Server) RunAliasDeletionJobs() {
 	runtime := &s.aliasDeletionJobs
 	runtime.mu.Lock()
-	ctx := runtime.ctx
+	ctx, wake := runtime.ctx, runtime.wake
 	runtime.mu.Unlock()
 	if ctx == nil {
 		return
 	}
-	<-ctx.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		s.dispatchAliasDeletionQueue(ctx)
+		select {
+		case <-ctx.Done():
+		case <-wake:
+		case <-ticker.C:
+		}
+	}
 	runtime.mu.Lock()
 	runtime.stopping = true
 	runtime.mu.Unlock()
 	runtime.wg.Wait()
 }
 
-// Rotation must not wait behind an hour-long background read lock and block
-// every progress poll. Admission and rotation use the same mutex to close the
-// check/start race before the existing credential lock is acquired.
+func (s *Server) wakeAliasDeletionQueue() {
+	runtime := &s.aliasDeletionJobs
+	runtime.mu.Lock()
+	wake := runtime.wake
+	runtime.mu.Unlock()
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+// Waiting work occupies neither an account lock nor an execution slot.
+// There is deliberately no cross-account concurrency semaphore.
+func (s *Server) dispatchAliasDeletionQueue(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	// Let short SQL transactions finish during shutdown. Cancelling a scan
+	// mid-query can outlive its caller inside database/sql and the SQLite driver.
+	// The parent is checked before any claim or remote execution starts.
+	scanContext, cancelScan := context.WithTimeout(context.WithoutCancel(ctx), aliasDeletionSaveTimeout)
+	heads, err := s.store.ListAliasDeletionQueueHeads(scanContext, s.now().UTC())
+	cancelScan()
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.Error("读取 Apple 删除队列失败")
+		}
+		return
+	}
+	runtime := &s.aliasDeletionJobs
+	for _, head := range heads {
+		runtime.mu.Lock()
+		_, active := runtime.active[head.AppleSubject]
+		_, blocked := runtime.blocked[head.AppleSubject]
+		if runtime.stopping || ctx.Err() != nil || runtime.rotationPending || active || blocked {
+			runtime.mu.Unlock()
+			continue
+		}
+		// A rotation writer must never park all accounts behind a blocking RLock.
+		if !s.credentialRotationMu.TryRLock() {
+			runtime.mu.Unlock()
+			continue
+		}
+		claimContext, cancelClaim := context.WithTimeout(context.WithoutCancel(ctx), aliasDeletionSaveTimeout)
+		work, claimErr := s.store.ClaimAliasDeletionWork(claimContext, head.ID, s.now().UTC())
+		cancelClaim()
+		if claimErr != nil {
+			s.credentialRotationMu.RUnlock()
+			runtime.mu.Unlock()
+			if !errors.Is(claimErr, store.ErrNotFound) && ctx.Err() == nil {
+				s.logger.Error("领取 Apple 删除队列项目失败", "account_id", head.AccountID)
+			}
+			continue
+		}
+		runtime.active[work.AppleSubject] = struct{}{}
+		runtime.wg.Add(1)
+		runtime.mu.Unlock()
+		go func() {
+			defer runtime.wg.Done()
+			defer func() {
+				s.credentialRotationMu.RUnlock()
+				runtime.mu.Lock()
+				delete(runtime.active, work.AppleSubject)
+				runtime.mu.Unlock()
+				s.wakeAliasDeletionQueue()
+			}()
+			s.runAliasDeletionWork(ctx, work)
+		}()
+	}
+}
+
 func (s *Server) beginAliasDeletionCredentialRotation() (func(), bool) {
 	runtime := &s.aliasDeletionJobs
 	runtime.mu.Lock()
@@ -114,6 +206,7 @@ func (s *Server) beginAliasDeletionCredentialRotation() (func(), bool) {
 		runtime.mu.Lock()
 		runtime.rotationPending = false
 		runtime.mu.Unlock()
+		s.wakeAliasDeletionQueue()
 	}, true
 }
 
@@ -122,8 +215,7 @@ func validAliasDeletionJobID(id string) bool {
 		return false
 	}
 	for _, char := range id {
-		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
-			(char >= '0' && char <= '9') || char == '-' || char == '_') {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_') {
 			return false
 		}
 	}
@@ -136,9 +228,6 @@ func (s *Server) adminAPIStartAliasDeletionJob(c *gin.Context, admin domain.Sess
 		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请提供 16–128 位字母、数字、连字符或下划线组成的 operation_id")
 		return
 	}
-	// Serialize query -> preflight -> insertion for competing submissions.
-	// A same-key retry must see its predecessor before any stale-alias or
-	// active/capacity rejection. Progress reads and execution never take this gate.
 	runtime := &s.aliasDeletionJobs
 	runtime.mu.Lock()
 	if runtime.admission == nil {
@@ -154,8 +243,8 @@ func (s *Server) adminAPIStartAliasDeletionJob(c *gin.Context, admin domain.Sess
 		writeAdminAPIError(c, apiErr.Status, apiErr.Code, apiErr.Message)
 		return
 	}
-	// Consult the idempotency key before looking up aliases: completed jobs
-	// have already removed some or all of those local IDs.
+	// Retry the idempotency key before alias lookup, including after a completed
+	// job has removed its local aliases.
 	job, err := s.store.GetAliasDeletionJob(c.Request.Context(), input.OperationID, admin.AdminID)
 	if err == nil {
 		s.adminAPIReplyExistingAliasDeletionJob(c, job, input.AliasIDs)
@@ -165,34 +254,42 @@ func (s *Server) adminAPIStartAliasDeletionJob(c *gin.Context, admin domain.Sess
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	latest, err := s.store.GetActiveAliasDeletionJob(c.Request.Context(), admin.AdminID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	if err == nil && aliasDeletionJobActive(latest.Status) {
-		writeAdminAPIError(c, http.StatusConflict, "BATCH_DELETE_IN_PROGRESS", "已有后台删除任务，请先查看该任务的进度")
-		return
-	}
+	admissionContext, cancelAdmission := context.WithTimeout(context.WithoutCancel(c.Request.Context()), aliasDeletionAdmissionTimeout)
+	defer cancelAdmission()
+	c.Request = c.Request.WithContext(admissionContext)
 	aliases, ok := s.adminAPIPreflightAliasBatchDelete(c, admin, input.AliasIDs)
 	if !ok {
 		return
 	}
-	job = domain.AliasDeletionJob{
-		ID: input.OperationID, AdminID: admin.AdminID, RequestID: requestID(c),
-		Status: domain.AliasDeletionJobQueued, CreatedAt: s.now().UTC(), UpdatedAt: s.now().UTC(),
-		Items: make([]domain.AliasDeletionJobItem, 0, len(input.AliasIDs)),
-	}
+	// Browser disconnect after authorization/preflight must not strand admission.
+	targets := make([]domain.AliasDeletionWork, 0, len(input.AliasIDs))
+	prepared := make(map[int64]domain.AliasDeletionWork)
 	for _, id := range input.AliasIDs {
-		job.Items = append(job.Items, domain.AliasDeletionJobItem{ID: id, Address: aliases[id].Address})
+		alias := aliases[id]
+		target, found := prepared[alias.AccountID]
+		if !found {
+			var prepareErr error
+			target, prepareErr = s.prepareAliasDeletionWork(admissionContext, alias)
+			if prepareErr == nil && target.AccountID != alias.AccountID {
+				prepareErr = hmesync.ErrAccountChanged
+			}
+			if prepareErr != nil {
+				s.adminAPIFinishBatchAliasDeleteFailure(c, admin, adminAPIBatchAliasDeleteError(prepareErr))
+				return
+			}
+			prepared[alias.AccountID] = target
+		}
+		target.AliasID, target.Address = alias.ID, alias.Address
+		targets = append(targets, target)
 	}
-	rawSession, err := c.Cookie(sessionCookie)
-	if err != nil {
-		writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已失效")
-		return
+	job = domain.AliasDeletionJob{
+		ID: input.OperationID, AdminID: admin.AdminID, RequestID: requestID(c), Status: domain.AliasDeletionJobQueued,
+		QueueVersion: 1, AuthorizingPasswordVersion: admin.PasswordVersion, Username: admin.Username, IP: c.ClientIP(),
+		CreatedAt: s.now().UTC(), UpdatedAt: s.now().UTC(), Items: make([]domain.AliasDeletionJobItem, 0, len(input.AliasIDs)),
 	}
-	sessionHash := secure.HashToken(rawSession)
-	ip := c.ClientIP()
+	for _, target := range targets {
+		job.Items = append(job.Items, domain.AliasDeletionJobItem{ID: target.AliasID, Address: target.Address, AccountID: target.AccountID})
+	}
 	runtime.mu.Lock()
 	if runtime.ctx == nil || runtime.stopping || runtime.ctx.Err() != nil {
 		runtime.mu.Unlock()
@@ -204,49 +301,36 @@ func (s *Server) adminAPIStartAliasDeletionJob(c *gin.Context, admin domain.Sess
 		writeAdminAPIError(c, http.StatusConflict, "BATCH_DELETE_IN_PROGRESS", "正在轮换凭证，请完成后重新登录再提交删除任务")
 		return
 	}
-	if len(runtime.active) >= aliasDeletionJobLimit {
-		runtime.mu.Unlock()
-		writeAdminAPIError(c, http.StatusTooManyRequests, "BATCH_DELETE_BUSY", "后台删除任务已满，请稍后提交")
-		return
-	}
-	// Admission is short and bounded, but cannot share the connection's
-	// cancellation: a disconnect just after INSERT must not strand a queued
-	// task without its in-process owner.
-	admissionContext, cancelAdmission := context.WithTimeout(context.WithoutCancel(c.Request.Context()), aliasDeletionSaveTimeout)
-	err = s.store.CreateAliasDeletionJob(admissionContext, job)
-	cancelAdmission()
+	job, err = s.store.EnqueueAliasDeletionJob(admissionContext, job, targets)
+	runtime.mu.Unlock()
 	if err != nil {
-		runtime.mu.Unlock()
 		if errors.Is(err, store.ErrAliasDeletionJobConflict) {
-			existing, lookupErr := s.store.GetAliasDeletionJob(c.Request.Context(), input.OperationID, admin.AdminID)
+			existing, lookupErr := s.store.GetAliasDeletionJob(admissionContext, input.OperationID, admin.AdminID)
 			if lookupErr == nil {
 				s.adminAPIReplyExistingAliasDeletionJob(c, existing, input.AliasIDs)
 			} else {
-				writeAdminAPIError(c, http.StatusConflict, "BATCH_DELETE_IN_PROGRESS", "已有后台删除任务或任务编号冲突，请先查看任务进度")
+				writeAdminAPIError(c, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "任务编号冲突，请重新提交")
 			}
-			return
+		} else {
+			s.writeAdminAPIInternalError(c, err)
 		}
-		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	key := aliasDeletionJobKey{adminID: job.AdminID, id: job.ID}
-	runtime.active[key] = struct{}{}
-	runtime.wg.Add(1)
-	workerContext := runtime.ctx
-	// Copy before starting the worker: the worker mutates its own item slice.
-	dto := adminAPIAliasDeletionJobFromRecord(job)
-	job.Items = append([]domain.AliasDeletionJobItem(nil), job.Items...)
-	runtime.mu.Unlock()
-	go func() {
-		defer func() {
-			runtime.mu.Lock()
-			delete(runtime.active, key)
-			runtime.mu.Unlock()
-			runtime.wg.Done()
-		}()
-		s.runAliasDeletionJob(workerContext, job, admin, sessionHash, ip)
-	}()
-	writeAdminAPIData(c, http.StatusAccepted, dto)
+	s.wakeAliasDeletionQueue()
+	writeAdminAPIData(c, http.StatusAccepted, s.adminAPIAliasDeletionJobSnapshot(job))
+}
+
+func (s *Server) prepareAliasDeletionWork(ctx context.Context, alias domain.Alias) (domain.AliasDeletionWork, error) {
+	if queued, ok := s.hmeSync.(HMEQueuedDeletionService); ok {
+		return queued.PrepareAliasDeletion(ctx, alias.ID)
+	}
+	// Existing embedders still execute one item at a time. Production supplies
+	// the verified Apple identity through HMEQueuedDeletionService.
+	account, err := s.store.GetAccount(ctx, alias.AccountID)
+	if err != nil {
+		return domain.AliasDeletionWork{}, err
+	}
+	return domain.AliasDeletionWork{AccountID: account.ID, AliasID: alias.ID, Address: alias.Address, AccountEmail: account.Email, AppleSubject: "account:" + strconv.FormatInt(account.ID, 10)}, nil
 }
 
 func (s *Server) adminAPIReplyExistingAliasDeletionJob(c *gin.Context, job domain.AliasDeletionJob, ids []int64) {
@@ -285,74 +369,174 @@ func (s *Server) adminAPIGetAliasDeletionJob(c *gin.Context) {
 	writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
 }
 
-func (s *Server) adminAPIGetLatestAliasDeletionJob(c *gin.Context) {
+func (s *Server) adminAPIListAliasDeletionJobs(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	job, err := s.store.GetActiveAliasDeletionJob(c.Request.Context(), mustSession(c).AdminID)
-	if errors.Is(err, store.ErrNotFound) {
-		job, err = s.store.GetLatestAliasDeletionJob(c.Request.Context(), mustSession(c).AdminID)
-	}
-	if errors.Is(err, store.ErrNotFound) {
-		writeAdminAPIData(c, http.StatusOK, nil)
-		return
-	}
+	jobs, err := s.store.ListAliasDeletionJobs(c.Request.Context(), mustSession(c).AdminID, 20)
 	if err != nil {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
+	result := make([]adminAPIAliasDeletionJobDTO, 0, len(jobs))
+	for _, job := range jobs {
+		result = append(result, s.adminAPIAliasDeletionJobSnapshot(job))
+	}
+	writeAdminAPIData(c, http.StatusOK, gin.H{"jobs": result})
+}
+
+func (s *Server) adminAPICancelAliasDeletionJob(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	if !validAliasDeletionJobID(c.Param("jobID")) {
+		writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "删除任务不存在")
+		return
+	}
+	job, err := s.store.CancelAliasDeletionJob(c.Request.Context(), c.Param("jobID"), mustSession(c).AdminID)
+	if err != nil {
+		s.writeAdminAPIStoreReadError(c, err)
+		return
+	}
+	s.wakeAliasDeletionQueue()
 	writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
+}
+
+func (s *Server) adminAPIGetLatestAliasDeletionJob(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	jobs, err := s.store.ListAliasDeletionJobs(c.Request.Context(), mustSession(c).AdminID, 1)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	if len(jobs) == 0 {
+		writeAdminAPIData(c, http.StatusOK, nil)
+		return
+	}
+	for _, job := range jobs {
+		if aliasDeletionJobActive(job.Status) {
+			writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
+			return
+		}
+	}
+	writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(jobs[0]))
 }
 
 func adminAPIAliasDeletionJobFromRecord(job domain.AliasDeletionJob) adminAPIAliasDeletionJobDTO {
 	dto := adminAPIAliasDeletionJobDTO{
-		JobID: job.ID, Status: job.Status, RequestID: job.RequestID,
+		JobID: job.ID, Status: job.Status, RequestID: job.RequestID, CancelRequested: job.CancelRequested,
 		CreatedAt: job.CreatedAt.UTC().Format(time.RFC3339Nano), UpdatedAt: job.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		adminAPIAliasBatchDeleteDTO: adminAPIAliasBatchDeleteDTO{
-			Requested: len(job.Items), Results: make([]adminAPIAliasBatchDeleteItemDTO, 0, len(job.Items)),
-		},
+		Accounts:                    make([]adminAPIAliasDeletionAccountDTO, 0),
+		adminAPIAliasBatchDeleteDTO: adminAPIAliasBatchDeleteDTO{Requested: len(job.Items), Results: make([]adminAPIAliasBatchDeleteItemDTO, 0, len(job.Items))},
 	}
+	accounts := make(map[int64]*adminAPIAliasDeletionAccountDTO)
+	waits := make(map[int64]adminAPIAliasDeletionWaitDTO)
+	rank := map[string]int{"completed": 0, "cancelled": 1, "queued": 2, "waiting": 3, "paused": 4, "running": 5}
 	for _, item := range job.Items {
-		if !item.Done && job.Status != domain.AliasDeletionJobInterrupted {
-			continue
+		account := accounts[item.AccountID]
+		if account == nil {
+			account = &adminAPIAliasDeletionAccountDTO{AccountID: item.AccountID, AccountEmail: item.AccountEmail, Status: "completed", Limit: 200}
+			accounts[item.AccountID] = account
 		}
-		result := adminAPIAliasBatchDeleteItemDTO{
-			ID: item.ID, Address: item.Address, Deleted: item.Deleted, Code: item.Code,
-			Message: item.Message, LocalRetained: item.LocalRetained,
+		account.Requested++
+		if item.Used > account.Used {
+			account.Used = item.Used
+		}
+		if item.Limit > 0 {
+			account.Limit = item.Limit
+		}
+		state := item.State
+		if state == domain.AliasDeletionWorkPending || state == "" {
+			state = "queued"
 		}
 		if item.Done {
 			dto.Processed++
-		} else {
-			result.Code = "BATCH_DELETE_INTERRUPTED"
-			result.Message = "任务已中断，该邮箱的 Apple 删除结果尚未确认，请刷新 Apple 目录核对后再操作"
-			result.LocalRetained = false
+			if state == domain.AliasDeletionWorkCancelled {
+				dto.Cancelled++
+				account.Cancelled++
+				if rank["cancelled"] > rank[account.Status] {
+					account.Status = "cancelled"
+				}
+				continue
+			}
+			result := adminAPIAliasBatchDeleteItemDTO{ID: item.ID, Address: item.Address, Deleted: item.Deleted, Code: item.Code, Message: item.Message, LocalRetained: item.LocalRetained}
+			if item.Deleted {
+				dto.Deleted++
+				account.Deleted++
+			} else {
+				dto.Failed++
+				account.Failed++
+				if item.Code == "APPLE_BATCH_DEFERRED" {
+					dto.Deferred++
+				}
+			}
+			dto.Results = append(dto.Results, result)
+			continue
 		}
-		if result.Deleted {
-			dto.Deleted++
-		} else {
+		if job.Status == domain.AliasDeletionJobInterrupted {
 			dto.Failed++
-			if item.Done && item.Code == "APPLE_BATCH_DEFERRED" {
-				dto.Deferred++
+			account.Failed++
+			dto.Results = append(dto.Results, adminAPIAliasBatchDeleteItemDTO{ID: item.ID, Address: item.Address, Code: "BATCH_DELETE_INTERRUPTED", Message: "任务已中断，该邮箱的 Apple 删除结果尚未确认，请刷新 Apple 目录核对后再操作"})
+			continue
+		}
+		dto.Pending++
+		account.Pending++
+		if rank[state] > rank[account.Status] {
+			account.Status = state
+		}
+		if !item.RetryAt.IsZero() {
+			retryAt := item.RetryAt.UTC().Format(time.RFC3339Nano)
+			if account.RetryAt == "" || retryAt < account.RetryAt {
+				account.RetryAt = retryAt
+				account.WaitReason = item.WaitReason
+			}
+			if _, exists := waits[item.AccountID]; !exists {
+				wait := adminAPIAliasDeletionWaitDTO{AccountID: item.AccountID, AliasID: item.ID, Operation: aliasDeletionOperationName(item.Operation), RetryAt: retryAt, Reason: item.WaitReason, Used: item.Used, Limit: account.Limit, HTTPStatus: item.HTTPStatus, ServiceCode: sanitizedAliasDeletionServiceCode(item.ServiceCode)}
+				if wait.HTTPStatus < 100 || wait.HTTPStatus > 599 {
+					wait.HTTPStatus = 0
+				}
+				waits[item.AccountID] = wait
 			}
 		}
-		dto.Results = append(dto.Results, result)
 	}
+	for _, account := range accounts {
+		if account.AccountID < 1 {
+			continue
+		}
+		dto.Accounts = append(dto.Accounts, *account)
+	}
+	for _, wait := range waits {
+		dto.Waits = append(dto.Waits, wait)
+	}
+	sort.Slice(dto.Accounts, func(i, j int) bool { return dto.Accounts[i].AccountID < dto.Accounts[j].AccountID })
+	sort.Slice(dto.Waits, func(i, j int) bool { return dto.Waits[i].AccountID < dto.Waits[j].AccountID })
 	return dto
 }
 
-// Cooldown deadlines are process diagnostics, not completed item outcomes.
-// After a restart durable jobs become interrupted and no stale wait is shown.
 func (s *Server) adminAPIAliasDeletionJobSnapshot(job domain.AliasDeletionJob) adminAPIAliasDeletionJobDTO {
 	dto := adminAPIAliasDeletionJobFromRecord(job)
-	if !aliasDeletionJobActive(job.Status) {
-		return dto
+	subjects := make(map[int64]string)
+	for _, item := range job.Items {
+		if item.AppleSubject != "" {
+			subjects[item.AccountID] = item.AppleSubject
+		}
 	}
-	key := aliasDeletionJobKey{adminID: job.AdminID, id: job.ID}
-	runtime := &s.aliasDeletionJobs
-	runtime.mu.Lock()
-	for _, wait := range runtime.waits[key] {
-		dto.Waits = append(dto.Waits, wait)
+	quotas := make(map[string]domain.AliasDeletionQuota)
+	ctx, cancel := context.WithTimeout(context.Background(), aliasDeletionSaveTimeout)
+	defer cancel()
+	for index := range dto.Accounts {
+		account := &dto.Accounts[index]
+		subject := subjects[account.AccountID]
+		if subject == "" {
+			continue
+		}
+		quota, present := quotas[subject]
+		if !present {
+			var err error
+			quota, err = s.store.GetAliasDeletionQuota(ctx, subject, s.now().UTC())
+			if err != nil {
+				continue
+			}
+			quotas[subject] = quota
+		}
+		account.Used, account.Limit = quota.Used, quota.Limit
 	}
-	runtime.mu.Unlock()
-	sort.Slice(dto.Waits, func(i, j int) bool { return dto.Waits[i].AccountID < dto.Waits[j].AccountID })
 	return dto
 }
 
@@ -383,207 +567,119 @@ func aliasDeletionOperationName(op string) string {
 	}
 }
 
-func (s *Server) recordAliasDeletionWait(job domain.AliasDeletionJob, wait hmesync.AliasDeletionWait) {
-	key := aliasDeletionJobKey{adminID: job.AdminID, id: job.ID}
-	runtime := &s.aliasDeletionJobs
-	runtime.mu.Lock()
-	if !wait.Waiting {
-		delete(runtime.waits[key], wait.AccountID)
-		if len(runtime.waits[key]) == 0 {
-			delete(runtime.waits, key)
-		}
-		runtime.mu.Unlock()
-		return
-	}
-	if wait.AccountID < 1 || wait.AliasID < 1 || wait.RetryAt.IsZero() || wait.Attempt < 1 || wait.MaxAttempts < wait.Attempt {
-		runtime.mu.Unlock()
-		return
-	}
-	if runtime.waits == nil {
-		runtime.waits = make(map[aliasDeletionJobKey]map[int64]adminAPIAliasDeletionWaitDTO)
-	}
-	if runtime.waits[key] == nil {
-		runtime.waits[key] = make(map[int64]adminAPIAliasDeletionWaitDTO)
-	}
-	dto := adminAPIAliasDeletionWaitDTO{
-		AccountID: wait.AccountID, AliasID: wait.AliasID, Operation: aliasDeletionOperationName(wait.Operation),
-		RetryAt: wait.RetryAt.UTC().Format(time.RFC3339Nano), Attempt: wait.Attempt, MaxAttempts: wait.MaxAttempts,
-		HTTPStatus: wait.HTTPStatus, ServiceCode: sanitizedAliasDeletionServiceCode(wait.ServiceCode),
-	}
-	if dto.HTTPStatus < 100 || dto.HTTPStatus > 599 {
-		dto.HTTPStatus = 0
-	}
-	runtime.waits[key][wait.AccountID] = dto
-	runtime.mu.Unlock()
-	s.logger.Warn("Apple 批量删除遇到限流，等待后核对状态继续",
-		"job_id", job.ID, "request_id", job.RequestID, "account_id", dto.AccountID, "alias_id", dto.AliasID,
-		"operation", dto.Operation, "upstream_status", dto.HTTPStatus, "upstream_code", dto.ServiceCode,
-		"retry_at", dto.RetryAt, "attempt", dto.Attempt, "max_attempts", dto.MaxAttempts,
-	)
-}
-
-func (s *Server) saveAliasDeletionJob(job domain.AliasDeletionJob, audit *domain.AuditLog) error {
-	ctx, cancel := context.WithTimeout(context.Background(), aliasDeletionSaveTimeout)
+func (s *Server) runAliasDeletionWork(parent context.Context, work domain.AliasDeletionWork) {
+	ctx, cancel := context.WithTimeout(parent, aliasDeletionItemTimeout)
 	defer cancel()
-	return s.store.SaveAliasDeletionJob(ctx, job, audit)
-}
-
-func (s *Server) runAliasDeletionJob(parent context.Context, job domain.AliasDeletionJob, admin domain.Session, sessionHash []byte, ip string) {
-	ctx, cancel := context.WithTimeout(parent, aliasDeletionJobTimeout)
-	defer cancel()
-	defer func() {
-		runtime := &s.aliasDeletionJobs
-		runtime.mu.Lock()
-		delete(runtime.waits, aliasDeletionJobKey{adminID: job.AdminID, id: job.ID})
-		runtime.mu.Unlock()
-	}()
-	var progressMu sync.Mutex
-	var persistenceErr error
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			// Never log a panic value: Apple/session adapters can embed secrets.
-			s.logger.Error("后台删除任务异常中断", "job_id", job.ID, "request_id", job.RequestID)
+			// Panic values may contain credentials; retain only reconciliation state.
+			work.Status, work.Reconcile = domain.AliasDeletionWorkPaused, true
+			work.WaitReason, work.NextRunAt = "execution_error", s.now().UTC().Add(time.Minute)
+			s.logger.Error("Apple 删除队列执行异常，已暂停核对", "account_id", work.AccountID, "alias_id", work.AliasID)
 		}
-		progressMu.Lock()
-		defer progressMu.Unlock()
-		if aliasDeletionJobActive(job.Status) {
-			job.Status = domain.AliasDeletionJobInterrupted
-			job.UpdatedAt = s.now().UTC()
-			if err := s.saveAliasDeletionJob(job, nil); err != nil {
-				s.logger.Error("保存后台删除任务终态失败", "job_id", job.ID, "request_id", job.RequestID)
-			}
+		work.UpdatedAt = s.now().UTC()
+		saveContext, cancelSave := context.WithTimeout(context.Background(), aliasDeletionSaveTimeout)
+		defer cancelSave()
+		if err := s.store.SaveAliasDeletionWork(saveContext, work); err != nil {
+			runtime := &s.aliasDeletionJobs
+			runtime.mu.Lock()
+			runtime.blocked[work.AppleSubject] = struct{}{}
+			runtime.mu.Unlock()
+			s.logger.Error("保存 Apple 删除进度失败，已停止该主号后续删除", "account_id", work.AccountID, "alias_id", work.AliasID)
 		}
 	}()
-
-	// The task was authorized by the accepted request. Recheck after acquiring
-	// the same rotation guard; never retain a gin.Context or raw session cookie.
-	for !s.credentialRotationMu.TryRLock() {
-		timer := time.NewTimer(10 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
-	defer s.credentialRotationMu.RUnlock()
-	if ctx.Err() != nil {
+	if parent.Err() != nil {
+		work.Status = domain.AliasDeletionWorkPending
 		return
 	}
-	current, err := s.store.GetSessionByHash(ctx, sessionHash)
-	if err != nil || current.AdminID != admin.AdminID || current.PasswordVersion != admin.PasswordVersion {
+	wanted, err := s.store.AliasDeletionWorkWanted(ctx, work.ID)
+	if err != nil {
+		work.Status, work.Reconcile = domain.AliasDeletionWorkPaused, true
+		work.NextRunAt, work.WaitReason = s.now().UTC().Add(time.Minute), "storage_error"
 		return
 	}
-	job.Status = domain.AliasDeletionJobRunning
-	job.UpdatedAt = s.now().UTC()
-	if err := s.saveAliasDeletionJob(job, nil); err != nil {
+	if !wanted && !work.Reconcile {
+		work.Status = domain.AliasDeletionWorkCancelled
 		return
 	}
-	ids := make([]int64, len(job.Items))
-	indices := make(map[int64]int, len(job.Items))
-	for i, item := range job.Items {
-		ids[i] = item.ID
-		indices[item.ID] = i
-	}
-	report := func(outcome hmesync.AliasDeletionOutcome) {
-		progressMu.Lock()
-		defer progressMu.Unlock()
-		index, exists := indices[outcome.AliasID]
-		if !exists || job.Items[index].Done || persistenceErr != nil {
-			return
-		}
-		item := job.Items[index]
-		item.Done = true
-		audit := domain.AuditLog{
-			AdminID: &admin.AdminID, Username: admin.Username, Action: "delete", ResourceType: "alias",
-			ResourceID: strconv.FormatInt(item.ID, 10), Result: "success", Detail: "batch",
-			IP: ip, RequestID: job.RequestID, CreatedAt: s.now().UTC(),
-		}
-		if outcome.Err == nil {
-			item.Deleted = true
-		} else {
-			apiErr := adminAPIBatchAliasDeleteError(outcome.Err)
-			if ctx.Err() != nil && errors.Is(outcome.Err, ctx.Err()) {
-				apiErr = adminAPIAppleError{
-					Status: http.StatusConflict, Code: "BATCH_DELETE_INTERRUPTED",
-					Message: "删除任务已停止或达到运行时限，请刷新 Apple 目录核对结果后再操作",
-				}
-			}
-			if apiErr.Code != "BATCH_DELETE_INTERRUPTED" && apiErr.Code != "NOT_FOUND" {
-				apiErr = adminAPIAppleAliasDeleteFailure(apiErr)
-				item.LocalRetained = true
-			}
-			item.Code, item.Message = apiErr.Code, apiErr.Message
-			audit.Result, audit.Detail = "failed", apiErr.Code
-		}
-		previous := job.Items[index]
-		job.Items[index] = item
-		job.UpdatedAt = s.now().UTC()
-		if err := s.saveAliasDeletionJob(job, &audit); err != nil {
-			// Do not publish an uncommitted result; cancellation stops further
-			// mutations, while in-flight calls still get bounded reconciliation.
-			job.Items[index] = previous
-			persistenceErr = err
-			cancel()
-			s.logger.Error("保存后台删除任务进度失败，已停止后续删除", "job_id", job.ID, "alias_id", item.ID, "request_id", job.RequestID)
-			return
-		}
-		if outcome.Err != nil && item.Code != "APPLE_BATCH_DEFERRED" {
-			// Keep concrete upstream evidence without logging response bodies,
-			// URLs, cookies or the wrapped error's text.
-			operation, serviceCode, httpStatus := "", "", 0
-			var upstream *apple.Error
-			if errors.As(outcome.Err, &upstream) && upstream != nil {
-				operation = aliasDeletionOperationName(upstream.Op)
-				serviceCode = sanitizedAliasDeletionServiceCode(upstream.ServiceCode)
-				if upstream.StatusCode >= 100 && upstream.StatusCode <= 599 {
-					httpStatus = upstream.StatusCode
-				}
-			}
-			s.logger.Warn("Apple alias deletion failed", "action", "delete", "alias_id", item.ID,
-				"code", item.Code, "job_id", job.ID, "request_id", job.RequestID,
-				"operation", operation, "upstream_status", httpStatus, "upstream_code", serviceCode)
-		}
-	}
-	ctx = hmesync.WithAliasDeletionProgress(ctx, report)
-	// Recovery is enabled only for background jobs. The synchronous compatibility
-	// endpoint and single-item deletion retain their existing request lifetimes.
-	waitIdentity := domain.AliasDeletionJob{ID: job.ID, AdminID: job.AdminID, RequestID: job.RequestID}
-	ctx = hmesync.WithAliasDeletionRecovery(ctx, func(wait hmesync.AliasDeletionWait) {
-		s.recordAliasDeletionWait(waitIdentity, wait)
-	})
-	var outcomes []hmesync.AliasDeletionOutcome
-	var runErr error
-	if batch, ok := s.hmeSync.(HMEBatchDeletionService); ok {
-		outcomes, runErr = batch.DeleteAliases(ctx, ids)
-	} else {
-		for _, id := range ids {
-			if ctx.Err() != nil {
+	if queued, ok := s.hmeSync.(HMEQueuedDeletionService); ok {
+		err = queued.DeleteQueuedAlias(ctx, work)
+	} else if batch, ok := s.hmeSync.(HMEBatchDeletionService); ok {
+		var outcomes []hmesync.AliasDeletionOutcome
+		outcomes, err = batch.DeleteAliases(ctx, []int64{work.AliasID})
+		found := false
+		for _, outcome := range outcomes {
+			if outcome.AliasID == work.AliasID {
+				err = outcome.Err
+				found = true
 				break
 			}
-			err := s.hmeSync.DeleteAlias(ctx, id)
-			report(hmesync.AliasDeletionOutcome{AliasID: id, Err: err})
+		}
+		if err == nil && !found {
+			err = errors.New("batch deletion returned no result")
+		}
+	} else if s.hmeSync != nil {
+		err = s.hmeSync.DeleteAlias(ctx, work.AliasID)
+	} else {
+		err = errors.New("Apple deletion service unavailable")
+	}
+	work.NextRunAt, work.WaitReason = time.Time{}, ""
+	work.Code, work.Message, work.LocalRetained = "", "", false
+	previousReconcile := work.Reconcile
+	work.Reconcile = false
+	if err == nil {
+		work.Status, work.Deleted = domain.AliasDeletionWorkSucceeded, true
+		return
+	}
+	if parent.Err() != nil {
+		work.Status, work.Reconcile = domain.AliasDeletionWorkPending, true
+		return
+	}
+	var wait *hmesync.AliasDeletionWaitError
+	if errors.As(err, &wait) {
+		work.Status, work.Reconcile = domain.AliasDeletionWorkWaiting, previousReconcile || wait.Reason != "quota"
+		work.NextRunAt, work.WaitReason, work.Used, work.Limit = wait.RetryAt, wait.Reason, wait.Used, wait.Limit
+		work.Operation, work.HTTPStatus, work.ServiceCode = aliasDeletionOperationName(wait.Operation), wait.HTTPStatus, sanitizedAliasDeletionServiceCode(wait.ServiceCode)
+		if !work.NextRunAt.After(s.now()) {
+			work.NextRunAt = s.now().UTC().Add(time.Second)
+		}
+		s.logger.Warn("Apple 删除等待额度恢复", "account_id", work.AccountID, "alias_id", work.AliasID, "reason", work.WaitReason, "retry_at", work.NextRunAt, "used", work.Used, "limit", work.Limit, "operation", work.Operation, "upstream_status", work.HTTPStatus, "upstream_code", work.ServiceCode)
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		wanted, wantedErr := s.store.AliasDeletionWorkWanted(ctx, work.ID)
+		if wantedErr == nil && !wanted {
+			work.Status = domain.AliasDeletionWorkCancelled
+			return
 		}
 	}
-	// Compatibility implementations may not emit progress callbacks. Folding
-	// their final results is idempotent and preserves every reported success.
-	for _, outcome := range outcomes {
-		report(outcome)
+	apiErr := adminAPIBatchAliasDeleteError(err)
+	if apiErr.Code == hmesync.CodeLoginRequired || apiErr.Code == hmesync.CodeSessionExpired || apiErr.Code == hmesync.CodeAccountActionRequired {
+		work.Status, work.Reconcile = domain.AliasDeletionWorkPaused, true
+		var attempt *hmesync.AliasDeletionAttemptError
+		if errors.As(err, &attempt) {
+			work.Reconcile = previousReconcile || attempt.MutationAttempted
+		}
+		work.WaitReason, work.NextRunAt, work.Code, work.Message = "login_required", s.now().UTC().Add(time.Minute), apiErr.Code, apiErr.Message
+		return
 	}
-	progressMu.Lock()
-	defer progressMu.Unlock()
-	complete := persistenceErr == nil && runErr == nil && ctx.Err() == nil
-	for _, item := range job.Items {
-		complete = complete && item.Done
+	if ctx.Err() != nil {
+		work.Status, work.Reconcile = domain.AliasDeletionWorkPaused, true
+		work.WaitReason, work.NextRunAt = "request_timeout", s.now().UTC().Add(time.Minute)
+		return
 	}
-	status := domain.AliasDeletionJobInterrupted
-	if complete {
-		status = domain.AliasDeletionJobCompleted
+	work.Status = domain.AliasDeletionWorkFailed
+	if apiErr.Code != "NOT_FOUND" && apiErr.Code != "BATCH_DELETE_INTERRUPTED" {
+		apiErr = adminAPIAppleAliasDeleteFailure(apiErr)
+		work.LocalRetained = true
 	}
-	job.Status = status
-	job.UpdatedAt = s.now().UTC()
-	if err := s.saveAliasDeletionJob(job, nil); err != nil {
-		job.Status = domain.AliasDeletionJobRunning // The deferred bounded finalizer retries.
-		s.logger.Error("保存后台删除任务结果失败", "job_id", job.ID, "request_id", job.RequestID)
+	work.Code, work.Message = apiErr.Code, apiErr.Message
+	var upstream *apple.Error
+	if errors.As(err, &upstream) && upstream != nil {
+		work.Operation, work.ServiceCode = aliasDeletionOperationName(upstream.Op), sanitizedAliasDeletionServiceCode(upstream.ServiceCode)
+		if upstream.StatusCode >= 100 && upstream.StatusCode <= 599 {
+			work.HTTPStatus = upstream.StatusCode
+		}
 	}
+	s.logger.Warn("Apple alias deletion failed", "action", "delete", "account_id", work.AccountID, "alias_id", work.AliasID, "code", work.Code, "operation", work.Operation, "upstream_status", work.HTTPStatus, "upstream_code", work.ServiceCode)
 }

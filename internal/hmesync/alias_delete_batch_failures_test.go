@@ -21,11 +21,11 @@ func TestDeleteAliasesBlockedAccountPreservesPartialCompletion(t *testing.T) {
 			client.validate = func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil }
 			client.list = func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
 				lists++
-				if lists > 1 {
-					if scenario != "rate limited" || session.SessionToken != "second-returned" {
-						t.Error("unexpected reconciliation or stale session")
-					}
-					session.SessionToken = "rate-reconciled"
+				if lists == 2 && session.SessionToken != "first-deleted" {
+					t.Error("second item reloaded a stale session")
+				}
+				if lists > 2 && (scenario != "local failed" || session.SessionToken != "second-returned") {
+					t.Error("blocked account was resumed or a stale session was reused")
 				}
 				return full, session, nil
 			}
@@ -106,9 +106,9 @@ func TestDeleteAliasesBlockedAccountPreservesPartialCompletion(t *testing.T) {
 			}
 			if scenario == "rate limited" {
 				if lists != 2 {
-					t.Error("rate-limited mutation did not receive exactly one read-only reconciliation")
+					t.Error("rate-limited mutation initiated another read during cooldown")
 				}
-				assertStoredAppleSessionToken(t, service, repo, 3, "rate-reconciled")
+				assertStoredAppleSessionToken(t, service, repo, 3, "second-returned")
 			}
 			if scenario == "checkpoint failed" || scenario == "identity mismatch" || scenario == "cleanup failed" {
 				assertStoredAppleSessionToken(t, service, repo, 3, "first-deleted")
