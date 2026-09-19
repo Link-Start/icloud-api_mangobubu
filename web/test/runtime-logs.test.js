@@ -74,6 +74,13 @@ test("runtime logs normalize timestamps, levels, attributes, and promoted contex
       serviceCodePresent: null,
       serviceCodeFingerprint: "",
       confirmationAttempt: null,
+      appleResponseExcerpt: "",
+      appleResponseFormat: "",
+      appleResponseBytes: null,
+      appleResponseTruncated: null,
+      appleResponseOperation: "",
+      appleResponseHttpStatus: null,
+      appleResponseServiceCode: "",
       attributes: { attempt: 2, error: "connection closed" },
     },
   );
@@ -143,6 +150,13 @@ test("runtime log pages normalize page totals while preserving flow cursors", ()
           serviceCodePresent: null,
           serviceCodeFingerprint: "",
           confirmationAttempt: null,
+          appleResponseExcerpt: "",
+          appleResponseFormat: "",
+          appleResponseBytes: null,
+          appleResponseTruncated: null,
+          appleResponseOperation: "",
+          appleResponseHttpStatus: null,
+          appleResponseServiceCode: "",
           attributes: {},
         },
       ],
@@ -324,6 +338,60 @@ test("creation kinds distinguish old records and resolve a whole run beyond its 
   });
   assert.equal(fallback.autoCreateKind, "reconcile");
   assert.equal(runtimeLogFlowContextText(fallback), "");
+});
+
+test("Apple response snapshots normalize grouped attributes without losing their request identity", () => {
+  const excerpt = '{"success":false,"error":{"code":"-27577","message":"稍后重试"}}';
+  const log = normalizeRuntimeLog({
+    http_status: 503,
+    operation: "reconcile alias directory",
+    attributes: {
+      "autocreate.apple_response_excerpt": excerpt,
+      "autocreate.apple_response_format": "JSON",
+      "autocreate.apple_response_bytes": "2189",
+      "autocreate.apple_response_truncated": "true",
+      "autocreate.apple_response_operation": "reserve Hide My Email alias",
+      "autocreate.apple_response_http_status": "200",
+      "autocreate.apple_response_service_code": "-27577",
+    },
+  });
+
+  assert.equal(log.appleResponseExcerpt, excerpt);
+  assert.equal(log.appleResponseFormat, "json");
+  assert.equal(log.appleResponseBytes, 2189);
+  assert.equal(log.appleResponseTruncated, true);
+  assert.equal(log.appleResponseOperation, "reserve Hide My Email alias");
+  assert.equal(log.appleResponseHttpStatus, 200);
+  assert.equal(log.appleResponseServiceCode, "-27577");
+  assert.equal(log.httpStatus, 503);
+  assert.equal(log.operation, "reconcile alias directory");
+  assert.equal(runtimeLogFlowContextText(log), "");
+
+  const topLevel = normalizeRuntimeLog({
+    appleResponseExcerpt: "  saved text\n",
+    appleResponseFormat: "TEXT",
+    appleResponseBytes: 0,
+    appleResponseTruncated: false,
+    appleResponseOperation: "current request",
+    appleResponseHttpStatus: 502,
+    appleResponseServiceCode: -99,
+    attributes: {
+      apple_response_bytes: 900,
+      apple_response_truncated: true,
+      apple_response_operation: "older request",
+      apple_response_http_status: 200,
+    },
+  });
+  assert.equal(topLevel.appleResponseExcerpt, "  saved text\n");
+  assert.equal(topLevel.appleResponseFormat, "text");
+  assert.equal(topLevel.appleResponseBytes, 0);
+  assert.equal(topLevel.appleResponseTruncated, false);
+  assert.equal(topLevel.appleResponseOperation, "current request");
+  assert.equal(topLevel.appleResponseHttpStatus, 502);
+  assert.equal(topLevel.appleResponseServiceCode, "-99");
+  for (const status of [0, -1, 99, 600, "invalid", null, undefined]) {
+    assert.equal(normalizeRuntimeLog({ apple_response_http_status: status }).appleResponseHttpStatus, null);
+  }
 });
 
 test("automatic creation diagnostics normalize status, retry, timing, and schedule fields", () => {

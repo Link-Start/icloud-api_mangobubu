@@ -2,6 +2,7 @@ package autocreate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,7 +27,8 @@ func TestAppleBusinessRejectionFlowsThroughCreationLogsAndOriginalSchedule(t *te
 		for _, rawCode := range []string{`-27577`, `"-27577"`} {
 			t.Run(operation+"/"+rawCode, func(t *testing.T) {
 				const candidate = "private-candidate@icloud.com"
-				const responseDetail = "private upstream rejection detail"
+				const responseDetail = "Apple rejected the requested alias"
+				var responseBytes int
 				generateRequests, reserveRequests, creatorCalls := 0, 0, 0
 				failOperation := true
 				client, err := apple.NewClient(apple.Config{Transport: serviceRejectionTransport(func(request *http.Request) (*http.Response, error) {
@@ -42,7 +44,8 @@ func TestAppleBusinessRejectionFlowsThroughCreationLogsAndOriginalSchedule(t *te
 						t.Fatalf("unexpected Apple request: %s", request.URL.Path)
 					}
 					if failOperation && request.URL.Path == "/v1/hme/"+operation {
-						body = fmt.Sprintf(`{"success":false,"error":{"errorCode":%s,"errorMessage":%q}}`, rawCode, responseDetail)
+						body = fmt.Sprintf(`{"success":false,"error":{"errorCode":%s,"errorMessage":%q},"sessionToken":"response-session-secret","nested":{"authorization":"Bearer response-auth-secret","email":%q}}`, rawCode, responseDetail, candidate)
+						responseBytes = len(body)
 					}
 					return &http.Response{
 						StatusCode: http.StatusOK,
@@ -110,6 +113,12 @@ func TestAppleBusinessRejectionFlowsThroughCreationLogsAndOriginalSchedule(t *te
 					"auto_creation_disabled":      "false",
 					"schedule_action":             "continue",
 					"next_run_at":                 wantNext.Format(time.RFC3339Nano),
+					"apple_response_operation":    operation + " Hide My Email alias",
+					"apple_response_http_status":  "200",
+					"apple_response_format":       "json",
+					"apple_response_service_code": "-27577",
+					"apple_response_bytes":        strconv.Itoa(responseBytes),
+					"apple_response_truncated":    "false",
 				} {
 					if failed.Fields[field] != want {
 						t.Fatalf("business rejection %s = %q, want %q; fields=%#v", field, failed.Fields[field], want, failed.Fields)
@@ -124,7 +133,18 @@ func TestAppleBusinessRejectionFlowsThroughCreationLogsAndOriginalSchedule(t *te
 					len(repo.failures) != 1 || len(repo.successes) != 0 || current.LastError != failed.Fields["error_context"] {
 					t.Fatalf("business failure changed original schedule or state: %#v err=%v", current, err)
 				}
-				assertFlowLogsDoNotContain(t, logs, "-27577", candidate, responseDetail, `"success":false`)
+				var original struct {
+					Success bool `json:"success"`
+					Error   struct {
+						Code    json.RawMessage `json:"errorCode"`
+						Message string          `json:"errorMessage"`
+					} `json:"error"`
+				}
+				if err := json.Unmarshal([]byte(failed.Fields["apple_response_excerpt"]), &original); err != nil ||
+					original.Success || string(original.Error.Code) != rawCode || original.Error.Message != responseDetail {
+					t.Fatalf("original rejection missing from log: %#v err=%v", failed.Fields, err)
+				}
+				assertFlowLogsDoNotContain(t, logs, candidate, "response-session-secret", "response-auth-secret")
 
 				failOperation = false
 				clock.Set(wantNext)

@@ -33,6 +33,13 @@ func TestAdminAPIApplicationLogPreservesAutoCreateFailureDiagnostics(t *testing.
 			"schedule_action":             "continue",
 			"next_run_at":                 "2026-08-09T10:00:00Z",
 			"remote_side_effect_possible": "true",
+			"apple_response_excerpt":      `{"success":false,"error":{"errorCode":-27577,"errorMessage":"Alias rejected"}}`,
+			"apple_response_format":       "json",
+			"apple_response_service_code": "-27577",
+			"apple_response_bytes":        "85",
+			"apple_response_truncated":    "false",
+			"apple_response_operation":    "reserve Hide My Email alias",
+			"apple_response_http_status":  "200",
 		},
 	}
 
@@ -58,6 +65,13 @@ func TestAdminAPIApplicationLogPreservesAutoCreateFailureDiagnostics(t *testing.
 		"schedule_action":             "continue",
 		"next_run_at":                 "2026-08-09T10:00:00Z",
 		"remote_side_effect_possible": "true",
+		"apple_response_excerpt":      `{"success":false,"error":{"errorCode":-27577,"errorMessage":"Alias rejected"}}`,
+		"apple_response_format":       "json",
+		"apple_response_service_code": "-27577",
+		"apple_response_bytes":        "85",
+		"apple_response_truncated":    "false",
+		"apple_response_operation":    "reserve Hide My Email alias",
+		"apple_response_http_status":  "200",
 	}
 	for key, expected := range want {
 		if got := dto.Attributes[key]; got != expected {

@@ -96,6 +96,13 @@ const FLOW_ATTRIBUTE_NAMES = new Set([
   "service_code_present",
   "service_code_fingerprint",
   "confirmation_attempt",
+  "apple_response_excerpt",
+  "apple_response_format",
+  "apple_response_bytes",
+  "apple_response_truncated",
+  "apple_response_operation",
+  "apple_response_http_status",
+  "apple_response_service_code",
 ]);
 
 function firstDefined(object, ...keys) {
@@ -202,6 +209,11 @@ function normalizedNullableNumber(value, { minimum = 0, maximum } = {}) {
 function normalizedNullableInteger(value, options = {}) {
   const number = normalizedNullableNumber(value, options);
   return number === null ? null : Math.trunc(number);
+}
+
+function normalizedHTTPStatus(value) {
+  const status = normalizedNullableInteger(value);
+  return status !== null && status >= 100 && status <= 599 ? status : null;
 }
 
 function normalizedNullableBoolean(value) {
@@ -416,6 +428,48 @@ export function normalizeRuntimeLog(raw = {}) {
     "confirmation_attempt",
     "confirmationAttempt",
     "ConfirmationAttempt",
+  );
+  const appleResponseExcerpt = firstDefined(
+    raw,
+    "apple_response_excerpt",
+    "appleResponseExcerpt",
+    "AppleResponseExcerpt",
+  );
+  const appleResponseFormat = firstDefined(
+    raw,
+    "apple_response_format",
+    "appleResponseFormat",
+    "AppleResponseFormat",
+  );
+  const appleResponseBytes = firstDefined(
+    raw,
+    "apple_response_bytes",
+    "appleResponseBytes",
+    "AppleResponseBytes",
+  );
+  const appleResponseTruncated = firstDefined(
+    raw,
+    "apple_response_truncated",
+    "appleResponseTruncated",
+    "AppleResponseTruncated",
+  );
+  const appleResponseOperation = firstDefined(
+    raw,
+    "apple_response_operation",
+    "appleResponseOperation",
+    "AppleResponseOperation",
+  );
+  const appleResponseHttpStatus = firstDefined(
+    raw,
+    "apple_response_http_status",
+    "appleResponseHttpStatus",
+    "AppleResponseHTTPStatus",
+  );
+  const appleResponseServiceCode = firstDefined(
+    raw,
+    "apple_response_service_code",
+    "appleResponseServiceCode",
+    "AppleResponseServiceCode",
   );
 
   return {
@@ -773,6 +827,69 @@ export function normalizeRuntimeLog(raw = {}) {
         "ConfirmationAttempt",
       ),
       { minimum: 1 },
+    ),
+    appleResponseExcerpt: String(
+      valueWithAttributeFallback(
+        appleResponseExcerpt,
+        attributes,
+        "apple_response_excerpt",
+        "appleResponseExcerpt",
+        "AppleResponseExcerpt",
+      ) ?? "",
+    ),
+    appleResponseFormat: normalizedToken(
+      valueWithAttributeFallback(
+        appleResponseFormat,
+        attributes,
+        "apple_response_format",
+        "appleResponseFormat",
+        "AppleResponseFormat",
+      ),
+    ),
+    appleResponseBytes: normalizedNullableInteger(
+      valueWithAttributeFallback(
+        appleResponseBytes,
+        attributes,
+        "apple_response_bytes",
+        "appleResponseBytes",
+        "AppleResponseBytes",
+      ),
+    ),
+    appleResponseTruncated: normalizedNullableBoolean(
+      valueWithAttributeFallback(
+        appleResponseTruncated,
+        attributes,
+        "apple_response_truncated",
+        "appleResponseTruncated",
+        "AppleResponseTruncated",
+      ),
+    ),
+    appleResponseOperation: normalizedNullableText(
+      valueWithAttributeFallback(
+        appleResponseOperation,
+        attributes,
+        "apple_response_operation",
+        "appleResponseOperation",
+        "AppleResponseOperation",
+      ),
+    ),
+    appleResponseHttpStatus: normalizedHTTPStatus(
+      valueWithAttributeFallback(
+        appleResponseHttpStatus,
+        attributes,
+        "apple_response_http_status",
+        "appleResponseHttpStatus",
+        "AppleResponseHTTPStatus",
+      ),
+    ),
+    appleResponseServiceCode: normalizedNullableText(
+      valueWithAttributeFallback(
+        appleResponseServiceCode,
+        attributes,
+        "apple_response_service_code",
+        "appleResponseServiceCode",
+        "AppleResponseServiceCode",
+      ),
     ),
     attributes,
   };

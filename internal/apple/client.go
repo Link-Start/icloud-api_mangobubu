@@ -806,14 +806,19 @@ type operation struct {
 }
 
 type responseData struct {
-	status int
-	header http.Header
-	body   []byte
+	status         int
+	header         http.Header
+	body           []byte
+	bodyIncomplete bool
 }
 
 func (response responseData) operationError(operation string, kind error, cause error) *Error {
 	err := operationError(operation, kind, response.status, cause)
 	err.RetryAfter = parseRetryAfter(response.header.Get("Retry-After"), time.Now())
+	if allowsResponseDiagnostic(operation) {
+		err.responseDiagnostic = makeResponseDiagnostic(response.body, response.header.Get("Content-Type"), response.bodyIncomplete)
+		err.hasResponseDiagnostic = true
+	}
 	return err
 }
 
@@ -1168,13 +1173,15 @@ func (op *operation) requestRaw(ctx context.Context, operation, method, rawURL s
 	defer response.Body.Close()
 	limited := io.LimitReader(response.Body, op.owner.maxResponseBytes+1)
 	responseBody, err := io.ReadAll(limited)
+	data.body = responseBody
 	if err != nil {
+		data.bodyIncomplete = true
 		return responseData{}, data.operationError(operation, ErrInvalidResponse, err)
 	}
 	if int64(len(responseBody)) > op.owner.maxResponseBytes {
+		data.bodyIncomplete = true
 		return responseData{}, data.operationError(operation, ErrResponseTooLarge, nil)
 	}
-	data.body = responseBody
 	return data, nil
 }
 

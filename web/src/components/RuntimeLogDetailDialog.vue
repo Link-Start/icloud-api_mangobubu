@@ -309,6 +309,30 @@
                   </p>
                 </div>
 
+                <div
+                  v-if="canViewOriginalInformation(entry)"
+                  class="runtime-log-original"
+                >
+                  <el-button
+                    type="primary"
+                    plain
+                    size="small"
+                    :aria-expanded="isOriginalInformationOpen(entry)"
+                    @click="toggleOriginalInformation(entry)"
+                  >
+                    {{ isOriginalInformationOpen(entry) ? "收起原始信息" : "查看原始信息" }}
+                  </el-button>
+                  <div
+                    v-if="isOriginalInformationOpen(entry)"
+                    class="runtime-log-original__panel"
+                    role="region"
+                    aria-label="原始信息"
+                  >
+                    <p>{{ originalInformationNotice(entry) }}</p>
+                    <pre v-if="hasSavedAppleResponse(entry)">{{ originalInformationText(entry) }}</pre>
+                  </div>
+                </div>
+
                 <details v-if="flowContextText(entry)" class="runtime-log-flow__context">
                   <summary>查看该步骤上下文</summary>
                   <pre>{{ flowContextText(entry) }}</pre>
@@ -334,6 +358,30 @@
         >
           <h3 id="runtime-log-diagnostics-title">失败诊断</h3>
           <pre>{{ diagnosticText(log) }}</pre>
+        </section>
+
+        <section
+          v-if="canViewOriginalInformation(log)"
+          class="runtime-log-detail__section runtime-log-original"
+        >
+          <el-button
+            type="primary"
+            plain
+            size="small"
+            :aria-expanded="isOriginalInformationOpen(log)"
+            @click="toggleOriginalInformation(log)"
+          >
+            {{ isOriginalInformationOpen(log) ? "收起原始信息" : "查看原始信息" }}
+          </el-button>
+          <div
+            v-if="isOriginalInformationOpen(log)"
+            class="runtime-log-original__panel"
+            role="region"
+            aria-label="原始信息"
+          >
+            <p>{{ originalInformationNotice(log) }}</p>
+            <pre v-if="hasSavedAppleResponse(log)">{{ originalInformationText(log) }}</pre>
+          </div>
         </section>
 
         <section
@@ -384,6 +432,7 @@ const emit = defineEmits(["update:modelValue", "retry-flow"]);
 
 const copying = ref(false);
 const copyFeedback = ref("");
+const expandedOriginalInformation = ref("");
 let feedbackTimer = null;
 
 const hasAutoCreateFlow = computed(() => Boolean(props.log?.autoCreateRunId));
@@ -530,6 +579,91 @@ function flowStageLabel(entry) {
 
 function flowContextText(entry) {
   return runtimeLogFlowContextText(entry);
+}
+
+function originalInformationKey(entry) {
+  if (!entry) return "";
+  return JSON.stringify([
+    entry.id ?? null,
+    entry.autoCreateRunId || "",
+    entry.syncRunId || "",
+    entry.accountId ?? null,
+    entry.time || "",
+    entry.source || "",
+    entry.message || "",
+  ]);
+}
+
+function hasSavedAppleResponse(entry) {
+  return Boolean(
+    entry?.appleResponseExcerpt ||
+      entry?.appleResponseFormat ||
+      entry?.appleResponseServiceCode ||
+      (entry?.appleResponseBytes !== null && entry?.appleResponseBytes !== undefined),
+  );
+}
+
+function canViewOriginalInformation(entry) {
+  return Boolean(entry) && (
+    hasSavedAppleResponse(entry) ||
+    ((entry.autoCreateRunId || hasAutoCreateFlow.value) && isFailedFlowEntry(entry))
+  );
+}
+
+function isOriginalInformationOpen(entry) {
+  return expandedOriginalInformation.value !== "" &&
+    expandedOriginalInformation.value === originalInformationKey(entry);
+}
+
+function toggleOriginalInformation(entry) {
+  expandedOriginalInformation.value = isOriginalInformationOpen(entry)
+    ? ""
+    : originalInformationKey(entry);
+}
+
+function originalInformationNotice(entry) {
+  return hasSavedAppleResponse(entry)
+    ? "敏感字段已脱敏。"
+    : "该日志未保存 Apple 原始响应；升级后新产生的隐私邮箱接口失败日志会记录可用的脱敏响应。";
+}
+
+function originalInformationText(entry) {
+  if (!hasSavedAppleResponse(entry)) return "";
+  const lines = [];
+  const operation = entry.appleResponseOperation;
+  const httpStatus = entry.appleResponseHttpStatus;
+  if (operation) lines.push(`响应对应 Apple 操作: ${operation}`);
+  if (httpStatus !== null && httpStatus !== undefined) {
+    lines.push(`响应 HTTP 状态: ${httpStatus}`);
+  }
+  if (entry.appleResponseServiceCode) {
+    lines.push(`Apple 业务码: ${entry.appleResponseServiceCode}`);
+  }
+  if (entry.appleResponseBytes !== null && entry.appleResponseBytes !== undefined) {
+    lines.push(`已读取响应长度: ${entry.appleResponseBytes} 字节`);
+  }
+  if (entry.appleResponseTruncated) {
+    lines.push("响应内容已截断，仅显示已保存的片段。");
+  }
+
+  let body = entry.appleResponseExcerpt || "";
+  if (!body) {
+    body = entry.appleResponseBytes === 0
+      ? "Apple 返回了空响应正文。"
+      : "该日志仅保留响应元数据，正文未保存。";
+  }
+  if (lines.length) lines.push("");
+  lines.push(body);
+  return lines.join("\n");
+}
+
+function originalInformationCopyText(entry) {
+  if (!canViewOriginalInformation(entry)) return "";
+  return [
+    "原始信息:",
+    originalInformationNotice(entry),
+    originalInformationText(entry),
+  ].filter(Boolean).join("\n");
 }
 
 function booleanLabel(value) {
@@ -862,6 +996,8 @@ function flowLogText() {
       (line) => !line.startsWith("失败步骤:") && !line.startsWith("失败操作:"),
     );
     if (diagnostics.length) lines.push("失败诊断:", ...diagnostics);
+    const originalInformation = originalInformationCopyText(entry);
+    if (originalInformation) lines.push(originalInformation);
     const context = flowContextText(entry);
     if (context) lines.push("步骤上下文:", context);
   }
@@ -882,6 +1018,8 @@ const fullLogText = computed(() => {
   lines.push("", "消息:", props.log.message || "-");
   const diagnostics = diagnosticText(props.log);
   if (diagnostics) lines.push("", "失败诊断:", diagnostics);
+  const originalInformation = originalInformationCopyText(props.log);
+  if (originalInformation) lines.push("", originalInformation);
   if (attributesText.value) {
     lines.push("", "上下文:", attributesText.value);
   }
@@ -910,9 +1048,10 @@ async function copyLog() {
 }
 
 watch(
-  () => [props.modelValue, props.log?.id],
+  () => [props.modelValue, originalInformationKey(props.log)],
   () => {
     copyFeedback.value = "";
+    expandedOriginalInformation.value = "";
   },
 );
 
@@ -1006,6 +1145,7 @@ onBeforeUnmount(() => {
 }
 
 .runtime-log-detail__section > pre,
+.runtime-log-original__panel pre,
 .runtime-log-flow pre {
   box-sizing: border-box;
   width: 100%;
@@ -1222,6 +1362,20 @@ onBeforeUnmount(() => {
   margin-top: 7px;
 }
 
+.runtime-log-original {
+  margin-top: 10px;
+}
+
+.runtime-log-original__panel p {
+  margin: 8px 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.runtime-log-original__panel pre {
+  max-height: min(42vh, 380px);
+}
+
 @media (max-width: 600px) {
   .runtime-log-detail__meta {
     grid-template-columns: minmax(0, 1fr);
@@ -1264,7 +1418,8 @@ onBeforeUnmount(() => {
     width: 100%;
   }
 
-  .runtime-log-flow pre {
+  .runtime-log-flow pre,
+  .runtime-log-original__panel pre {
     padding: 10px;
     font-size: 11px;
   }

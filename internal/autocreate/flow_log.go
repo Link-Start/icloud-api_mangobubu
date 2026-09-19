@@ -357,6 +357,7 @@ func (m *Manager) logAliasCreationFailureWithOperation(
 			)
 		}
 	}
+	attributes = append(attributes, aliasCreationResponseAttrs(err)...)
 	if flow.state == nil {
 		return
 	}
@@ -408,6 +409,7 @@ func (m *Manager) logAliasCreationCancellationWithError(
 		slog.Bool("pending_confirmation", aliasCreationPendingConfirmation(cause, code)),
 	}
 	attributes = append(attributes, aliasCreationTimingAttrs(scheduledFor, attemptedAt, nextRunAt)...)
+	attributes = append(attributes, aliasCreationResponseAttrs(cause)...)
 	if flow.state == nil {
 		return
 	}
@@ -721,7 +723,7 @@ func diagnoseAliasCreationError(err error) aliasCreationErrorInfo {
 	info.class = aliasCreationErrorClass(info.code)
 	info.reason = aliasCreationErrorReason(info.code)
 	if info.code == "APPLE_UPSTREAM_ERROR" && info.upstream != nil && info.upstream.ServiceRejected {
-		info.reason = "Apple 已明确返回业务失败，HTTP 成功状态不代表操作成功；请结合服务码指纹排查"
+		info.reason = "Apple 已明确返回业务失败，HTTP 成功状态不代表操作成功；请查看原始信息中的业务码和错误说明"
 	}
 	return info
 }

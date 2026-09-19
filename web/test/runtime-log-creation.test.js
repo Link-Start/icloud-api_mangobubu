@@ -161,3 +161,196 @@ test("details and copied flows resolve creation kind from later steps and retain
   props.log = runtimeLogs.normalizeRuntimeLog({ id: 9, sync_run_id: "sync-run-1" });
   assert.doesNotMatch(detail.fullLogText.value, /创建类别:/);
 });
+
+test("original information follows one failed entry and is included in copied creation flows", async (context) => {
+  const source = await readFile(new URL("../src/components/RuntimeLogDetailDialog.vue", import.meta.url), "utf8");
+  const scope = effectScope();
+  context.after(() => scope.stop());
+  const started = runtimeLogs.normalizeRuntimeLog({
+    id: 1,
+    account_id: 12,
+    time: "2026-09-19T13:20:40Z",
+    attributes: {
+      auto_create_run_id: "auto-run-1",
+      auto_create_event: "run_started",
+      auto_create_stage: "preparing",
+    },
+  });
+  const failed = runtimeLogs.normalizeRuntimeLog({
+    id: 2,
+    account_id: 12,
+    level: "error",
+    time: "2026-09-19T13:20:48Z",
+    message: "自动创建隐私邮箱失败",
+    attributes: {
+      auto_create_run_id: "auto-run-1",
+      auto_create_event: "run_failed",
+      auto_create_stage: "failed",
+      auto_create_kind: "new",
+      http_status: 503,
+      operation: "reconcile alias directory",
+      apple_response_excerpt: '{"success":false,"error":{"code":"-27577","message":"<script>alert(1)</script>"},"count":9007199254740993}',
+      apple_response_format: "json",
+      apple_response_bytes: 312,
+      apple_response_truncated: false,
+      apple_response_operation: "reserve Hide My Email alias",
+      apple_response_http_status: 200,
+      apple_response_service_code: "-27577",
+    },
+  });
+  const anotherFailed = runtimeLogs.normalizeRuntimeLog({
+    ...failed,
+    id: 3,
+    appleResponseExcerpt: '{"error":{"code":"-2"}}',
+    appleResponseServiceCode: "-2",
+  });
+  const props = reactive({
+    modelValue: true,
+    log: started,
+    flowLogs: [started, failed, anotherFailed],
+    flowLoading: false,
+    flowError: null,
+    accountLabel: "owner@icloud.com",
+  });
+  const detail = scope.run(() => evaluateSetup(source, {
+    defineProps: () => props,
+    defineEmits: () => () => {},
+    formatTime,
+  }, [
+    "canViewOriginalInformation", "isOriginalInformationOpen", "toggleOriginalInformation",
+    "originalInformationNotice", "originalInformationText", "fullLogText",
+  ]));
+
+  assert.equal(detail.canViewOriginalInformation(started), false);
+  assert.equal(detail.canViewOriginalInformation(failed), true);
+  assert.equal(detail.isOriginalInformationOpen(failed), false);
+  assert.match(detail.fullLogText.value, /原始信息:\n敏感字段已脱敏。/);
+  assert.match(detail.fullLogText.value, /响应对应 Apple 操作: reserve Hide My Email alias/);
+  assert.match(detail.fullLogText.value, /响应 HTTP 状态: 200/);
+  assert.match(detail.fullLogText.value, /Apple 业务码: -27577/);
+  assert.match(detail.fullLogText.value, /"code":"-27577"/);
+  assert.doesNotMatch(detail.fullLogText.value, /apple_response_excerpt/);
+
+  detail.toggleOriginalInformation(failed);
+  assert.equal(detail.isOriginalInformationOpen(failed), true);
+  assert.equal(detail.isOriginalInformationOpen(anotherFailed), false);
+  const originalText = detail.originalInformationText(failed);
+  assert.match(originalText, /已读取响应长度: 312 字节/);
+  assert.match(originalText, /<script>alert\(1\)<\/script>/);
+  assert.ok(originalText.endsWith(failed.appleResponseExcerpt));
+  assert.doesNotMatch(originalText, /503|reconcile alias directory|已截断/);
+  assert.match(source, /<pre v-if="hasSavedAppleResponse\(entry\)">\{\{ originalInformationText\(entry\) \}\}<\/pre>/);
+  assert.doesNotMatch(source, /v-html|innerHTML/);
+
+  detail.toggleOriginalInformation(anotherFailed);
+  assert.equal(detail.isOriginalInformationOpen(failed), false);
+  assert.equal(detail.isOriginalInformationOpen(anotherFailed), true);
+  detail.toggleOriginalInformation(anotherFailed);
+  assert.equal(detail.isOriginalInformationOpen(anotherFailed), false);
+
+  detail.toggleOriginalInformation(failed);
+  props.log = failed;
+  await nextTick();
+  assert.equal(detail.isOriginalInformationOpen(failed), false);
+  detail.toggleOriginalInformation(failed);
+  props.modelValue = false;
+  await nextTick();
+  assert.equal(detail.isOriginalInformationOpen(failed), false);
+
+  props.modelValue = true;
+  props.log = runtimeLogs.normalizeRuntimeLog({ ...failed, accountId: 13, autoCreateRunId: "auto-run-2" });
+  props.flowLogs = [props.log];
+  await nextTick();
+  assert.equal(detail.isOriginalInformationOpen(props.log), false);
+  detail.toggleOriginalInformation(props.log);
+  assert.equal(detail.isOriginalInformationOpen(props.log), true);
+  assert.equal(detail.isOriginalInformationOpen(failed), false);
+});
+
+test("single snapshots and historical creation failures explain missing, omitted, empty and truncated responses", async (context) => {
+  const source = await readFile(new URL("../src/components/RuntimeLogDetailDialog.vue", import.meta.url), "utf8");
+  const scope = effectScope();
+  context.after(() => scope.stop());
+  const props = reactive({
+    modelValue: true,
+    log: runtimeLogs.normalizeRuntimeLog({ id: 7, level: "error", message: "Apple 请求失败" }),
+    flowLogs: [],
+    flowLoading: false,
+    flowError: null,
+    accountLabel: "",
+  });
+  const detail = scope.run(() => evaluateSetup(source, {
+    defineProps: () => props,
+    defineEmits: () => () => {},
+    formatTime,
+  }, [
+    "canViewOriginalInformation", "hasSavedAppleResponse", "isOriginalInformationOpen",
+    "toggleOriginalInformation", "originalInformationNotice", "originalInformationText", "fullLogText",
+  ]));
+
+  assert.equal(detail.canViewOriginalInformation(props.log), false);
+  assert.doesNotMatch(detail.fullLogText.value, /原始信息:|新产生的失败日志会记录/);
+  props.log = runtimeLogs.normalizeRuntimeLog({
+    id: 7,
+    level: "error",
+    message: "Apple 请求失败",
+    auto_create_run_id: "historical-auto-run",
+  });
+  await nextTick();
+  assert.equal(detail.canViewOriginalInformation(props.log), true);
+  assert.equal(detail.hasSavedAppleResponse(props.log), false);
+  assert.equal(detail.originalInformationText(props.log), "");
+  assert.equal(detail.originalInformationNotice(props.log), "该日志未保存 Apple 原始响应；升级后新产生的隐私邮箱接口失败日志会记录可用的脱敏响应。");
+  assert.match(detail.fullLogText.value, /该日志未保存 Apple 原始响应/);
+  assert.doesNotMatch(detail.fullLogText.value, /\{\}|Apple 返回了空响应正文/);
+  detail.toggleOriginalInformation(props.log);
+  assert.equal(detail.isOriginalInformationOpen(props.log), true);
+
+  const response = (attributes) => runtimeLogs.normalizeRuntimeLog({
+    id: 8,
+    level: "error",
+    attributes,
+  });
+  props.log = response({
+    apple_response_excerpt: '{"error":{"code":"-27577","message":"很长的响应',
+    apple_response_format: "json",
+    apple_response_bytes: 12345,
+    apple_response_truncated: true,
+    apple_response_service_code: "-27577",
+  });
+  await nextTick();
+  assert.equal(detail.canViewOriginalInformation(props.log), true);
+  assert.equal(detail.isOriginalInformationOpen(props.log), false);
+  assert.match(detail.originalInformationText(props.log), /已读取响应长度: 12345 字节/);
+  assert.match(detail.originalInformationText(props.log), /响应内容已截断/);
+  assert.ok(detail.originalInformationText(props.log).endsWith(props.log.appleResponseExcerpt));
+  assert.match(detail.fullLogText.value, /Apple 业务码: -27577/);
+  assert.match(source, /<pre v-if="hasSavedAppleResponse\(log\)">\{\{ originalInformationText\(log\) \}\}<\/pre>/);
+
+  props.log = response({
+    apple_response_excerpt: "响应正文不是 JSON，原文已省略。",
+    apple_response_format: "omitted",
+    apple_response_bytes: 71,
+    apple_response_truncated: false,
+  });
+  assert.match(detail.originalInformationText(props.log), /响应正文不是 JSON，原文已省略。/);
+  assert.doesNotMatch(detail.originalInformationText(props.log), /已截断/);
+
+  props.log = response({ apple_response_format: "text", apple_response_bytes: 0 });
+  assert.equal(detail.hasSavedAppleResponse(props.log), true);
+  assert.match(detail.originalInformationText(props.log), /Apple 返回了空响应正文。/);
+
+  props.log = response({
+    operation: "reconcile alias directory",
+    http_status: 503,
+    apple_response_operation: "reserve Hide My Email alias",
+    apple_response_http_status: 0,
+    apple_response_format: "omitted",
+    apple_response_bytes: 0,
+    apple_response_excerpt: "请求未收到 HTTP 响应。",
+  });
+  assert.equal(props.log.appleResponseHttpStatus, null);
+  assert.match(detail.originalInformationText(props.log), /响应对应 Apple 操作: reserve Hide My Email alias/);
+  assert.match(detail.originalInformationText(props.log), /请求未收到 HTTP 响应。/);
+  assert.doesNotMatch(detail.originalInformationText(props.log), /响应 HTTP 状态|503|100|reconcile alias directory/);
+});

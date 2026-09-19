@@ -27,8 +27,8 @@ var (
 )
 
 // Error is the typed error returned for transport, HTTP, protocol and service
-// failures. Response bodies are deliberately excluded because they can carry
-// authentication material.
+// failures. Its summary excludes response bodies. Selected HME failures carry
+// a bounded, sanitized diagnostic through ResponseDiagnostic.
 type Error struct {
 	Op          string
 	Kind        error
@@ -44,6 +44,9 @@ type Error struct {
 	// the operation. Zero means no positive delay is available.
 	RetryAfter time.Duration
 	Err        error
+
+	responseDiagnostic    ResponseDiagnostic
+	hasResponseDiagnostic bool
 }
 
 func (e *Error) Error() string {
@@ -61,6 +64,12 @@ func (e *Error) Error() string {
 		message += " (service " + e.ServiceCode + ")"
 	}
 	return message
+}
+
+// GoString keeps generic debug formatting from revealing an explicitly
+// requested diagnostic. Use ResponseDiagnostic to inspect the sanitized body.
+func (e *Error) GoString() string {
+	return e.Error()
 }
 
 func (e *Error) Unwrap() error {
