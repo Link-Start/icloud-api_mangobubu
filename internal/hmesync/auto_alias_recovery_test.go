@@ -118,6 +118,15 @@ func TestAutoAliasRecoveryDiscardsLocallyAndNextAttemptCreates(t *testing.T) {
 				t.Fatal("discard retained the candidate or performed a remote mutation")
 			}
 			assertStoredAppleSessionToken(t, service, repo.fakeRepository, 3, "latest-directory-session")
+			client.list = func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+				directory := aliasDeletionDirectory()
+				if client.createCalls.Load() > 0 {
+					directory.Aliases = []apple.Alias{{
+						HME: "next-created@icloud.com", IsActive: true, ForwardToEmail: "primary@icloud.com",
+					}}
+				}
+				return directory, session, nil
+			}
 			created, err := service.CreateAutoAlias(ctx, 3)
 			if err != nil || !created.Enabled || created.Address != "next-created@icloud.com" ||
 				client.createCalls.Load() != 1 || repo.discardCalls != 1 || repo.confirms.Load() != 1 {

@@ -732,9 +732,10 @@ func decodeReservedAlias(result json.RawMessage, candidate string) (Alias, error
 	reserved.HME = strings.TrimSpace(address)
 	// A successful reserve response is not guaranteed to repeat every field
 	// returned by the authoritative list endpoint. In particular, Apple may
-	// omit isActive; reserve success itself means the new alias is active. Keep
-	// an explicit false value intact so callers can still reject contradictory
-	// responses.
+	// omit isActive; retain the compatible active hint for callers, while keeping
+	// an explicit false value intact so they can reject contradictory responses.
+	// This hint is not directory confirmation: the service must read ListAliases
+	// before publishing the candidate or releasing its credentials.
 	if _, present := aliasFields["isActive"]; !present {
 		reserved.IsActive = true
 	}

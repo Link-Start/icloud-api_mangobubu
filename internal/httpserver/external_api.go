@@ -94,34 +94,19 @@ func (s *Server) createExternalAlias(c *gin.Context) {
 		return
 	}
 
-	var alias domain.Alias
-	err = s.withAccountLock(c.Request.Context(), account.ID, func() error {
-		current, lookupErr := s.store.GetAccountByEmail(c.Request.Context(), accountEmail)
-		if lookupErr != nil {
-			return lookupErr
-		}
-		if current.ID != account.ID {
-			return store.ErrNotFound
-		}
-		if conflict, conflictErr := s.externalAliasIdentityConflict(c.Request.Context(), address, current); conflictErr != nil {
-			return conflictErr
-		} else if conflict {
-			return errExternalAliasIdentityConflict
-		}
-		if _, duplicateErr := s.store.GetAliasByAddress(c.Request.Context(), address); duplicateErr == nil {
-			return errExternalAliasExists
-		} else if !errors.Is(duplicateErr, store.ErrNotFound) {
-			return duplicateErr
-		}
-		// The store's configured issuer owns new v2 credentials. Passing no
-		// provisional hash avoids returning a key that was discarded by CreateAlias.
-		var createErr error
-		alias, createErr = s.store.CreateAlias(c.Request.Context(), domain.Alias{
-			AccountID: account.ID,
-			Address:   address,
-			Enabled:   true,
-		})
-		return createErr
+	if _, duplicateErr := s.store.GetAliasByAddress(c.Request.Context(), address); duplicateErr == nil {
+		s.writeExternalAliasCreateError(c, errExternalAliasExists)
+		return
+	} else if !errors.Is(duplicateErr, store.ErrNotFound) {
+		s.writeExternalAliasCreateError(c, duplicateErr)
+		return
+	}
+	// Credentials are issued only after the Apple directory confirms an iCloud
+	// alias. Custom mailboxes retain their local registration behavior.
+	alias, err := s.registerManualAlias(c.Request.Context(), account, domain.Alias{
+		AccountID: account.ID,
+		Address:   address,
+		Enabled:   true,
 	})
 	if err != nil {
 		s.writeExternalAliasCreateError(c, err)
@@ -208,6 +193,10 @@ func (s *Server) writeExternalAccountLookupError(c *gin.Context, err error) {
 }
 
 func (s *Server) writeExternalAliasCreateError(c *gin.Context, err error) {
+	if appleErr, ok := manualAliasAppleError(err); ok {
+		s.writeAPIError(c, appleErr.Status, appleErr.Code, appleErr.Message)
+		return
+	}
 	switch {
 	case errors.Is(err, errExternalAliasIdentityConflict):
 		s.writeAPIError(c, http.StatusBadRequest, "INVALID_REQUEST", "隐私邮箱不能与已登记主号邮箱或所选主号的 IMAP 用户名相同")

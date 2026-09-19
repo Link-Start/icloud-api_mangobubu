@@ -3,13 +3,13 @@
     <el-tag :type="status.type" effect="plain" size="small" round>
       <span
         class="sync-status__dot"
-        :class="{ 'sync-status__dot--active': progress.active }"
+        :class="{ 'sync-status__dot--active': progress.active && !appleDirectoryStatus }"
         aria-hidden="true"
       ></span>
       {{ status.label }}
     </el-tag>
     <div
-      v-if="progress.active"
+      v-if="progress.active && !appleDirectoryStatus"
       class="sync-status__progress"
       role="status"
       :aria-label="progressAriaLabel"
@@ -29,6 +29,9 @@
         :stroke-width="4"
       />
     </div>
+    <small v-if="details && appleDirectoryStatus">
+      {{ appleDirectoryStatus.description }}
+    </small>
     <template v-if="showDetails">
       <small v-if="item.lastSyncError" class="sync-status__error">
         <span>错误：{{ compactRunes(item.lastSyncError) }}</span>
@@ -49,6 +52,7 @@
 import { computed } from "vue";
 
 import SyncErrorLogDialog from "./SyncErrorLogDialog.vue";
+import { appleAliasDirectoryStatus } from "../utils/appleAliasState.js";
 import { compactRunes, formatTime } from "../utils/format.js";
 import { syncProgressPresentation } from "../utils/syncProgress.js";
 
@@ -59,6 +63,9 @@ const props = defineProps({
 
 const progress = computed(() =>
   syncProgressPresentation(props.item.syncProgress),
+);
+const appleDirectoryStatus = computed(() =>
+  appleAliasDirectoryStatus(props.item),
 );
 const fullErrorLog = computed(
   () => props.item.lastSyncErrorLog || props.item.lastSyncError || "",
@@ -72,6 +79,7 @@ const progressAriaLabel = computed(() => {
 });
 
 const status = computed(() => {
+  if (appleDirectoryStatus.value) return appleDirectoryStatus.value;
   if (!props.item.enabled) {
     return { label: "已停用", type: "info" };
   }
@@ -94,6 +102,7 @@ const status = computed(() => {
 const showDetails = computed(
   () =>
     props.details &&
+    !appleDirectoryStatus.value &&
     props.item.enabled &&
     (props.item.lastSyncStatus === "ok" || props.item.lastSyncStatus === "error"),
 );

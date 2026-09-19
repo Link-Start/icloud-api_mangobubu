@@ -6,7 +6,7 @@
     <SectionHeader
       id="accounts-section-title"
       title="邮箱主号"
-      description="隐私邮箱通过所属主号的 IMAP 收取邮件。"
+      description="隐私邮箱通过所属主号的 IMAP 收取邮件；本地邮箱数包含停用及待确认记录，同步 Apple 目录时自动移除已不存在的地址。"
     >
       <template #actions>
         <el-tooltip content="刷新主号列表" placement="bottom">
@@ -106,7 +106,7 @@
           </header>
           <dl class="mobile-kv-list">
             <div>
-              <dt>隐私邮箱</dt>
+              <dt>本地邮箱</dt>
               <dd>{{ account.aliasCount }}</dd>
             </div>
             <div>
@@ -161,7 +161,7 @@ const pageSize = ref(DEFAULT_PAGE_SIZE);
 const accountColumns = [
   { key: "account", title: "主号", width: 250, flexGrow: 3 },
   { key: "status", title: "状态", width: 140, flexGrow: 1 },
-  { key: "aliasCount", title: "隐私邮箱", width: 112, align: "center" },
+  { key: "aliasCount", title: "本地邮箱", width: 112, align: "center" },
   { key: "lastSyncedAt", title: "最近同步", width: 180, flexGrow: 1 },
   { key: "actions", title: "操作", width: 118, align: "right", fixed: "right" },
 ];

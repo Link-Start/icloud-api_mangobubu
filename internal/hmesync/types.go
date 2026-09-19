@@ -34,6 +34,20 @@ type CredentialImportRepository interface {
 	ImportAliasesWithCredentials(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, []domain.AliasImportCredential, error)
 }
 
+// AppleDirectoryReconciliationRepository removes local entries absent from a
+// complete, identity-checked Apple directory. The unfiltered address set is
+// separate from import candidates so another forwarding target is not mistaken
+// for an address that Apple removed.
+type AppleDirectoryReconciliationRepository interface {
+	ReconcileAppleAliasesWithCredentials(context.Context, int64, []domain.AliasImportCandidate, []string) (domain.AliasImportResult, []domain.AliasImportCredential, error)
+}
+
+// AliasRegistrationRepository publishes a single existing Apple alias after
+// its directory entry and the current account/session have been verified.
+type AliasRegistrationRepository interface {
+	CreateAlias(context.Context, domain.Alias) (domain.Alias, error)
+}
+
 // AutoCreateRepository is the original automatic-creation persistence
 // contract. Keep this interface source-compatible for existing embedders.
 type AutoCreateRepository interface {
@@ -157,6 +171,10 @@ type SyncSummary struct {
 	ImportedDisabledCount int
 	ConflictCount         int
 	FilteredOutCount      int
+	MissingCount          int
+	RemovedCount          int
+	InactiveUpdatedCount  int
+	RestoredCount         int
 }
 
 type CreatedAlias struct {

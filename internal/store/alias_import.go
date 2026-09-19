@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/mail"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"icloud-api/internal/domain"
 )
@@ -20,7 +22,7 @@ func (s *Store) ImportAliases(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 ) (domain.AliasImportResult, error) {
-	result, _, err := s.importAliases(ctx, accountID, candidates, false, false, domain.MailboxTypeICloud)
+	result, _, err := s.importAliases(ctx, accountID, candidates, false, false, domain.MailboxTypeICloud, false, nil)
 	return result, err
 }
 
@@ -31,7 +33,25 @@ func (s *Store) ImportAliasesWithCredentials(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 ) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
-	return s.importAliases(ctx, accountID, candidates, true, false, domain.MailboxTypeICloud)
+	return s.importAliases(ctx, accountID, candidates, true, false, domain.MailboxTypeICloud, false, nil)
+}
+
+// ReconcileAppleAliasesWithCredentials imports a complete, freshly fetched
+// Apple directory and reconciles its availability with existing local aliases.
+// The caller must validate the directory's completeness and account identity
+// before calling, including when the complete directory is empty. Candidates
+// contain entries forwarding to this account; directoryAddresses must contain
+// every address, including entries forwarding elsewhere. Missing local aliases
+// and their dependent credentials/mailbox mappings are deleted atomically;
+// inactive aliases remain disabled. Account-level archived messages are retained.
+// Original ImportAliases methods deliberately keep their additive contract.
+func (s *Store) ReconcileAppleAliasesWithCredentials(
+	ctx context.Context,
+	accountID int64,
+	candidates []domain.AliasImportCandidate,
+	directoryAddresses []string,
+) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
+	return s.importAliases(ctx, accountID, candidates, true, false, domain.MailboxTypeICloud, true, directoryAddresses)
 }
 
 // ImportAliasesWithCredentialsStrict is the all-or-nothing variant used by
@@ -43,7 +63,7 @@ func (s *Store) ImportAliasesWithCredentialsStrict(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 ) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
-	return s.importAliases(ctx, accountID, candidates, true, true, "")
+	return s.importAliases(ctx, accountID, candidates, true, true, "", false, nil)
 }
 
 // ImportCustomAliasesWithCredentialsStrict adds the account state and suffix
@@ -55,7 +75,7 @@ func (s *Store) ImportCustomAliasesWithCredentialsStrict(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 ) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
-	return s.importAliases(ctx, accountID, candidates, true, true, domain.MailboxTypeCustom)
+	return s.importAliases(ctx, accountID, candidates, true, true, domain.MailboxTypeCustom, false, nil)
 }
 
 func (s *Store) importAliases(
@@ -65,6 +85,8 @@ func (s *Store) importAliases(
 	includeCredentials bool,
 	strict bool,
 	requiredMailboxType string,
+	reconcileAppleDirectory bool,
+	directoryAddresses []string,
 ) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
 	if includeCredentials && s.credentialFactory == nil {
 		return domain.AliasImportResult{}, nil, fmt.Errorf("import aliases: v2 credential factory is not configured")
@@ -75,6 +97,18 @@ func (s *Store) importAliases(
 	normalized, err := normalizeAliasImportCandidates(candidates)
 	if err != nil {
 		return domain.AliasImportResult{}, nil, err
+	}
+	var directoryPresence map[string]struct{}
+	if reconcileAppleDirectory {
+		directoryPresence, err = normalizeAppleDirectoryAddresses(directoryAddresses)
+		if err != nil {
+			return domain.AliasImportResult{}, nil, err
+		}
+		for _, candidate := range normalized {
+			if _, present := directoryPresence[candidate.Address]; !present {
+				return domain.AliasImportResult{}, nil, fmt.Errorf("reconcile Apple aliases: candidate %q is absent from directory addresses", candidate.Address)
+			}
+		}
 	}
 	if !includeCredentials {
 		for _, candidate := range normalized {
@@ -168,6 +202,20 @@ func (s *Store) importAliases(
 		return result, nil, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
 	}
 
+	now := s.now()
+	routingChanged := false
+	var existingBeforeReconciliation []domain.Alias
+	if reconcileAppleDirectory {
+		existingBeforeReconciliation = append([]domain.Alias(nil), result.Existing...)
+		// Delete missing and disable inactive addresses before allocating capacity to new
+		// addresses. The account lock covers every operation, and any later
+		// import failure rolls these back too.
+		routingChanged, err = s.reconcileAppleAliasesTx(ctx, tx, accountID, normalized, directoryPresence, &result, now)
+		if err != nil {
+			return domain.AliasImportResult{}, nil, err
+		}
+	}
+
 	limitEnabledAliases := mailboxHasEnabledAliasLimit(state.MailboxType)
 	var enabledCount int
 	if limitEnabledAliases {
@@ -211,7 +259,6 @@ func (s *Store) importAliases(
 		return insertions[left].candidate.Address < insertions[right].candidate.Address
 	})
 
-	now := s.now()
 	createdEnabled := false
 	createdByAddress := make(map[string]domain.Alias, len(insertions))
 	credentialsByAddress := make(map[string]domain.AliasImportCredential, len(insertions))
@@ -230,16 +277,20 @@ func (s *Store) importAliases(
 			}
 		}
 		var id int64
+		initialStatus, initialSyncError := domain.SyncStatusPending, ""
+		if reconcileAppleDirectory && !candidate.Active {
+			initialStatus, initialSyncError = domain.SyncStatusError, domain.AppleAliasInactive
+		}
 		err = s.txQueryRowContext(ctx, tx, `
 			INSERT INTO aliases(
 				account_id, address, label, api_key_hash, api_key_prefix, credential_mode, enabled,
 				last_sync_status, last_sync_error, last_synced_at,
 				last_accessed_at, created_at, updated_at
-			) VALUES(?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, ?, ?)
+			) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
 			ON CONFLICT(address) DO NOTHING
 			RETURNING id`,
 			accountID, candidate.Address, candidate.Label, initialHash, apiKeyPrefix,
-			credentialMode, enabled, domain.SyncStatusPending,
+			credentialMode, enabled, initialStatus, initialSyncError,
 			timestamp(now), timestamp(now),
 		).Scan(&id)
 		if err == sql.ErrNoRows {
@@ -258,6 +309,13 @@ func (s *Store) importAliases(
 			}
 			result.Created = result.Created[:0]
 			result.ImportedDisabledCount = 0
+			result.MissingCount = 0
+			result.RemovedCount = 0
+			result.InactiveUpdatedCount = 0
+			result.RestoredCount = 0
+			if reconcileAppleDirectory {
+				result.Existing = existingBeforeReconciliation
+			}
 			result.Conflicts = append(result.Conflicts, domain.AliasImportConflict{
 				Address:              candidate.Address,
 				ExistingAliasID:      existing.ID,
@@ -313,6 +371,8 @@ func (s *Store) importAliases(
 		); err != nil {
 			return domain.AliasImportResult{}, nil, fmt.Errorf("reset IMAP cursor after alias import: %w", err)
 		}
+	}
+	if createdEnabled || routingChanged {
 		if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
 			return domain.AliasImportResult{}, nil, fmt.Errorf("advance account version after alias import: %w", err)
 		}
@@ -322,6 +382,149 @@ func (s *Store) importAliases(
 		return domain.AliasImportResult{}, nil, fmt.Errorf("commit alias import: %w", err)
 	}
 	return result, issued, nil
+}
+
+func isAppleDirectoryUnavailable(syncError string) bool {
+	return syncError == domain.AppleAliasNotFound || syncError == domain.AppleAliasInactive
+}
+
+// reconcileAppleAliasesTx runs after the account lock and ownership preflight.
+// All aliases absent from the complete directory are removed. Present
+// confirmation-pending aliases remain managed by the creation confirmation
+// workflow. Active entries clear availability markers
+// without enabling aliases: a separate administrator action preserves their
+// local enable/disable decision without requiring another persisted state.
+func (s *Store) reconcileAppleAliasesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	accountID int64,
+	candidates []domain.AliasImportCandidate,
+	directoryPresence map[string]struct{},
+	result *domain.AliasImportResult,
+	now time.Time,
+) (bool, error) {
+	remote := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		remote[candidate.Address] = candidate.Active
+	}
+	rows, err := s.txQueryContext(ctx, tx, `
+		SELECT id, address, enabled, last_sync_status, last_sync_error
+		FROM aliases WHERE account_id = ? ORDER BY address, id`, accountID)
+	if err != nil {
+		return false, fmt.Errorf("read aliases before Apple directory reconciliation: %w", err)
+	}
+	var locals []domain.Alias
+	for rows.Next() {
+		var alias domain.Alias
+		if err := rows.Scan(&alias.ID, &alias.Address, &alias.Enabled, &alias.LastSyncStatus, &alias.LastSyncError); err != nil {
+			_ = rows.Close()
+			return false, fmt.Errorf("scan aliases before Apple directory reconciliation: %w", err)
+		}
+		locals = append(locals, alias)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return false, fmt.Errorf("iterate aliases before Apple directory reconciliation: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return false, fmt.Errorf("close aliases before Apple directory reconciliation: %w", err)
+	}
+
+	routingChanged := false
+	changed := make(map[int64]struct{})
+	for _, alias := range locals {
+		address := domain.NormalizeEmail(alias.Address)
+		if _, present := directoryPresence[address]; !present {
+			deleted, err := s.txExecContext(ctx, tx,
+				`DELETE FROM aliases WHERE id = ? AND account_id = ?`, alias.ID, accountID,
+			)
+			if err != nil {
+				return false, fmt.Errorf("remove alias absent from Apple directory: %w", err)
+			}
+			if err := requireAffected(deleted, "alias"); err != nil {
+				return false, fmt.Errorf("remove alias absent from Apple directory: %w", err)
+			}
+			if _, err := s.createAuditLogTx(ctx, tx, domain.AuditLog{
+				Username: "system", Action: "sync_remove", ResourceType: "alias",
+				ResourceID: strconv.FormatInt(alias.ID, 10), Result: "success",
+				Detail: domain.AppleAliasNotFound, CreatedAt: now,
+			}); err != nil {
+				return false, fmt.Errorf("audit alias removal after Apple directory reconciliation: %w", err)
+			}
+			// Foreign keys remove alias-scoped state. Shared archived messages
+			// and raw files belong to the account, not to an individual alias.
+			result.MissingCount++
+			result.RemovedCount++
+			routingChanged = routingChanged || alias.Enabled
+			continue
+		}
+		if alias.LastSyncError == domain.AppleAliasConfirmationPending {
+			continue
+		}
+		active, applies := remote[address]
+		if !applies {
+			// The address exists at Apple but forwards to another destination.
+			// Filtering import candidates must never make it look deleted.
+			continue
+		}
+		if active {
+			if !isAppleDirectoryUnavailable(alias.LastSyncError) {
+				continue
+			}
+			if _, err := s.txExecContext(ctx, tx, `
+				UPDATE aliases SET last_sync_status = ?, last_sync_error = '', updated_at = ?
+				WHERE id = ? AND account_id = ?`, domain.SyncStatusPending, timestamp(now), alias.ID, accountID,
+			); err != nil {
+				return false, fmt.Errorf("clear active alias Apple directory marker: %w", err)
+			}
+			changed[alias.ID] = struct{}{}
+			result.RestoredCount++
+			continue
+		}
+		marker := domain.AppleAliasInactive
+		if !alias.Enabled && alias.LastSyncStatus == domain.SyncStatusError && alias.LastSyncError == marker {
+			continue
+		}
+		if _, err := s.txExecContext(ctx, tx, `
+			UPDATE aliases SET enabled = FALSE, last_sync_status = ?, last_sync_error = ?, updated_at = ?
+			WHERE id = ? AND account_id = ?`, domain.SyncStatusError, marker, timestamp(now), alias.ID, accountID,
+		); err != nil {
+			return false, fmt.Errorf("mark alias unavailable in Apple directory: %w", err)
+		}
+		changed[alias.ID] = struct{}{}
+		result.InactiveUpdatedCount++
+		if alias.Enabled {
+			routingChanged = true
+		}
+	}
+	// Return the final committed state for entries that were already local.
+	for index, alias := range result.Existing {
+		if _, ok := changed[alias.ID]; !ok {
+			continue
+		}
+		updated, err := s.getAliasByIDTx(ctx, tx, alias.ID)
+		if err != nil {
+			return false, fmt.Errorf("read reconciled Apple alias: %w", err)
+		}
+		result.Existing[index] = updated
+	}
+	return routingChanged, nil
+}
+
+func normalizeAppleDirectoryAddresses(addresses []string) (map[string]struct{}, error) {
+	normalized := make(map[string]struct{}, len(addresses))
+	for index, address := range addresses {
+		address = domain.NormalizeEmail(address)
+		parsed, err := mail.ParseAddress(address)
+		if address == "" || err != nil || domain.NormalizeEmail(parsed.Address) != address {
+			return nil, fmt.Errorf("reconcile Apple aliases: directory address %d is invalid", index)
+		}
+		if _, duplicate := normalized[address]; duplicate {
+			return nil, fmt.Errorf("reconcile Apple aliases: duplicate directory address %q", address)
+		}
+		normalized[address] = struct{}{}
+	}
+	return normalized, nil
 }
 
 func (s *Store) aliasImportAccountEmailConflictTx(

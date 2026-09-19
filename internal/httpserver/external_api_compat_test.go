@@ -25,6 +25,7 @@ func TestExternalAliasResponseCredentialsMatchCommittedV2Bundle(t *testing.T) {
 	now := time.Date(2026, 8, 12, 4, 0, 0, 0, time.UTC)
 	env.server.now = func() time.Time { return now }
 	account := adminAPITestCreateAccount(t, env, "external-response@icloud.com")
+	connectManualAliasDirectory(t, env, account.ID, "external-response-alias@icloud.com")
 	form := url.Values{
 		externalAliasAddressField: {"external-response-alias@icloud.com"},
 		externalAliasAccountField: {account.Email},
@@ -102,6 +103,7 @@ func TestExternalAliasAcceptsLegacyQueryParametersWithoutBody(t *testing.T) {
 	env.server.oauthTokenConfigured = true
 	env.server.oauthTokenHash = secure.HashToken("query-compat-oauth-token")
 	account := adminAPITestCreateAccount(t, env, "external-query@icloud.com")
+	connectManualAliasDirectory(t, env, account.ID, "external-query-alias@icloud.com")
 	query := url.Values{
 		externalAliasAddressField: {"external-query-alias@icloud.com"},
 		externalAliasAccountField: {account.Email},

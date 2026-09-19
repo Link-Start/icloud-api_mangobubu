@@ -12,6 +12,11 @@ import (
 	"icloud-api/internal/domain"
 )
 
+// ErrAppleAliasUnavailable means the latest verified Apple directory did not
+// contain an active entry for this alias. A fresh directory reconciliation is
+// required before an administrator can enable it again.
+var ErrAppleAliasUnavailable = errors.New("alias is unavailable in the Apple directory")
+
 const aliasColumns = `
 	al.id, al.account_id, ac.email, al.address, al.label,
 	al.group_id, COALESCE(mg.name, ''), al.api_key_hash,
@@ -529,6 +534,9 @@ func (s *Store) updateAliasState(
 	if !currentEnabled && lastSyncError == domain.AppleAliasConfirmationPending &&
 		(label != nil || (enabled != nil && *enabled)) {
 		return ErrAliasConfirmationPending
+	}
+	if enabled != nil && *enabled && isAppleDirectoryUnavailable(lastSyncError) {
+		return ErrAppleAliasUnavailable
 	}
 	targetEnabled := currentEnabled
 	if enabled != nil {

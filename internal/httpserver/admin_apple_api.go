@@ -66,6 +66,10 @@ type adminAPIAppleSyncSummaryDTO struct {
 	ImportedDisabledCount int `json:"imported_disabled_count"`
 	ConflictCount         int `json:"conflict_count"`
 	FilteredOutCount      int `json:"filtered_out_count"`
+	MissingCount          int `json:"missing_count"`
+	RemovedCount          int `json:"removed_count"`
+	InactiveUpdatedCount  int `json:"inactive_updated_count"`
+	RestoredCount         int `json:"restored_count"`
 }
 
 type adminAPIAppleCreatedAliasDTO struct {
@@ -227,7 +231,11 @@ func (s *Server) adminAPISyncAppleAliases(c *gin.Context) {
 		" existing=" + strconv.Itoa(summary.ExistingCount) +
 		" inactive=" + strconv.Itoa(summary.InactiveCount) +
 		" imported_disabled=" + strconv.Itoa(summary.ImportedDisabledCount) +
-		" filtered=" + strconv.Itoa(summary.FilteredOutCount)
+		" filtered=" + strconv.Itoa(summary.FilteredOutCount) +
+		" missing=" + strconv.Itoa(summary.MissingCount) +
+		" removed=" + strconv.Itoa(summary.RemovedCount) +
+		" inactive_updated=" + strconv.Itoa(summary.InactiveUpdatedCount) +
+		" restored=" + strconv.Itoa(summary.RestoredCount)
 	s.audit(c, &adminSession.AdminID, adminSession.Username, "sync_hme_aliases", "account", strconv.FormatInt(accountID, 10), "success", auditDetail)
 	writeAdminAPIData(c, http.StatusOK, adminAPIAppleSyncResultDTO{
 		adminAPIAccountDetailDTO: detail,
@@ -322,6 +330,10 @@ func adminAPIAppleSyncSummary(summary hmesync.SyncSummary) adminAPIAppleSyncSumm
 		ImportedDisabledCount: summary.ImportedDisabledCount,
 		ConflictCount:         summary.ConflictCount,
 		FilteredOutCount:      summary.FilteredOutCount,
+		MissingCount:          summary.MissingCount,
+		RemovedCount:          summary.RemovedCount,
+		InactiveUpdatedCount:  summary.InactiveUpdatedCount,
+		RestoredCount:         summary.RestoredCount,
 	}
 }
 
@@ -382,6 +394,10 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 			code = hmesync.CodeRateLimited
 		case errors.Is(err, hmesync.ErrAccountMismatch):
 			code = hmesync.CodeAccountMismatch
+		case errors.Is(err, hmesync.ErrAliasNotFound):
+			code = hmesync.CodeAliasNotFound
+		case errors.Is(err, hmesync.ErrAliasInactive):
+			code = hmesync.CodeAliasInactive
 		case errors.Is(err, hmesync.ErrAccountChanged):
 			code = hmesync.CodeAccountChanged
 		case errors.Is(err, hmesync.ErrAliasOwnershipConflict), errors.Is(err, store.ErrAliasOwnershipConflict):
@@ -411,6 +427,10 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 		return adminAPIAppleError{Status: http.StatusTooManyRequests, Code: code, Message: "Apple 请求过于频繁，请稍后再试"}
 	case hmesync.CodeAccountMismatch:
 		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 登录账户或转发邮箱与该主号不匹配"}
+	case hmesync.CodeAliasNotFound:
+		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "Apple 中没有这个隐私邮箱，请先在 Apple 创建，或使用自动创建功能"}
+	case hmesync.CodeAliasInactive:
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "这个隐私邮箱已在 Apple 停用，请先在 Apple 恢复使用"}
 	case hmesync.CodeAccountChanged:
 		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "主号信息已发生变化，请重新操作"}
 	case hmesync.CodeAliasOwnershipConflict:

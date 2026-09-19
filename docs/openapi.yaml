@@ -80,8 +80,10 @@ paths:
         每个字段必须恰好出现一次，且不能包含其他字段。正文为空时不要求
         `Content-Type`。使用部署级 `ICLOUD_API_OAUTH_TOKEN` 的严格单一 Bearer 鉴权；
         成功响应直接返回 `api_key` 和 `mail_api_direct_link`；v2 凭证随后仍可由
-        已认证管理端读取。该接口只登记 Apple 端已经存在的隐私邮箱，不负责创建
-        地址。query 与正文合计不得超过 4 KiB。
+        已认证管理端读取。iCloud 主号必须先完成 Apple 登录；登记时验证当前会话和目录身份，
+        并确认地址已在 Apple 启用且转发至该主号，成功后才保存地址并签发凭据。
+        该接口不会在 Apple 创建地址；custom 主号保持本地登记行为。
+        验证失败不新增地址或重置邮件同步游标。query 与正文合计不得超过 4 KiB。
       x-runtime-constraint:
         query-form-merge: >-
           OpenAPI 无法表达跨 query 与表单正文的联合必填约束；服务端合并两处参数后，
@@ -131,12 +133,18 @@ paths:
           $ref: "#/components/responses/RequestTooLarge"
         "415":
           $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/AliasRegistrationUnprocessable"
         "429":
           $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/AppleUpstreamError"
         "503":
-          $ref: "#/components/responses/Unavailable"
+          $ref: "#/components/responses/AliasRegistrationUnavailable"
+        "504":
+          $ref: "#/components/responses/AppleUpstreamError"
 
   /api/v1/mail/latest:
     get:
@@ -1126,6 +1134,144 @@ paths:
         "503":
           $ref: "#/components/responses/OAuthUnavailable"
 
+  /api/v1/accounts/{id}/aliases:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径
+      - url: https://HOST/admin
+        description: 固定兼容管理 API 入口
+    post:
+      tags: [Admin Accounts]
+      operationId: registerAdminAlias
+      summary: 手动登记已有邮箱地址
+      description: |
+        iCloud 主号须先完成 Apple 登录。服务验证当前会话和目录身份，并确认地址在 Apple
+        启用且转发至该主号，成功后才保存地址并签发凭据；不调用 Apple 创建地址。
+        验证失败不会新增本地地址或重置邮件同步游标。custom 主号保持本地登记行为。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminRegisterAliasRequest"
+      responses:
+        "201":
+          description: 地址及凭据登记成功
+          headers:
+            Cache-Control:
+              description: 响应包含凭据，禁止缓存。
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminOneTimeKeyResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAliasRegistrationNotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/AliasRegistrationUnprocessable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+        "502":
+          $ref: "#/components/responses/AppleUpstreamError"
+        "503":
+          $ref: "#/components/responses/AliasRegistrationUnavailable"
+        "504":
+          $ref: "#/components/responses/AppleUpstreamError"
+
+  /api/v1/accounts/{id}/aliases/sync:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径
+      - url: https://HOST/admin
+        description: 固定兼容管理 API 入口
+    post:
+      tags: [Admin Accounts]
+      operationId: syncAdminAppleAliases
+      summary: 同步并对账 Apple 隐私邮箱目录
+      description: |
+        适用于 iCloud 主号，须有有效 Apple 会话。取得完整且身份匹配的 Apple 目录后，导入
+        转发目标匹配当前主号的新地址，自动移除完整目录中已不存在的本地地址，包括停用地址
+        和待确认候选，并清理其凭据、分组关联、邮件映射和快照等关联数据。只移除本地数据，
+        不调用 Apple 停用或删除接口，不删除主号共享的归档邮件和原始邮件文件。
+        缺失判断使用完整目录；仍存在但因转发目标不同而被导入过滤的地址不会被误删。
+        目录读取失败、内容不完整、身份校验失败或导入冲突时不清理本地地址。
+        Apple 仍存在但已停用的匹配地址保留，记录 APPLE_ALIAS_INACTIVE 并停用本地路由。
+        完整目录重新确认地址 active 时只清除失效标记，保持本地停用，由管理员显式启用。
+        响应详情默认返回前 20 条地址，新建地址另由 created 返回。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      responses:
+        "200":
+          description: 目录同步成功，返回本次统计、新建地址和主号详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleSyncResponse"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          $ref: "#/components/responses/AdminNotFound"
+        "409":
+          description: Apple 会话、身份或转发目标异常，地址归属冲突，主号并发变化，或 custom 模式不支持 Apple 操作。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "422":
+          description: Apple 认证凭据失效（APPLE_CREDENTIALS_INVALID）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+        "502":
+          $ref: "#/components/responses/AppleUpstreamError"
+        "503":
+          description: Apple 目录同步服务未就绪（INTERNAL_ERROR）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "504":
+          $ref: "#/components/responses/AppleUpstreamError"
+
   /api/v1/accounts/{id}/aliases/random:
     servers:
       - url: https://HOST/{admin_path}
@@ -1758,6 +1904,10 @@ components:
             - ACCOUNT_EXISTS
             - ACCOUNT_IDENTITY_LOCKED
             - APPLE_ACCOUNT_MISMATCH
+            - APPLE_ALIAS_NOT_FOUND
+            - APPLE_ALIAS_INACTIVE
+            - APPLE_ALIAS_UNAVAILABLE
+            - APPLE_REGISTRATION_UNAVAILABLE
             - ACCOUNT_CHANGED
             - ALIAS_OWNERSHIP_CONFLICT
             - ALIAS_CONFIRMATION_PENDING
@@ -1849,6 +1999,7 @@ components:
         alias_count:
           type: integer
           minimum: 0
+          description: 本地主号的地址记录总数，包含停用及待确认记录；同步时自动移除 Apple 完整目录中缺失的地址，不代表 Apple 当前使用中的地址数。
         mailbox_type:
           type: string
           enum: [icloud, custom]
@@ -1993,6 +2144,7 @@ components:
           type: integer
           minimum: 0
           maximum: 100
+          description: 本轮邮件同步阶段进度；近期邮件重扫从实际扫描窗口起点计算，避免把起点之前的 UID 算作已扫描。
         started_at:
           type: string
           format: date-time
@@ -2326,6 +2478,102 @@ components:
           type: boolean
           const: true
           description: 成功后执行管理员的全部 Session 已撤销，调用方必须重新登录。
+    AdminRegisterAliasRequest:
+      type: object
+      additionalProperties: false
+      required: [address]
+      properties:
+        address:
+          type: string
+          format: email
+          description: 已在 Apple 启用且转发至当前主号的地址；custom 模式按本地规则登记。
+        label:
+          type: string
+          maxLength: 100
+        group_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 可选目标分组 ID；省略表示未分组。
+    AdminAppleSyncResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [account, aliases, pagination, apple_session, auto_creation, summary, created]
+          properties:
+            account:
+              $ref: "#/components/schemas/AdminAccount"
+            aliases:
+              $ref: "#/components/schemas/AdminAccountDetail/properties/aliases"
+            pagination:
+              $ref: "#/components/schemas/AdminAccountAliasPagination"
+            apple_session:
+              $ref: "#/components/schemas/AdminAppleSession"
+            auto_creation:
+              $ref: "#/components/schemas/AdminAliasAutoCreation"
+            summary:
+              $ref: "#/components/schemas/AdminAppleSyncSummary"
+            created:
+              type: array
+              items:
+                $ref: "#/components/schemas/AdminPendingAliasKey"
+            detail_stale:
+              type: boolean
+              const: true
+              description: 仅在同步成功后详情刷新失败时返回，表示详情分页仍为同步前快照；summary 和 created 是本轮结果。
+    AdminAppleSyncSummary:
+      type: object
+      additionalProperties: false
+      required: [total, created_count, existing_count, inactive_count, imported_disabled_count, conflict_count, filtered_out_count, missing_count, removed_count, inactive_updated_count, restored_count]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+          description: Apple 目录中转发目标匹配当前主号的地址数，包含 active 和 inactive。
+        created_count:
+          type: integer
+          minimum: 0
+          description: 本次新建本地记录数。
+        existing_count:
+          type: integer
+          minimum: 0
+          description: 本次匹配目录中已归属当前主号的本地记录数。
+        inactive_count:
+          type: integer
+          minimum: 0
+          description: 本次匹配目录中 Apple 已停用的地址数。
+        imported_disabled_count:
+          type: integer
+          minimum: 0
+          description: 本次新导入但本地停用的记录数，包含远端停用及超出本地启用容量的地址。
+        conflict_count:
+          type: integer
+          minimum: 0
+          description: 归属冲突数；归属冲突会拒绝整批导入并返回 409，成功响应为 0。
+        filtered_out_count:
+          type: integer
+          minimum: 0
+          description: 因转发目标不匹配而未导入的目录地址数；缺失判断仍使用未过滤的完整目录，避免误删这些地址。
+        missing_count:
+          type: integer
+          minimum: 0
+          description: 兼容字段，本次完整对账发现并移除的缺失地址数，与 removed_count 相同，包含待确认候选；重复同步同一目录时为 0。
+        removed_count:
+          type: integer
+          minimum: 0
+          description: 本次从本地实际移除的地址数；这些地址不存在于 Apple 完整目录中，含停用地址和待确认候选。只清理本地地址及关联数据，不请求 Apple 删除。
+        inactive_updated_count:
+          type: integer
+          minimum: 0
+          description: 本轮实际更新为 APPLE_ALIAS_INACTIVE 的已有匹配记录数，不含新导入的停用地址。
+        restored_count:
+          type: integer
+          minimum: 0
+          description: 本轮因 Apple 再次 active 而清除目录失效标记的匹配记录数；本地保持停用，由管理员显式启用。
     AdminRandomAliasRequest:
       type: object
       additionalProperties: false
@@ -2708,6 +2956,16 @@ components:
           minimum: 0
         enabled:
           type: boolean
+          description: 本地地址路由是否启用；Apple 已停用的地址保留并设为 false，完整目录中已缺失的地址及其关联数据在同步时自动移除。
+        last_sync_status:
+          type: string
+        last_sync_error:
+          type: string
+          description: |
+            目录对账标记 APPLE_ALIAS_INACTIVE 时，手动启用返回 409 APPLE_ALIAS_UNAVAILABLE；
+            完整目录确认地址恢复后清除标记并保持本地停用，由管理员按剩余容量显式重新启用。
+            旧版 APPLE_ALIAS_NOT_FOUND 标记同样阻止手动启用；同步时完整目录中已缺失的记录
+            自动移除，包括 APPLE_ALIAS_CONFIRMATION_PENDING 候选。
     AdminMailGroup:
       type: object
       additionalProperties: false
@@ -3019,7 +3277,29 @@ components:
           schema:
             $ref: "#/components/schemas/APIErrorEnvelope"
     Conflict:
-      description: alias 已存在或主号已达到启用数量上限。
+      description: |
+        alias 已存在或主号已达到启用数量上限。iCloud 登记还包括 APPLE_LOGIN_REQUIRED
+        （未连接 Apple）、APPLE_SESSION_EXPIRED（会话过期）、APPLE_ALIAS_INACTIVE
+        （地址已停用）、APPLE_ACCOUNT_MISMATCH（登录身份或转发目标不匹配）、
+        APPLE_ACCOUNT_ACTION_REQUIRED（Apple 要求完成账户操作）及 ACCOUNT_CHANGED（主号并发变化）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AliasRegistrationUnprocessable:
+      description: Apple 目录中没有该地址（APPLE_ALIAS_NOT_FOUND），或 Apple 认证凭据失效（APPLE_CREDENTIALS_INVALID）；本地地址未创建。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AliasRegistrationUnavailable:
+      description: Apple 地址登记验证服务尚未就绪或不支持登记验证（APPLE_REGISTRATION_UNAVAILABLE）；外部登记接口也使用 503 表示数据库暂不可用（DATABASE_UNAVAILABLE）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AppleUpstreamError:
+      description: Apple 请求失败（502）或超时（504），错误码为 APPLE_UPSTREAM_ERROR。
       content:
         application/json:
           schema:
@@ -3086,6 +3366,12 @@ components:
             $ref: "#/components/schemas/APIErrorEnvelope"
     AdminMailGroupNotFound:
       description: 邮箱分组不存在或路径 ID 无效（`GROUP_NOT_FOUND` 或 `NOT_FOUND`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminAliasRegistrationNotFound:
+      description: 主号或请求的邮箱分组不存在（NOT_FOUND 或 GROUP_NOT_FOUND）。
       content:
         application/json:
           schema:

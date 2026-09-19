@@ -1320,6 +1320,10 @@ test("alias directory sync normalizes its summary and persistent credential bund
     existingCount: 1,
     inactiveCount: 1,
     importedDisabledCount: 1,
+    missingCount: 0,
+    removedCount: 0,
+    inactiveUpdatedCount: 0,
+    restoredCount: 0,
     conflictCount: 1,
   });
   assert.equal(result.created[0].apiKey, "api-key");
@@ -1345,6 +1349,23 @@ test("alias directory sync normalizes its summary and persistent credential bund
       credentialVersion: 1,
     },
   );
+});
+
+test("alias directory reconciliation counts accept all response spellings", async () => {
+  for (const summary of [
+    { missing_count: 5, removed_count: 5, inactive_updated_count: 3, restored_count: 2 },
+    { missingCount: "5", removedCount: "5", inactiveUpdatedCount: "3", restoredCount: "2" },
+    { MissingCount: 5, RemovedCount: 5, InactiveUpdatedCount: 3, RestoredCount: 2 },
+  ]) {
+    globalThis.fetch = async () => jsonResponse({ summary });
+
+    const result = await syncAccountAliases(12, "csrf-token");
+
+    assert.equal(result.summary.missingCount, 5);
+    assert.equal(result.summary.removedCount, 5);
+    assert.equal(result.summary.inactiveUpdatedCount, 3);
+    assert.equal(result.summary.restoredCount, 2);
+  }
 });
 
 test("runtime log pages use offset filters and normalize pagination metadata", async () => {

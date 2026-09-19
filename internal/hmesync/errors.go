@@ -21,6 +21,7 @@ const (
 	CodeAliasConfirmationPending = domain.AppleAliasConfirmationPending
 	CodeAliasCandidateDiscarded  = "APPLE_ALIAS_CANDIDATE_DISCARDED"
 	CodeAliasInactive            = "APPLE_ALIAS_INACTIVE"
+	CodeAliasNotFound            = "APPLE_ALIAS_NOT_FOUND"
 	CodeAccountMismatch          = "APPLE_ACCOUNT_MISMATCH"
 	CodeAccountChanged           = "ACCOUNT_CHANGED"
 	CodeAliasOwnershipConflict   = "ALIAS_OWNERSHIP_CONFLICT"
@@ -42,6 +43,7 @@ var (
 	ErrAliasConfirmationPending = errors.New("Apple alias confirmation pending")
 	ErrAliasCandidateDiscarded  = errors.New("absent Apple alias candidate discarded locally")
 	ErrAliasInactive            = errors.New("Apple alias is inactive")
+	ErrAliasNotFound            = errors.New("alias is absent from the Apple directory")
 	ErrAccountMismatch          = errors.New("Apple account does not own this mailbox")
 	ErrAccountChanged           = errors.New("account identity changed during Apple operation")
 	ErrAliasOwnershipConflict   = errors.New("alias belongs to another account")

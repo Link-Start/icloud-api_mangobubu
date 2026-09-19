@@ -8,6 +8,8 @@ const (
 	SyncStatusError   = "error"
 
 	AppleAliasConfirmationPending = "APPLE_ALIAS_CONFIRMATION_PENDING"
+	AppleAliasNotFound            = "APPLE_ALIAS_NOT_FOUND"
+	AppleAliasInactive            = "APPLE_ALIAS_INACTIVE"
 
 	// Alias credential modes identify which public contract an alias uses.
 	// Legacy aliases retain their original API key and v1 mailbox state, while
@@ -200,6 +202,21 @@ type AliasImportResult struct {
 	Existing              []Alias
 	Conflicts             []AliasImportConflict
 	ImportedDisabledCount int
+	// MissingCount is the number of local aliases found absent from the complete
+	// Apple directory and removed in this transaction. It is kept for existing
+	// response consumers and equals RemovedCount.
+	MissingCount int
+	// RemovedCount includes enabled, disabled, previously marked and
+	// confirmation-pending aliases deleted after a complete Apple directory read.
+	RemovedCount int
+	// InactiveUpdatedCount counts existing aliases whose state was changed to
+	// reflect an inactive Apple entry in this transaction. Newly imported
+	// inactive entries are already represented by Created.
+	InactiveUpdatedCount int
+	// RestoredCount counts aliases whose unavailable-directory marker was
+	// cleared by a current active Apple entry. Their enabled state is preserved;
+	// an administrator must explicitly enable a previously disabled alias.
+	RestoredCount int
 }
 
 // AliasImportCredential is transient metadata for the trusted service that

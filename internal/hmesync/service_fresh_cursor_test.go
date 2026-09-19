@@ -127,10 +127,7 @@ func TestCreateAutoAliasFreshConfirmationRouting(t *testing.T) {
 				t.Fatalf("confirmation side effects: confirms=%d candidate writes=%d reserves=%d",
 					base.confirms.Load(), base.creates.Load(), client.createCalls.Load())
 			}
-			wantListCalls := 1
-			if test.minimalResponse || test.ambiguousReserve {
-				wantListCalls = 2
-			}
+			wantListCalls := 2
 			if test.crossRoundPending {
 				wantListCalls = 3
 			}

@@ -918,14 +918,20 @@ func TestCreateAutoAliasInitializesMissingForwardingTarget(t *testing.T) {
 				session.SessionToken = "listed-session"
 				return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
 			}
-			if session.SessionToken != "updated-session" {
+			if listCalls == 2 && session.SessionToken != "updated-session" {
 				t.Fatalf("forwarding verification session = %#v", session)
 			}
 			session.SessionToken = "verified-session"
-			return apple.ListResult{
+			result := apple.ListResult{
 				SelectedForwardTo: "primary@icloud.com",
 				ForwardToEmails:   []string{"primary@icloud.com"},
-			}, session, nil
+			}
+			if listCalls >= 3 {
+				result.Aliases = []apple.Alias{{
+					HME: "created@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true,
+				}}
+			}
+			return result, session, nil
 		},
 		update: func(_ context.Context, session apple.Session, forwardToEmail string) (apple.Session, error) {
 			events = append(events, "update")
@@ -952,8 +958,8 @@ func TestCreateAutoAliasInitializesMissingForwardingTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initialize forwarding and create: %v", err)
 	}
-	if created.Address != "created@icloud.com" || listCalls != 2 || client.updateCalls.Load() != 1 ||
-		client.createCalls.Load() != 1 || repo.creates.Load() != 1 || strings.Join(events, ",") != "list-1,update,list-2,create" {
+	if created.Address != "created@icloud.com" || listCalls != 3 || client.updateCalls.Load() != 1 ||
+		client.createCalls.Load() != 1 || repo.creates.Load() != 1 || strings.Join(events, ",") != "list-1,update,list-2,create,list-3" {
 		t.Fatalf("created=%#v lists=%d updates=%d reserves=%d writes=%d events=%v",
 			created, listCalls, client.updateCalls.Load(), client.createCalls.Load(), repo.creates.Load(), events)
 	}
@@ -1024,10 +1030,16 @@ func TestCreateAutoAliasReconcilesUncertainForwardingUpdate(t *testing.T) {
 			if listCalls == 1 {
 				return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
 			}
-			return apple.ListResult{
+			result := apple.ListResult{
 				SelectedForwardTo: "primary@icloud.com",
 				ForwardToEmails:   []string{"primary@icloud.com"},
-			}, session, nil
+			}
+			if listCalls >= 3 {
+				result.Aliases = []apple.Alias{{
+					HME: "created@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true,
+				}}
+			}
+			return result, session, nil
 		},
 		update: func(_ context.Context, session apple.Session, _ string) (apple.Session, error) {
 			session.SessionToken = "rotated-during-uncertain-update"
@@ -1049,7 +1061,7 @@ func TestCreateAutoAliasReconcilesUncertainForwardingUpdate(t *testing.T) {
 	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
 
 	created, err := service.CreateAutoAlias(ctx, 3)
-	if err != nil || created.Address != "created@icloud.com" || listCalls != 2 ||
+	if err != nil || created.Address != "created@icloud.com" || listCalls != 3 ||
 		client.updateCalls.Load() != 1 || client.createCalls.Load() != 1 {
 		t.Fatalf("created=%#v err=%v lists=%d updates=%d reserves=%d",
 			created, err, listCalls, client.updateCalls.Load(), client.createCalls.Load())
@@ -1325,12 +1337,20 @@ func TestCreateAutoAliasPreservesConfirmationPersistenceCause(t *testing.T) {
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
 	repo.confirmErr = store.ErrAliasLimit
+	listCalls := 0
 	client := &fakeAppleClient{
 		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
 			return session, nil
 		},
 		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
-			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+			listCalls++
+			result := apple.ListResult{SelectedForwardTo: "primary@icloud.com"}
+			if listCalls >= 2 {
+				result.Aliases = []apple.Alias{{
+					HME: "new-alias@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true,
+				}}
+			}
+			return result, session, nil
 		},
 		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
 			return apple.Alias{

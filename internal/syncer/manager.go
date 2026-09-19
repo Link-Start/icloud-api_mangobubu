@@ -402,10 +402,15 @@ func (m *Manager) reportCursorProgress(
 		m.progressMu.Unlock()
 		return syncFlowSnapshot{}, false
 	}
-	if !active.cursorSet || active.uidValidity != result.State.UIDValidity {
+	resetCursor := result.Reset || (active.cursorSet && active.uidValidity != result.State.UIDValidity)
+	if !active.cursorSet || resetCursor {
 		active.uidValidity = result.State.UIDValidity
 		active.initialUID = 0
-		if previous != nil && previous.UIDValidity == result.State.UIDValidity {
+		if resetCursor {
+			// A reset batch establishes the recent window. UIDs before its
+			// cursor are outside this run, not messages already processed.
+			active.initialUID = result.State.LastUID
+		} else if previous != nil && previous.UIDValidity == result.State.UIDValidity {
 			active.initialUID = previous.LastUID
 		}
 		active.targetUID = result.TargetUID
@@ -427,7 +432,9 @@ func (m *Manager) reportCursorProgress(
 		}
 		percent = 25 + int(completed*70/total)
 	}
-	if percent > active.progress.Percent {
+	// A new window invalidates the previous window's percentage. Subsequent
+	// stage updates and ordinary batches continue to advance monotonically.
+	if resetCursor || percent > active.progress.Percent {
 		active.progress.Percent = normalizedActivePercent(percent)
 	}
 	active.progress.Phase = domain.MailboxSyncPhaseSaving

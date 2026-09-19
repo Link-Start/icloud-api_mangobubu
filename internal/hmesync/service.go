@@ -318,12 +318,21 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 	if err != nil {
 		return SyncResult{}, err
 	}
+	if domain.NormalizeMailboxType(account.MailboxType) != domain.MailboxTypeICloud {
+		return SyncResult{}, wrapError(CodeAccountChanged, ErrAccountChanged, store.ErrICloudMailboxRequired)
+	}
+	reconcileRepo, reconciles := s.repo.(AppleDirectoryReconciliationRepository)
 	record, session, err := s.loadSession(ctx, accountID)
 	if err != nil {
 		if errors.Is(err, ErrSessionExpired) {
 			s.expireSession(ctx, accountID)
 		}
 		return SyncResult{}, err
+	}
+	if reconciles {
+		if err := validateSessionDSID(session.DSID, session); err != nil {
+			return SyncResult{}, err
+		}
 	}
 	validated, err := s.client.Validate(ctx, session)
 	if err != nil {
@@ -332,6 +341,12 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 			s.expireSession(ctx, accountID)
 		}
 		return SyncResult{}, mapped
+	}
+	if reconciles {
+		validated, err = s.registrationSession(record, session, validated)
+		if err != nil {
+			return SyncResult{}, err
+		}
 	}
 	normalizeSession(&validated, record.AppleID, session.Region, s.now())
 	list, updated, err := s.client.ListAliases(ctx, validated)
@@ -342,11 +357,21 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		}
 		return SyncResult{}, mapped
 	}
+	if reconciles {
+		updated, err = s.registrationSession(record, session, updated)
+		if err != nil {
+			return SyncResult{}, err
+		}
+	}
 	normalizeSession(&updated, record.AppleID, validated.Region, s.now())
 
 	filtered, inactive, err := filterAliases(list, account.Email)
 	if err != nil {
 		return SyncResult{}, err
+	}
+	directoryAddresses := make([]string, 0, len(list.Aliases))
+	for _, remote := range list.Aliases {
+		directoryAddresses = append(directoryAddresses, domain.NormalizeEmail(remote.HME))
 	}
 	candidates := make([]domain.AliasImportCandidate, 0, len(filtered))
 	rawKeys := make(map[string]string, len(filtered))
@@ -377,11 +402,29 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		if !sameIdentity(identityOf(current), identityOf(account)) {
 			return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		}
+		if reconciles {
+			currentSession, sessionErr := s.repo.GetAppleWebSession(ctx, accountID)
+			if errors.Is(sessionErr, store.ErrNotFound) {
+				return wrapError(CodeAccountChanged, ErrAccountChanged, sessionErr)
+			}
+			if sessionErr != nil {
+				return sessionErr
+			}
+			if !currentSession.Authenticated || currentSession.Ciphertext != record.Ciphertext ||
+				currentSession.AppleID != record.AppleID || currentSession.Region != record.Region {
+				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+			}
+		}
 		saved, err = s.saveSession(ctx, accountID, updated)
 		if err != nil {
 			return err
 		}
-		if credentialRepo, ok := s.repo.(CredentialImportRepository); ok {
+		// Absence is checked against the unfiltered Apple directory, never the
+		// forwarding-filtered import subset. Both publication and removal share
+		// one transaction under the account lock.
+		if reconciles {
+			imported, issued, err = reconcileRepo.ReconcileAppleAliasesWithCredentials(ctx, accountID, candidates, directoryAddresses)
+		} else if credentialRepo, ok := s.repo.(CredentialImportRepository); ok {
 			imported, issued, err = credentialRepo.ImportAliasesWithCredentials(ctx, accountID, candidates)
 		} else {
 			imported, err = s.repo.ImportAliases(ctx, accountID, candidates)
@@ -424,6 +467,10 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 			ImportedDisabledCount: imported.ImportedDisabledCount,
 			ConflictCount:         len(imported.Conflicts),
 			FilteredOutCount:      len(list.Aliases) - len(filtered),
+			MissingCount:          imported.MissingCount,
+			RemovedCount:          imported.RemovedCount,
+			InactiveUpdatedCount:  imported.InactiveUpdatedCount,
+			RestoredCount:         imported.RestoredCount,
 		},
 		Created: created,
 		Session: sessionInfoFromRecord(saved, updated, StatusAuthenticated),
@@ -857,6 +904,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		return domain.Alias{}, wrapPersistenceError(err)
 	}
 	if hasPendingConfirmation {
+		if _, _, err := filterAliases(settings, account.Email); err != nil {
+			return domain.Alias{}, err
+		}
 		confirmed, found := findAppleAlias(settings.Aliases, pendingConfirmation.Alias.Address)
 		if !found {
 			discarded, err := s.discardMissingAutoAlias(ctx, account, pendingConfirmation, settings, releaseAccount != nil)
@@ -957,6 +1007,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	}
 	if forwardingErr != nil {
 		return domain.Alias{}, forwardingErr
+	}
+	if _, _, err := filterAliases(settings, account.Email); err != nil {
+		return domain.Alias{}, err
 	}
 
 	// Prepare the one-time API key before reserve. The store later reuses this
@@ -1091,9 +1144,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		return domain.Alias{}, expireAutoSession(mappedCreateErr)
 	}
 
-	// A complete, internally consistent reserve response can publish the staged
-	// alias immediately. Use a detached short context because the remote side
-	// effect and its durable marker already exist even if the request timed out.
+	// Reserve can report success before the address exists in Apple's directory.
+	// Reject explicit contradictions, but only a fresh directory read may make
+	// the staged candidate usable, even when reserve returned every alias field.
 	if mappedCreateErr == nil && strings.TrimSpace(created.ForwardToEmail) != "" {
 		if !created.IsActive {
 			reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, 1)
@@ -1107,18 +1160,17 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 			reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, 1)
 			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
-		confirmContext, cancelConfirm := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
-		saved, confirmErr := confirmPendingAlias(confirmContext, provisional, created, sessionForConfirmation, 1)
-		cancelConfirm()
-		return saved, confirmErr
 	}
 
-	// Minimal or ambiguous reserve results are reconciled only through bounded,
+	// All reserve results are reconciled only through bounded,
 	// read-only directory requests. Later plans confirm the candidate or retire
 	// it after the visibility grace period if a fresh directory still omits it.
 	confirmationSession := sessionForConfirmation
 	confirmationCause := mappedCreateErr
 	for attemptIndex := 0; ; attemptIndex++ {
+		if err := ctx.Err(); err != nil {
+			return domain.Alias{}, err
+		}
 		attempt := attemptIndex + 1
 		reportProgress(domain.AliasCreationPhaseReconciling, autoCreateReconcilingPercent, attempt)
 		confirmed, returnedSession, listErr := s.client.ListAliases(ctx, confirmationSession)
@@ -1145,6 +1197,26 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 				errors.Is(confirmationErr, ErrCredentialsInvalid) ||
 				errors.Is(confirmationErr, ErrLoginRequired) {
 				requiresAccountAction = true
+			}
+		}
+		if listErr == nil {
+			if strings.TrimSpace(returnedSession.AppleID) != "" &&
+				!sameEmail(returnedSession.AppleID, record.AppleID) {
+				return domain.Alias{}, errors.Join(
+					wrapError(CodeAccountMismatch, ErrAccountMismatch, nil), confirmationCause,
+				)
+			}
+			if identityErr := validateSessionDSID(trustedDSID, returnedSession); identityErr != nil {
+				if errors.Is(identityErr, ErrSessionExpired) {
+					identityErr = expireAutoSession(identityErr)
+				}
+				return domain.Alias{}, errors.Join(identityErr, confirmationCause)
+			}
+			// A matching row inside an inconsistent directory is not confirmation.
+			// The Apple client rejects partial responses; also enforce directory
+			// shape and ownership for alternate client implementations.
+			if _, _, directoryErr := filterAliases(confirmed, account.Email); directoryErr != nil {
+				return domain.Alias{}, errors.Join(directoryErr, confirmationCause)
 			}
 		}
 		if hasAppleSessionState(returnedSession) {

@@ -1313,7 +1313,8 @@ func (s *Server) adminAPICreateAlias(basePath string) gin.HandlerFunc {
 		if !ok {
 			return
 		}
-		if _, err := s.store.GetAccount(c.Request.Context(), accountID); err != nil {
+		account, err := s.store.GetAccount(c.Request.Context(), accountID)
+		if err != nil {
 			s.writeAdminAPIStoreReadError(c, err)
 			return
 		}
@@ -1336,20 +1337,17 @@ func (s *Server) adminAPICreateAlias(basePath string) gin.HandlerFunc {
 			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "group_id 必须是正整数")
 			return
 		}
-		var alias domain.Alias
-		err := s.withAccountLock(c.Request.Context(), accountID, func() error {
-			var createErr error
-			alias, createErr = s.store.CreateAlias(c.Request.Context(), domain.Alias{
-				AccountID: accountID,
-				Address:   address,
-				Label:     label,
-				GroupID:   groupID,
-				Enabled:   true,
-			})
-			return createErr
+		alias, err := s.registerManualAlias(c.Request.Context(), account, domain.Alias{
+			AccountID: accountID,
+			Address:   address,
+			Label:     label,
+			GroupID:   groupID,
+			Enabled:   true,
 		})
 		if err != nil {
 			switch {
+			case errors.Is(err, errExternalAliasIdentityConflict):
+				writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "隐私邮箱与已登记主号邮箱或 IMAP 用户名相同")
 			case errors.Is(err, store.ErrAliasLimit):
 				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
 			case adminAPIUniqueConstraint(err):
@@ -1357,7 +1355,11 @@ func (s *Server) adminAPICreateAlias(basePath string) gin.HandlerFunc {
 			case errors.Is(err, store.ErrMailGroupNotFound):
 				writeAdminAPIError(c, http.StatusNotFound, "GROUP_NOT_FOUND", "邮箱分组不存在")
 			default:
-				s.writeAdminAPIInternalError(c, err)
+				if appleErr, ok := manualAliasAppleError(err); ok {
+					s.adminAPIFinishAppleFailure(c, mustSession(c), accountID, "register_alias", appleErr)
+				} else {
+					s.writeAdminAPIInternalError(c, err)
+				}
 			}
 			return
 		}
@@ -2012,6 +2014,8 @@ func (s *Server) adminAPIUpdateAlias(c *gin.Context) {
 			writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
 		} else if errors.Is(err, store.ErrAliasConfirmationPending) {
 			writeAdminAPIAliasConfirmationPending(c)
+		} else if errors.Is(err, store.ErrAppleAliasUnavailable) {
+			writeAdminAPIError(c, http.StatusConflict, "APPLE_ALIAS_UNAVAILABLE", "请先同步 Apple 隐私邮箱目录，确认地址存在且已启用后再操作")
 		} else if errors.Is(err, store.ErrMailGroupNotFound) {
 			writeAdminAPIError(c, http.StatusNotFound, "GROUP_NOT_FOUND", "邮箱分组不存在")
 		} else {

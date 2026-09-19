@@ -759,6 +759,16 @@ function normalizeSyncSummary(raw = {}) {
           "FilteredOutCount",
         ),
       ) || 0,
+    missingCount:
+      Number(firstDefined(raw, "missing_count", "missingCount", "MissingCount")) || 0,
+    removedCount:
+      Number(firstDefined(raw, "removed_count", "removedCount", "RemovedCount")) || 0,
+    inactiveUpdatedCount:
+      Number(
+        firstDefined(raw, "inactive_updated_count", "inactiveUpdatedCount", "InactiveUpdatedCount"),
+      ) || 0,
+    restoredCount:
+      Number(firstDefined(raw, "restored_count", "restoredCount", "RestoredCount")) || 0,
     conflictCount:
       Number(
         firstDefined(

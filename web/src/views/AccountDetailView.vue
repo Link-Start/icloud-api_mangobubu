@@ -199,7 +199,7 @@
           title="隐私邮箱"
           :description="isCustomMailbox
             ? '按邮箱后缀生成或手动登记地址；每个地址使用独立的完整凭证包。'
-            : '从 Apple 拉取 Hide My Email 地址目录；每个本地地址使用独立的完整凭证包。'"
+            : '以 Apple 最新完整目录为准；同步时自动移除 Apple 已不存在的本地地址及关联数据。'"
         >
           <template #actions>
             <el-button
@@ -235,12 +235,17 @@
             </span>
           </div>
           <div v-if="aliasSyncSummary" class="apple-session-strip__summary">
-            上次同步：共 {{ aliasSyncSummary.total }}，新建
+            上次同步（转发至本主号的 Apple 地址）：启用
+            {{ Math.max(0, aliasSyncSummary.total - aliasSyncSummary.inactiveCount) }}，停用
+            {{ aliasSyncSummary.inactiveCount }}；本地已登记
+            {{ account.aliasCount }}（含停用及待确认记录）。本次新增登记
             {{ aliasSyncSummary.createdCount }}，已存在
-            {{ aliasSyncSummary.existingCount }}，Apple 已停用
-            {{ aliasSyncSummary.inactiveCount }}，因本地容量暂未启用
+            {{ aliasSyncSummary.existingCount }}，新导入但本地停用
             {{ aliasSyncSummary.importedDisabledCount }}，冲突
-            {{ aliasSyncSummary.conflictCount }}
+            {{ aliasSyncSummary.conflictCount }}；本次自动移除
+            {{ aliasSyncSummary.removedCount }} 个本地地址（Apple 已不存在），本次更新停用
+            {{ aliasSyncSummary.inactiveUpdatedCount }}，Apple 已恢复
+            {{ aliasSyncSummary.restoredCount }}（可手动启用）
           </div>
         </div>
 
@@ -280,7 +285,7 @@
 
           <dl class="auto-creation-metrics">
             <div>
-              <dt>当前隐私邮箱</dt>
+              <dt>本地已登记</dt>
               <dd aria-live="polite" aria-atomic="true">
                 {{ account.aliasCount }}
               </dd>
@@ -482,7 +487,7 @@
                   v-if="!isAliasConfirmationPending(row)"
                   :model-value="row.enabled"
                   :loading="Boolean(toggleLoading[row.id])"
-                  :disabled="isAliasActionBusy(row)"
+                  :disabled="isAliasActionBusy(row) || Boolean(appleAliasDirectoryStatus(row))"
                   :aria-label="`启用隐私邮箱 ${row.address}`"
                   @change="(enabled) => toggleAlias(row, enabled)"
                 />
@@ -598,7 +603,7 @@
                   <el-switch
                     :model-value="alias.enabled"
                     :loading="Boolean(toggleLoading[alias.id])"
-                    :disabled="isAliasActionBusy(alias)"
+                    :disabled="isAliasActionBusy(alias) || Boolean(appleAliasDirectoryStatus(alias))"
                     :aria-label="`启用隐私邮箱 ${alias.address}`"
                     @change="(enabled) => toggleAlias(alias, enabled)"
                   />
@@ -669,7 +674,7 @@
             ? '请尝试其他关键词，或清空搜索后查看全部邮箱。'
             : isCustomMailbox
               ? '输入生成数量批量创建，或在下方手动登记一个邮箱地址。'
-              : '添加一个已经转发到此主号的 Hide My Email 地址。'"
+              : '先在 iCloud 创建隐私邮箱或开启上方自动创建，再同步或登记已有地址。'"
         >
           <el-button
             v-if="appliedAliasQuery"
@@ -706,11 +711,19 @@
             closable
             @close="aliasFormError = null"
           />
-          <el-form-item label="隐私邮箱地址" prop="address">
+          <p class="field-help form-span">
+            {{ isCustomMailbox
+              ? '登记由此主号接收邮件的自定义邮箱地址，并签发整套凭证。'
+              : '请先在 iCloud 创建隐私邮箱，或开启上方自动创建。此处登记 Apple 已有地址；确认地址已启用且转发至此主号后，才会签发整套凭证。' }}
+          </p>
+          <el-form-item
+            :label="isCustomMailbox ? '邮箱地址（本地登记）' : '已在 Apple 创建的隐私邮箱地址'"
+            prop="address"
+          >
             <el-input
               v-model="aliasForm.address"
               type="email"
-              placeholder="random@icloud.com"
+              :placeholder="isCustomMailbox ? `name@${account.emailSuffix || 'example.com'}` : '已在 Apple 创建的地址，如 random@icloud.com'"
               autocomplete="off"
             />
           </el-form-item>
@@ -730,7 +743,7 @@
             :icon="Plus"
             :loading="createLoading"
           >
-            添加并签发整套凭证
+            {{ isCustomMailbox ? '登记并签发整套凭证' : '核对 Apple 地址并登记' }}
           </el-button>
         </el-form>
       </section>
@@ -810,6 +823,7 @@ import SyncStatus from "../components/SyncStatus.vue";
 import VirtualDataTable from "../components/VirtualDataTable.vue";
 import { useAuth } from "../stores/auth.js";
 import { setPageHeader } from "../stores/page.js";
+import { appleAliasDirectoryStatus } from "../utils/appleAliasState.js";
 import {
   createActionLock,
   createLatestRequestGate,
@@ -1016,7 +1030,7 @@ const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
   APPLE_UPSTREAM_ERROR:
     "Apple 服务暂时异常，请稍后再试；自动创建会按计划继续执行",
   APPLE_ALIAS_CONFIRMATION_PENDING:
-    "Apple 隐私邮箱创建结果尚未确认；候选满 5 分钟后，若完整目录仍查无此地址，将自动清理本地记录",
+    "Apple 隐私邮箱创建结果尚未确认；同步完整目录时会自动移除缺失的候选，自动创建计划也会在候选满 5 分钟后核对并清理",
   APPLE_ALIAS_CANDIDATE_DISCARDED:
     "Apple 最新目录未找到候选地址，已清理本地待确认记录；下次计划将重新创建",
   APPLE_ALIAS_INACTIVE:
@@ -1743,13 +1757,14 @@ async function performAliasesSync() {
       return;
     }
     const capacityNotice = result.summary.importedDisabledCount
-      ? `，其中 ${result.summary.importedDisabledCount} 个因本地容量暂未启用`
+      ? `，其中 ${result.summary.importedDisabledCount} 个因 Apple 停用或本地容量暂未启用`
       : "";
     const createdNotice = result.summary.createdCount
-      ? `，新增 ${result.summary.createdCount} 个，可通过列表中的复制操作导出完整凭证`
-      : "，没有新增地址";
+      ? `，本次新增登记 ${result.summary.createdCount} 个，可通过列表中的复制操作导出完整凭证`
+      : "，本次没有新增登记";
+    const directoryNotice = `；本次自动移除 ${result.summary.removedCount} 个本地地址（Apple 已不存在），本次更新停用 ${result.summary.inactiveUpdatedCount} 个、Apple 已恢复 ${result.summary.restoredCount} 个（可手动启用）`;
     successMessage(
-      `隐私邮箱同步完成，Apple 共 ${result.summary.total} 个地址${createdNotice}${capacityNotice}。`,
+      `隐私邮箱同步完成，转发至本主号的 Apple 地址：启用 ${Math.max(0, result.summary.total - result.summary.inactiveCount)} 个、停用 ${result.summary.inactiveCount} 个；本地已登记 ${account.value.aliasCount} 个（含停用及待确认记录）${createdNotice}${capacityNotice}${directoryNotice}。`,
     );
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
@@ -1815,6 +1830,12 @@ async function addAlias() {
     aliasFormError.value = null;
     const valid = await aliasFormRef.value?.validate().catch(() => false);
     if (!valid || !isCurrentAccount(accountId)) return;
+    if (!isCustomMailbox.value && !appleSessionAuthenticated.value) {
+      aliasFormError.value = new Error(
+        "请先点击“同步隐私邮箱”完成 Apple 登录，再登记已有地址。",
+      );
+      return;
+    }
 
     await createAlias(
       accountId,
@@ -1829,10 +1850,24 @@ async function addAlias() {
     if (!isCurrentAccount(accountId)) return;
     Object.assign(aliasForm, { address: "", label: "" });
     aliasFormRef.value?.resetFields();
-    successMessage("隐私邮箱已添加，整套凭证已签发，可通过列表中的复制操作导出。");
+    successMessage(
+      isCustomMailbox.value
+        ? "邮箱已登记，整套凭证已签发，可通过列表中的复制操作导出。"
+        : "Apple 地址已核对并登记，整套凭证已签发，可通过列表中的复制操作导出。",
+    );
   } catch (error) {
     sessionInvalid = isSessionInvalid(error);
     if (!isCurrentAccount(accountId)) return;
+    if (!isCustomMailbox.value && isAppleSessionInvalid(error)) {
+      if (appleSession.value) {
+        appleSession.value = { ...appleSession.value, status: "expired" };
+      }
+      aliasFormError.value = {
+        ...error,
+        message: "Apple 登录已过期，请点击“同步隐私邮箱”重新登录，再登记已有地址。",
+      };
+      return;
+    }
     aliasFormError.value = error;
   } finally {
     createLoading.value = false;
@@ -2031,6 +2066,7 @@ async function copyLegacyDirectLink(alias) {
 async function toggleAlias(alias, enabled) {
   if (
     isAliasConfirmationPending(alias) ||
+    appleAliasDirectoryStatus(alias) ||
     alias.enabled === enabled ||
     !aliasActionLock.acquire(alias.id)
   ) {

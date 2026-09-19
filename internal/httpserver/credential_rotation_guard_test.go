@@ -97,6 +97,7 @@ func TestExternalAliasRoutesWaitForCredentialRotation(t *testing.T) {
 			account := adminAPITestCreateAccount(
 				t, env, "external-rotation-guard@icloud.com",
 			)
+			connectManualAliasDirectory(t, env, account.ID, "external-rotation-guard-alias@icloud.com")
 
 			guardEntered := make(chan struct{})
 			env.server.beforeCredentialRotationReadLock = func() {

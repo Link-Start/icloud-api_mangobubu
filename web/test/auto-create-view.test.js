@@ -177,9 +177,8 @@ test("pending creation messages distinguish bounded confirmation, cleanup, and i
 
   const pending = format("APPLE_ALIAS_CONFIRMATION_PENDING");
   assert.match(pending, /创建结果尚未确认/);
-  assert.match(pending, /满 5 分钟/);
-  assert.match(pending, /完整目录仍查无此地址/);
-  assert.match(pending, /自动清理本地记录/);
+  assert.match(pending, /同步完整目录时会自动移除缺失的候选/);
+  assert.match(pending, /自动创建计划.*满 5 分钟后核对并清理/);
   assert.doesNotMatch(pending, /已创建|只会继续确认/);
   assert.equal(
     format("APPLE_ALIAS_CANDIDATE_DISCARDED"),

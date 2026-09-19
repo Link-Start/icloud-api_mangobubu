@@ -216,6 +216,150 @@ func chronologicalLogEntries(entries []applog.Entry) []applog.Entry {
 	return result
 }
 
+func TestAutomaticSyncProgressTracksCursorWindows(t *testing.T) {
+	const accountID int64 = 1
+	state := func(validity, uid uint32) domain.IMAPSyncState {
+		return domain.IMAPSyncState{AccountID: accountID, UIDValidity: validity, LastUID: uid}
+	}
+	type batch struct {
+		result      domain.MailboxSyncResult
+		wantPercent int
+	}
+	windowBatch := func(validity, uid, target uint32, reset, more bool, percent int) batch {
+		return batch{
+			result: domain.MailboxSyncResult{
+				State: state(validity, uid), TargetUID: target, Reset: reset, HasMore: more,
+			},
+			wantPercent: percent,
+		}
+	}
+	for _, test := range []struct {
+		name     string
+		previous domain.IMAPSyncState
+		batches  []batch
+	}{
+		{
+			name: "first sync establishes a recent window at a large UID",
+			batches: []batch{
+				windowBatch(7, 4_000_000_000, 4_000_000_300, true, true, 25),
+				windowBatch(7, 4_000_000_100, 4_000_000_300, false, true, 48),
+				windowBatch(7, 4_000_000_200, 4_000_000_300, false, true, 71),
+				windowBatch(7, 4_000_000_300, 4_000_000_300, false, false, 95),
+			},
+		},
+		{
+			name:     "ordinary increment starts at the persisted cursor",
+			previous: state(7, 4_000_000_000),
+			batches: []batch{
+				windowBatch(7, 4_000_000_100, 4_000_000_300, false, true, 48),
+				windowBatch(7, 4_000_000_200, 4_000_000_300, false, true, 71),
+				windowBatch(7, 4_000_000_300, 4_000_000_300, false, false, 95),
+			},
+		},
+		{
+			name:     "explicit reset restarts progress within the same generation",
+			previous: state(7, 4_000_000_000),
+			batches: []batch{
+				windowBatch(7, 4_000_000_200, 4_000_000_300, false, true, 71),
+				windowBatch(7, 4_000_000_000, 4_000_000_300, true, true, 25),
+				windowBatch(7, 4_000_000_100, 4_000_000_300, false, true, 48),
+				windowBatch(7, 4_000_000_300, 4_000_000_300, false, false, 95),
+			},
+		},
+		{
+			name:     "new UIDVALIDITY restarts progress during a run",
+			previous: state(7, 4_000_000_000),
+			batches: []batch{
+				windowBatch(7, 4_000_000_200, 4_000_000_300, false, true, 71),
+				windowBatch(8, 3_000_000_000, 3_000_000_300, true, true, 25),
+				windowBatch(8, 3_000_000_100, 3_000_000_300, false, true, 48),
+				windowBatch(8, 3_000_000_300, 3_000_000_300, false, false, 95),
+			},
+		},
+		{
+			name: "empty reset completes without pending work",
+			batches: []batch{
+				windowBatch(7, 0, 0, true, false, 95),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			account := domain.Account{ID: accountID, Enabled: true, PasswordCiphertext: "encrypted"}
+			repo := newFakeRepo(account)
+			if test.previous.UIDValidity != 0 {
+				repo.states[accountID] = test.previous
+			}
+			logs := applog.New(200)
+			var manager *Manager
+			var stageProgress []domain.MailboxSyncProgress
+			var previousStates []*domain.IMAPSyncState
+			calls := 0
+			fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, previous *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
+				previousStates = append(previousStates, previous)
+				for _, update := range []domain.MailboxSyncProgressUpdate{
+					{Phase: domain.MailboxSyncPhaseConnecting, Percent: 5},
+					{Phase: domain.MailboxSyncPhaseScanning, Percent: 15},
+					{Phase: domain.MailboxSyncPhaseReading, Percent: 20},
+					{Phase: domain.MailboxSyncPhaseValidating, Percent: 25},
+				} {
+					domain.ReportMailboxSyncProgress(ctx, update.Phase, update.Percent)
+					progress, _ := manager.AccountProgress(accountID)
+					stageProgress = append(stageProgress, progress)
+				}
+				result := test.batches[calls].result
+				calls++
+				return result, nil
+			})
+			manager = New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Minute, 1)
+			var pending accountIDSet
+			var startedAt time.Time
+			for index, batch := range test.batches {
+				stageProgress = nil
+				pending = manager.syncAllRound(context.Background(), pending)
+				for _, progress := range stageProgress {
+					if index > 0 && progress.Percent < test.batches[index-1].wantPercent {
+						t.Fatalf("batch %d stage %q regressed to %d%%", index+1, progress.Phase, progress.Percent)
+					}
+					if startedAt.IsZero() {
+						startedAt = progress.StartedAt
+					} else if !progress.StartedAt.Equal(startedAt) {
+						t.Fatalf("batch %d started a new progress run", index+1)
+					}
+				}
+				progress, active := manager.AccountProgress(accountID)
+				if batch.result.HasMore {
+					if _, ok := pending[accountID]; !ok || !active || progress.Percent != batch.wantPercent {
+						t.Fatalf("batch %d pending=%v progress=%#v, want active %d%%", index+1, pending, progress, batch.wantPercent)
+					}
+				} else if len(pending) != 0 || active {
+					t.Fatalf("completed batch retained pending=%v progress=%#v", pending, progress)
+				}
+				// Simulate the cursor saved by the preceding batch before the next fetch.
+				repo.states[accountID] = batch.result.State
+			}
+			for index := 1; index < len(previousStates); index++ {
+				if previousStates[index] == nil || *previousStates[index] != test.batches[index-1].result.State {
+					t.Fatalf("batch %d did not resume from the saved cursor: %#v", index+1, previousStates[index])
+				}
+			}
+			entries := chronologicalLogEntries(logs.List(applog.Filter{AccountID: &account.ID, Limit: 200}).Items)
+			saved := 0
+			for _, entry := range entries {
+				if entry.Fields["sync_event"] == "batch_saved" {
+					if entry.Fields["sync_percent"] != fmt.Sprint(test.batches[saved].wantPercent) {
+						t.Fatalf("saved batch %d percent=%s, want %d", saved+1, entry.Fields["sync_percent"], test.batches[saved].wantPercent)
+					}
+					saved++
+				}
+			}
+			if saved != len(test.batches) || entries[len(entries)-1].Fields["sync_percent"] != "100" ||
+				entries[len(entries)-1].Fields["sync_event"] != "run_completed" {
+				t.Fatalf("sync did not save and complete all batches: %#v", entries)
+			}
+		})
+	}
+}
+
 func TestQueuedSyncLogsDetailedFlowAcrossPendingBatches(t *testing.T) {
 	account := domain.Account{
 		ID:                 41,

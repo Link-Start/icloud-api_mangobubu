@@ -150,8 +150,10 @@ func TestAdminAPIDualEntryPoints(t *testing.T) {
 				t.Fatalf("random account Location = %q, want %q", got, wantAccountLocation)
 			}
 
+			aliasAddress := "dual-alias-" + strings.ReplaceAll(test.name, " ", "-") + "@icloud.com"
+			connectManualAliasDirectory(t, env, accountPayload.Data.ID, aliasAddress)
 			aliasBody := adminAPITestJSON(t, map[string]string{
-				"address": "dual-alias-" + strings.ReplaceAll(test.name, " ", "-") + "@icloud.com",
+				"address": aliasAddress,
 				"label":   "dual entry",
 			})
 			aliasResponse := serveAdminRouterRequest(router, http.MethodPost,
