@@ -732,11 +732,12 @@ func TestAliasMutationsRejectInvalidAnonymousIDsWithoutRequest(t *testing.T) {
 func TestAliasMutationErrorsAreNotRetryableOrRetried(t *testing.T) {
 	transportFailure := errors.New("connection reset after mutation write")
 	tests := []struct {
-		name        string
-		respond     func(*http.Request) (*http.Response, error)
-		wantKind    error
-		wantStatus  int
-		serviceCode string
+		name         string
+		respond      func(*http.Request) (*http.Response, error)
+		wantKind     error
+		wantStatus   int
+		serviceCode  string
+		wantRejected bool
 	}{
 		{
 			name: "transport failure",
@@ -772,6 +773,7 @@ func TestAliasMutationErrorsAreNotRetryableOrRetried(t *testing.T) {
 				return testResponse(request, http.StatusOK, `{"success":false,"error":{"errorCode":"REJECTED"}}`, nil), nil
 			},
 			wantKind: ErrService, wantStatus: http.StatusOK, serviceCode: "REJECTED",
+			wantRejected: true,
 		},
 		{
 			name: "missing success",
@@ -816,7 +818,7 @@ func TestAliasMutationErrorsAreNotRetryableOrRetried(t *testing.T) {
 			}
 			var typed *Error
 			if !errors.As(err, &typed) || typed.StatusCode != test.wantStatus ||
-				typed.ServiceCode != test.serviceCode || typed.Retryable {
+				typed.ServiceCode != test.serviceCode || typed.Retryable || typed.ServiceRejected != test.wantRejected {
 				t.Fatalf("typed error = %#v", typed)
 			}
 			if requests != 1 {
@@ -975,6 +977,7 @@ func TestCreateAliasReturnsCandidateOnlyForUncertainReserveResults(t *testing.T)
 		reserve       func(*http.Request) (*http.Response, error)
 		wantCandidate bool
 		wantKind      error
+		wantRejected  bool
 	}{
 		{
 			name: "transport failure",
@@ -1004,6 +1007,14 @@ func TestCreateAliasReturnsCandidateOnlyForUncertainReserveResults(t *testing.T)
 			name: "malformed success response",
 			reserve: func(request *http.Request) (*http.Response, error) {
 				return testResponse(request, http.StatusOK, `{"success":`, nil), nil
+			},
+			wantCandidate: true,
+			wantKind:      ErrInvalidResponse,
+		},
+		{
+			name: "missing success flag",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusOK, `{"error":{"errorCode":-27577}}`, nil), nil
 			},
 			wantCandidate: true,
 			wantKind:      ErrInvalidResponse,
@@ -1042,7 +1053,8 @@ func TestCreateAliasReturnsCandidateOnlyForUncertainReserveResults(t *testing.T)
 			reserve: func(request *http.Request) (*http.Response, error) {
 				return testResponse(request, http.StatusOK, `{"success":false,"error":{"errorCode":"REJECTED"}}`, nil), nil
 			},
-			wantKind: ErrService,
+			wantKind:     ErrService,
+			wantRejected: true,
 		},
 		{
 			name: "explicit success false with server status",
@@ -1085,6 +1097,9 @@ func TestCreateAliasReturnsCandidateOnlyForUncertainReserveResults(t *testing.T)
 			var typed *Error
 			if !errors.As(err, &typed) || typed.Retryable {
 				t.Fatalf("reserve error = %#v, want non-retryable", typed)
+			}
+			if typed.ServiceRejected != test.wantRejected {
+				t.Fatalf("ServiceRejected = %v, want %v", typed.ServiceRejected, test.wantRejected)
 			}
 			if test.wantCandidate {
 				want := Alias{HME: "candidate@icloud.com", Label: "input label", Note: "input note"}

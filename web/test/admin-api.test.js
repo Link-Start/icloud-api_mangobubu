@@ -1385,6 +1385,7 @@ test("runtime log pages use offset filters and normalize pagination metadata", a
           request_id: "req-log-1",
           auto_create_run_id: "auto-run-1",
           attributes: {
+            auto_create_kind: "new",
             auto_create_stage: "failed",
             auto_create_percent: "100",
             auto_create_event: "run_failed",
@@ -1408,6 +1409,7 @@ test("runtime log pages use offset filters and normalize pagination metadata", a
 
   const result = await getRuntimeLogs({
     level: "error",
+    category: "creation",
     query: "同步失败",
     accountId: 12,
     autoCreateRunId: "auto-run-1",
@@ -1419,6 +1421,7 @@ test("runtime log pages use offset filters and normalize pagination metadata", a
   assert.equal(url.pathname, "/admin/api/v1/logs");
   assert.deepEqual(Object.fromEntries(url.searchParams), {
     level: "error",
+    category: "creation",
     query: "同步失败",
     account_id: "12",
     auto_create_run_id: "auto-run-1",
@@ -1431,6 +1434,7 @@ test("runtime log pages use offset filters and normalize pagination metadata", a
   assert.equal(result.items[0].accountId, 12);
   assert.equal(result.items[0].requestId, "req-log-1");
   assert.equal(result.items[0].autoCreateRunId, "auto-run-1");
+  assert.equal(result.items[0].autoCreateKind, "new");
   assert.equal(result.items[0].autoCreateStage, "failed");
   assert.equal(result.items[0].autoCreatePercent, 100);
   assert.equal(result.items[0].autoCreateEvent, "run_failed");
@@ -1449,6 +1453,40 @@ test("runtime log pages use offset filters and normalize pagination metadata", a
   assert.equal(result.total, 481);
   assert.equal(result.limit, 50);
   assert.equal(result.offset, 100);
+});
+
+test("all creation logs retain category and combined filters across every page", async () => {
+  const controller = new AbortController();
+  const requests = [];
+  const responses = [
+    { items: [{ id: 91 }, { id: 90 }], pagination: { total: 3, offset: 0, has_more: true } },
+    { items: [{ id: 89 }], pagination: { total: 3, offset: 2, has_more: false } },
+  ];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url, "https://admin.invalid"), options });
+    return jsonResponse(responses.shift());
+  };
+
+  const logs = await getAllRuntimeLogs({
+    category: "creation",
+    level: "error",
+    accountId: 12,
+    query: "目录",
+    signal: controller.signal,
+  });
+  assert.deepEqual(logs.map((entry) => entry.id), [91, 90, 89]);
+  assert.equal(requests.length, 2);
+  for (const [index, request] of requests.entries()) {
+    assert.deepEqual(Object.fromEntries(request.url.searchParams), {
+      level: "error",
+      category: "creation",
+      query: "目录",
+      account_id: "12",
+      limit: "1000",
+      ...(index === 1 ? { offset: "2" } : {}),
+    });
+    assert.equal(request.options.signal, controller.signal);
+  }
 });
 
 test("sync run logs follow every cursor without inheriting list filters", async () => {

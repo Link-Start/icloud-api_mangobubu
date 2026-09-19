@@ -60,6 +60,7 @@ func TestCreateAutoAliasReportsPendingDirectoryReadAsReconciliation(t *testing.T
 	if !containsAliasCreationPhase(progress, domain.AliasCreationPhaseReconciling) {
 		t.Fatalf("pending reconciliation did not report reconciling: %#v", progress)
 	}
+	assertAliasCreationProgressKind(t, progress, domain.AliasCreationKindReconcile)
 	if progress[len(progress)-1].Phase != domain.AliasCreationPhaseFailed {
 		t.Fatalf("terminal progress = %#v, want failed", progress[len(progress)-1])
 	}
@@ -236,6 +237,26 @@ func containsAliasCreationPhase(progress []domain.AliasCreationProgressUpdate, w
 		}
 	}
 	return false
+}
+
+func assertAliasCreationProgressKind(t *testing.T, progress []domain.AliasCreationProgressUpdate, want domain.AliasCreationKind) {
+	t.Helper()
+	for _, update := range progress {
+		if update.Phase == domain.AliasCreationPhasePreparing ||
+			update.Phase == domain.AliasCreationPhaseCheckingAccount ||
+			update.Phase == domain.AliasCreationPhaseCheckingCapacity {
+			if update.Kind != "" {
+				t.Fatalf("creation kind selected before reading pending state: %#v", update)
+			}
+			continue
+		}
+		if update.Kind != want {
+			t.Fatalf("progress kind = %q, want %q; update=%#v", update.Kind, want, update)
+		}
+	}
+	if len(progress) == 0 || progress[len(progress)-1].Kind != want {
+		t.Fatalf("terminal progress kind missing: %#v", progress)
+	}
 }
 
 func testAutoCreateDiagnosticNow() time.Time {

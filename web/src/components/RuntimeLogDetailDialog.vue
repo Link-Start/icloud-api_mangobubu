@@ -64,6 +64,10 @@
           <dt>触发方式</dt>
           <dd>{{ syncTriggerLabel }}</dd>
         </div>
+        <div v-if="hasAutoCreateFlow">
+          <dt>创建类别</dt>
+          <dd>{{ autoCreateKindLabel }}</dd>
+        </div>
         <div v-if="hasFlow" class="runtime-log-detail__meta-wide">
           <dt>{{ flowIdentifierLabel }}</dt>
           <dd><code>{{ flowRunId }}</code></dd>
@@ -223,7 +227,7 @@
                       (entry.upstreamRetryable !== null && entry.upstreamRetryable !== undefined)
                     "
                   >
-                    <dt>可重试</dt>
+                    <dt>当前请求可重试</dt>
                     <dd>{{ retryLabel(entry) }}</dd>
                   </div>
                   <div v-if="entry.elapsedMs !== null && entry.elapsedMs !== undefined">
@@ -359,6 +363,8 @@ import { formatTime } from "../utils/format.js";
 import {
   chronologicalRuntimeLogs,
   runtimeLogAttributesText,
+  runtimeLogAutoCreateFlowKind,
+  runtimeLogAutoCreateKindLabel,
   runtimeLogAutoCreateStageLabel,
   runtimeLogFlowContextText,
   runtimeLogLevelMeta,
@@ -434,6 +440,9 @@ const orderedFlowLogs = computed(() =>
     ...props.flowLogs,
     ...(props.log ? [props.log] : []),
   ]),
+);
+const autoCreateKindLabel = computed(() =>
+  runtimeLogAutoCreateKindLabel(runtimeLogAutoCreateFlowKind(orderedFlowLogs.value)),
 );
 const syncTriggerLabel = computed(() => {
   const trigger =
@@ -632,12 +641,11 @@ function batchElapsedMs(entry) {
 }
 
 function retryLabel(entry) {
-  const upstream = entry?.upstreamRetryable;
-  const retryable = entry?.retryable;
-  if (upstream !== null && upstream !== undefined) {
-    return `${booleanLabel(retryable)}（Apple：${booleanLabel(upstream)}）`;
+  const label = booleanLabel(entry?.retryable ?? entry?.upstreamRetryable);
+  if ((hasAutoCreateFlow.value || entry?.autoCreateRunId) && entry?.scheduleAction) {
+    return `${label}（后续执行以计划动作为准）`;
   }
-  return booleanLabel(retryable);
+  return label;
 }
 
 function elapsedLabel(value) {
@@ -717,10 +725,11 @@ function diagnosticLines(entry) {
   if (entry.httpStatus !== null && entry.httpStatus !== undefined) {
     lines.push(`HTTP 状态: ${entry.httpStatus}`);
   }
-  if (entry.retryable !== null && entry.retryable !== undefined) {
-    lines.push(`可重试: ${retryLabel(entry)}`);
-  } else if (entry.upstreamRetryable !== null && entry.upstreamRetryable !== undefined) {
-    lines.push(`Apple 可重试: ${booleanLabel(entry.upstreamRetryable)}`);
+  if (
+    (entry.retryable !== null && entry.retryable !== undefined) ||
+    (entry.upstreamRetryable !== null && entry.upstreamRetryable !== undefined)
+  ) {
+    lines.push(`当前请求可重试: ${retryLabel(entry)}`);
   }
   if (entry.elapsedMs !== null && entry.elapsedMs !== undefined) {
     lines.push(`已耗时: ${elapsedLabel(entry.elapsedMs)}`);
@@ -816,6 +825,7 @@ function flowLogText() {
     ? [
         "自动创建流程",
         `创建编号: ${flowRunId.value}`,
+        `创建类别: ${autoCreateKindLabel.value}`,
         `主号: ${accountDisplayLabel.value}`,
         `流程记录: ${orderedFlowLogs.value.length} 条`,
       ]

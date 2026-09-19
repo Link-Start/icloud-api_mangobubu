@@ -108,11 +108,16 @@ func TestAutoAliasRecoveryDiscardsLocallyAndNextAttemptCreates(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
+			var progress []domain.AliasCreationProgressUpdate
+			ctx = domain.WithAliasCreationProgressReporter(ctx, func(update domain.AliasCreationProgressUpdate) {
+				progress = append(progress, update)
+			})
 			alias, err := service.CreateAutoAlias(ctx, 3)
 			if Code(err) != CodeAliasCandidateDiscarded || !errors.Is(err, ErrAliasCandidateDiscarded) || alias.ID != 0 {
 				t.Fatalf("discard result = %#v, err=%v code=%s", alias, err, Code(err))
 			}
 			assertRecoveryPending(t, err, false)
+			assertAliasCreationProgressKind(t, progress, domain.AliasCreationKindReconcile)
 			if repo.pending != nil || repo.discardCalls != 1 || client.createCalls.Load() != 0 ||
 				client.deactivateCalls.Load() != 0 || client.deleteCalls.Load() != 0 {
 				t.Fatal("discard retained the candidate or performed a remote mutation")
@@ -127,11 +132,13 @@ func TestAutoAliasRecoveryDiscardsLocallyAndNextAttemptCreates(t *testing.T) {
 				}
 				return directory, session, nil
 			}
+			progress = nil
 			created, err := service.CreateAutoAlias(ctx, 3)
 			if err != nil || !created.Enabled || created.Address != "next-created@icloud.com" ||
 				client.createCalls.Load() != 1 || repo.discardCalls != 1 || repo.confirms.Load() != 1 {
 				t.Fatalf("next attempt failed to create once: alias=%#v err=%v creates=%d discards=%d", created, err, client.createCalls.Load(), repo.discardCalls)
 			}
+			assertAliasCreationProgressKind(t, progress, domain.AliasCreationKindNew)
 		})
 	}
 }

@@ -45,6 +45,12 @@ const AUTO_CREATE_STAGE_LABELS = Object.freeze({
   cancelled: "自动创建已取消",
 });
 
+const AUTO_CREATE_KIND_LABELS = Object.freeze({
+  new: "新建隐私邮箱",
+  reconcile: "复查待确认地址",
+  undetermined: "尚未判定",
+});
+
 const SYNC_TRIGGER_LABELS = Object.freeze({
   manual: "手动同步",
   automatic: "自动同步",
@@ -59,6 +65,7 @@ const FLOW_ATTRIBUTE_NAMES = new Set([
   "sync_percent",
   "sync_event",
   "auto_create_run_id",
+  "auto_create_kind",
   "auto_create_stage",
   "auto_create_percent",
   "auto_create_event",
@@ -263,6 +270,12 @@ export function normalizeRuntimeLog(raw = {}) {
     "auto_create_stage",
     "autoCreateStage",
     "AutoCreateStage",
+  );
+  const autoCreateKind = firstDefined(
+    raw,
+    "auto_create_kind",
+    "autoCreateKind",
+    "AutoCreateKind",
   );
   const autoCreatePercent = firstDefined(
     raw,
@@ -502,6 +515,15 @@ export function normalizeRuntimeLog(raw = {}) {
         "auto_create_stage",
         "autoCreateStage",
         "AutoCreateStage",
+      ),
+    ),
+    autoCreateKind: normalizedToken(
+      valueWithAttributeFallback(
+        autoCreateKind,
+        attributes,
+        "auto_create_kind",
+        "autoCreateKind",
+        "AutoCreateKind",
       ),
     ),
     autoCreatePercent: normalizedNullableNumber(
@@ -811,6 +833,7 @@ export function normalizeRuntimeLogPage(data = {}) {
 export function buildRuntimeLogQuery(options = {}) {
   const parameters = new URLSearchParams();
   const level = normalizeRuntimeLogLevel(options.level || "");
+  const category = normalizedToken(options.category);
   const query = String(options.query || "").trim();
   const accountId = String(options.accountId ?? "").trim();
   const rawLimit = Number(options.limit);
@@ -826,6 +849,7 @@ export function buildRuntimeLogQuery(options = {}) {
   const autoCreateRunId = String(options.autoCreateRunId ?? "").trim();
 
   if (level && options.level) parameters.set("level", level);
+  if (category) parameters.set("category", category);
   if (query) parameters.set("query", query);
   if (accountId) parameters.set("account_id", accountId);
   if (syncRunId) parameters.set("sync_run_id", syncRunId);
@@ -846,6 +870,23 @@ export function runtimeLogAutoCreateStageLabel(stage) {
   const normalized = normalizedToken(stage);
   if (!normalized) return "自动创建步骤";
   return AUTO_CREATE_STAGE_LABELS[normalized] || normalized.replaceAll("_", " ");
+}
+
+export function runtimeLogAutoCreateKindLabel(kind) {
+  const normalized = normalizedToken(kind);
+  return Object.hasOwn(AUTO_CREATE_KIND_LABELS, normalized)
+    ? AUTO_CREATE_KIND_LABELS[normalized]
+    : "未记录";
+}
+
+export function runtimeLogAutoCreateFlowKind(logs = []) {
+  let fallback = "";
+  for (const log of logs) {
+    const kind = normalizedToken(log?.autoCreateKind);
+    if (kind === "new" || kind === "reconcile") return kind;
+    if (kind === "undetermined") fallback = kind;
+  }
+  return fallback;
 }
 
 export function runtimeLogSyncTriggerLabel(trigger) {

@@ -26,6 +26,7 @@ type aliasCreationFlow struct {
 type aliasCreationFlowState struct {
 	mu                       sync.Mutex
 	stage                    domain.AliasCreationPhase
+	kind                     domain.AliasCreationKind
 	percent                  int
 	lastEvent                string
 	remoteSideEffectPossible bool
@@ -43,6 +44,7 @@ func (m *Manager) newAliasCreationFlow(startedAt time.Time) aliasCreationFlow {
 		startedAt: startedAt,
 		state: &aliasCreationFlowState{
 			stage:   domain.AliasCreationPhasePreparing,
+			kind:    domain.AliasCreationKindUndetermined,
 			percent: 5,
 		},
 	}
@@ -79,6 +81,12 @@ func (flow aliasCreationFlow) hasRecordedRemoteSideEffect() bool {
 }
 
 func (flow aliasCreationFlow) hasRemoteSideEffectPossibleForError(stage domain.AliasCreationPhase, err error) bool {
+	var remote remoteSideEffectProvider
+	var pending pendingConfirmationProvider
+	if errors.As(err, &remote) && remote.RemoteSideEffectPossible() ||
+		errors.As(err, &pending) && pending.PendingConfirmation() {
+		return true
+	}
 	var coded diagnosticCodeProvider
 	if errors.As(err, &coded) && strings.TrimSpace(coded.DiagnosticCode()) == "APPLE_ALIAS_CANDIDATE_DISCARDED" {
 		// A complete directory check found no remote alias and only the local
@@ -86,17 +94,17 @@ func (flow aliasCreationFlow) hasRemoteSideEffectPossibleForError(stage domain.A
 		// a remote creation from the read-only reconciliation stage.
 		return flow.hasRecordedRemoteSideEffect()
 	}
-	if stage == domain.AliasCreationPhaseReserving && explicitRateLimitRejection(err) {
-		// A known HME throttle in a definitive HTTP response rejects the
-		// business operation. Preserve an earlier forwarding mutation marker, but
-		// do not infer an alias mutation from the reserve stage alone.
+	if stage == domain.AliasCreationPhaseReserving && explicitAliasCreationRejection(err) {
+		// An explicit HME business failure rejects this operation. Preserve an
+		// earlier forwarding mutation marker, but do not infer an alias mutation
+		// from the reserve stage alone.
 		return flow.hasRecordedRemoteSideEffect()
 	}
 	return flow.hasRemoteSideEffectPossible(stage)
 }
 
-func explicitRateLimitRejection(err error) bool {
-	if err == nil || !aliasCreationRequiresRateLimitCooldown(err) {
+func explicitAliasCreationRejection(err error) bool {
+	if err == nil {
 		return false
 	}
 	var visit func(error) bool
@@ -105,6 +113,11 @@ func explicitRateLimitRejection(err error) bool {
 			return false
 		}
 		if upstream, ok := current.(*apple.Error); ok && upstream != nil {
+			if upstream.ServiceRejected && upstream.Kind == apple.ErrService &&
+				upstream.StatusCode >= http.StatusOK && upstream.StatusCode < http.StatusMultipleChoices &&
+				(upstream.Op == "generate Hide My Email alias" || upstream.Op == "reserve Hide My Email alias") {
+				return true
+			}
 			if apple.IsRateLimited(upstream) &&
 				(upstream.StatusCode == http.StatusTooManyRequests ||
 					upstream.StatusCode >= http.StatusOK && upstream.StatusCode < http.StatusMultipleChoices) {
@@ -176,6 +189,7 @@ func (m *Manager) logAliasCreationFlowLocked(
 	}
 	attrs = append(attrs,
 		slog.String("auto_create_run_id", flow.runID),
+		slog.String("auto_create_kind", safeAliasCreationKind(flow.state.kind)),
 		slog.String("auto_create_stage", safeAliasCreationStage(stage)),
 		slog.Int("auto_create_percent", normalizedAliasCreationPercent(percent)),
 		slog.String("auto_create_event", safeAliasCreationEvent(event)),
@@ -194,6 +208,20 @@ func (m *Manager) logAliasCreationProgress(
 	if flow == nil {
 		return
 	}
+	if flow.state == nil {
+		return
+	}
+	flow.state.mu.Lock()
+	defer flow.state.mu.Unlock()
+	if flow.state.terminal {
+		return
+	}
+	// Only a selected kind is accepted. Early reports and older producers do
+	// not reset it, and unrelated diagnostic text never becomes a log field.
+	switch update.Kind {
+	case domain.AliasCreationKindNew, domain.AliasCreationKindReconcile:
+		flow.state.kind = update.Kind
+	}
 	// The manager owns terminal records because it also knows whether schedule
 	// state was persisted and whether another slot remains. Keep the last
 	// service stage here so a failure points to the operation that actually ran.
@@ -201,14 +229,6 @@ func (m *Manager) logAliasCreationProgress(
 	case domain.AliasCreationPhaseCompleted,
 		domain.AliasCreationPhaseFailed,
 		domain.AliasCreationPhaseCancelled:
-		return
-	}
-	if flow.state == nil {
-		return
-	}
-	flow.state.mu.Lock()
-	defer flow.state.mu.Unlock()
-	if flow.state.terminal {
 		return
 	}
 	stage := update.Phase
@@ -244,6 +264,15 @@ func (m *Manager) logAliasCreationProgress(
 		extra = append(extra, slog.Int("confirmation_attempt", update.Attempt))
 	}
 	m.logAliasCreationFlowLocked(ctx, slog.LevelDebug, aliasCreationStageMessage(stage), accountID, *flow, stage, percent, "stage_started", extra...)
+}
+
+func safeAliasCreationKind(kind domain.AliasCreationKind) string {
+	switch kind {
+	case domain.AliasCreationKindNew, domain.AliasCreationKindReconcile:
+		return string(kind)
+	default:
+		return string(domain.AliasCreationKindUndetermined)
+	}
 }
 
 func (m *Manager) logAliasCreationFailure(
@@ -691,6 +720,9 @@ func diagnoseAliasCreationError(err error) aliasCreationErrorInfo {
 	}
 	info.class = aliasCreationErrorClass(info.code)
 	info.reason = aliasCreationErrorReason(info.code)
+	if info.code == "APPLE_UPSTREAM_ERROR" && info.upstream != nil && info.upstream.ServiceRejected {
+		info.reason = "Apple 已明确返回业务失败，HTTP 成功状态不代表操作成功；请结合服务码指纹排查"
+	}
 	return info
 }
 

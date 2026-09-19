@@ -174,6 +174,46 @@ func TestListFiltersAutoCreateRunIDExactly(t *testing.T) {
 	}
 }
 
+func TestListCreationCategoryFiltersBeforePagination(t *testing.T) {
+	handler := New(20)
+	logger := slog.New(handler)
+	logger.Info("legacy creation", "auto_create_run_id", "auto-run-1", "account_id", int64(42))
+	logger.Info("自动创建 auto_create_run_id=auto-run-1")
+	logger.Warn("reconcile candidate", slog.Group("autocreate", "auto_create_run_id", "auto-run-2", "account_id", int64(42)))
+	logger.Info("sync only", "sync_run_id", "sync-run-1")
+	logger.Info("literal dot key", "autocreate.auto_create_run_id", "auto-run-2")
+	logger.Info("empty run id", "auto_create_run_id", "")
+	logger.Info("blank run id", "auto_create_run_id", " \t ")
+	logger.Warn("reconcile candidate again", slog.Group("worker.with.dot", "auto_create_run_id", "auto-run-2", "account_id", int64(42)))
+	logger.Error("newest creation", "auto_create_run_id", "auto-run-3", "account_id", int64(7))
+
+	accountID := int64(42)
+	for _, test := range []struct {
+		name       string
+		filter     Filter
+		ids        []uint64
+		total      int
+		hasMore    bool
+		nextBefore uint64
+	}{
+		{name: "all categories", filter: Filter{Limit: 20}, ids: []uint64{9, 8, 7, 6, 5, 4, 3, 2, 1}, total: 9},
+		{name: "creation first page", filter: Filter{Category: CategoryCreation, Limit: 2}, ids: []uint64{9, 8}, total: 4, hasMore: true, nextBefore: 8},
+		{name: "creation cursor page", filter: Filter{Category: CategoryCreation, BeforeID: 8, Limit: 2}, ids: []uint64{3, 1}, total: 4},
+		{name: "creation offset page", filter: Filter{Category: CategoryCreation, Offset: 1, Limit: 2}, ids: []uint64{8, 3}, total: 4, hasMore: true, nextBefore: 3},
+		{name: "creation offset beyond end", filter: Filter{Category: CategoryCreation, Offset: 4, Limit: 2}, total: 4},
+		{name: "combined filters", filter: Filter{Category: CategoryCreation, Level: "warn", AccountID: &accountID, AutoCreateRunID: "auto-run-2", Query: "reconcile", Limit: 1}, ids: []uint64{8}, total: 2, hasMore: true, nextBefore: 8},
+		{name: "unknown category", filter: Filter{Category: "create", Limit: 20}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			page := handler.List(test.filter)
+			assertIDs(t, page.Items, test.ids...)
+			if page.Total != test.total || page.HasMore != test.hasMore || page.NextBeforeID != test.nextBefore {
+				t.Fatalf("page = %#v; want total=%d has-more=%t next-before=%d", page, test.total, test.hasMore, test.nextBefore)
+			}
+		})
+	}
+}
+
 func TestFieldKeyHasSuffixDistinguishesEscapedDots(t *testing.T) {
 	if !FieldKeyHasSuffix("autocreate.auto_create_run_id", "auto_create_run_id") {
 		t.Fatal("grouped field was not recognized")

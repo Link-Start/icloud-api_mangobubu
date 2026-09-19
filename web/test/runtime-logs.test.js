@@ -9,6 +9,8 @@ import {
   normalizeRuntimeLog,
   normalizeRuntimeLogPage,
   runtimeLogAttributesText,
+  runtimeLogAutoCreateFlowKind,
+  runtimeLogAutoCreateKindLabel,
   runtimeLogAutoCreateStageLabel,
   runtimeLogFlowContextText,
   runtimeLogLevelMeta,
@@ -43,6 +45,7 @@ test("runtime logs normalize timestamps, levels, attributes, and promoted contex
       syncEvent: "",
       autoCreateRunId: "",
       autoCreateStage: "",
+      autoCreateKind: "",
       autoCreatePercent: null,
       autoCreateEvent: "",
       syncTrigger: "",
@@ -111,6 +114,7 @@ test("runtime log pages normalize page totals while preserving flow cursors", ()
           syncEvent: "",
           autoCreateRunId: "",
           autoCreateStage: "",
+          autoCreateKind: "",
           autoCreatePercent: null,
           autoCreateEvent: "",
           syncTrigger: "",
@@ -154,6 +158,7 @@ test("runtime log pages normalize page totals while preserving flow cursors", ()
 test("runtime log queries trim filters, encode values, and clamp limits", () => {
   const query = buildRuntimeLogQuery({
     level: "ERROR",
+    category: " CREATION ",
     query: " connection closed ",
     accountId: 12,
     syncRunId: "sync-run-7",
@@ -166,6 +171,7 @@ test("runtime log queries trim filters, encode values, and clamp limits", () => 
 
   assert.deepEqual(Object.fromEntries(parameters), {
     level: "error",
+    category: "creation",
     query: "connection closed",
     account_id: "12",
     sync_run_id: "sync-run-7",
@@ -222,11 +228,13 @@ test("sync flow fields normalize from structured attributes", () => {
 test("automatic creation flow fields normalize from top-level and grouped attributes", () => {
   const topLevelLog = normalizeRuntimeLog({
     auto_create_run_id: "auto-run-top",
+    auto_create_kind: "UNDETERMINED",
     auto_create_stage: "CHECKING-ACCOUNT",
     auto_create_percent: "8",
     auto_create_event: "RUN-STARTED",
   });
   assert.equal(topLevelLog.autoCreateRunId, "auto-run-top");
+  assert.equal(topLevelLog.autoCreateKind, "undetermined");
   assert.equal(topLevelLog.autoCreateStage, "checking_account");
   assert.equal(topLevelLog.autoCreatePercent, 8);
   assert.equal(topLevelLog.autoCreateEvent, "run_started");
@@ -239,6 +247,7 @@ test("automatic creation flow fields normalize from top-level and grouped attrib
     attributes: {
       account_id: "12",
       "autocreate.auto_create_run_id": "auto-run-7",
+      "autocreate.auto_create_kind": "NEW",
       "autocreate.auto_create_stage": "FAILED",
       "autocreate.auto_create_percent": "104",
       "autocreate.auto_create_event": "RUN_FAILED",
@@ -264,6 +273,7 @@ test("automatic creation flow fields normalize from top-level and grouped attrib
   });
 
   assert.equal(log.autoCreateRunId, "auto-run-7");
+  assert.equal(log.autoCreateKind, "new");
   assert.equal(log.autoCreateStage, "failed");
   assert.equal(log.autoCreatePercent, 100);
   assert.equal(log.autoCreateEvent, "run_failed");
@@ -286,6 +296,34 @@ test("automatic creation flow fields normalize from top-level and grouped attrib
   assert.equal(log.serviceCodePresent, true);
   assert.equal(log.serviceCodeFingerprint, "deadbeef01234567");
   assert.equal(runtimeLogFlowContextText(log), "");
+});
+
+test("creation kinds distinguish old records and resolve a whole run beyond its initial stage", () => {
+  for (const kind of ["new", "reconcile"]) {
+    const logs = [
+      normalizeRuntimeLog({ attributes: { auto_create_kind: "undetermined" } }),
+      normalizeRuntimeLog({ attributes: { auto_create_kind: kind } }),
+      normalizeRuntimeLog({ attributes: { auto_create_stage: "reconciling", auto_create_kind: kind } }),
+    ];
+    assert.equal(runtimeLogAutoCreateFlowKind(logs), kind);
+  }
+  assert.equal(runtimeLogAutoCreateKindLabel("new"), "新建隐私邮箱");
+  assert.equal(runtimeLogAutoCreateKindLabel("reconcile"), "复查待确认地址");
+  assert.equal(runtimeLogAutoCreateKindLabel("undetermined"), "尚未判定");
+  for (const value of ["", undefined, "future_kind", "constructor"]) {
+    assert.equal(runtimeLogAutoCreateKindLabel(value), "未记录");
+  }
+  assert.equal(runtimeLogAutoCreateFlowKind([normalizeRuntimeLog({})]), "");
+  assert.equal(
+    runtimeLogAutoCreateFlowKind([normalizeRuntimeLog({ autoCreateKind: "undetermined" })]),
+    "undetermined",
+  );
+  const fallback = normalizeRuntimeLog({
+    autoCreateKind: "",
+    attributes: { "flow.AutoCreateKind": "RECONCILE" },
+  });
+  assert.equal(fallback.autoCreateKind, "reconcile");
+  assert.equal(runtimeLogFlowContextText(fallback), "");
 });
 
 test("automatic creation diagnostics normalize status, retry, timing, and schedule fields", () => {

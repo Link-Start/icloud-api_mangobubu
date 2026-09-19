@@ -55,7 +55,7 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 	response := env.request(
 		t,
 		http.MethodGet,
-		"/admin/api/v1/logs?level=ERROR&query=%20imap%20&keyword=ignored&account_id=42&sync_run_id=sync-run-123&auto_create_run_id=auto-run-123&before_id=100&offset=0&limit=20",
+		"/admin/api/v1/logs?category=creation&level=ERROR&query=%20imap%20&keyword=ignored&account_id=42&sync_run_id=sync-run-123&auto_create_run_id=auto-run-123&before_id=100&offset=0&limit=20",
 		nil,
 		"",
 		[]*http.Cookie{sessionCookie},
@@ -69,6 +69,9 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 	}
 	if source.filter.Level != "error" || source.filter.Query != "imap" || source.filter.BeforeID != 100 || source.filter.Limit != 20 {
 		t.Fatalf("application log filter = %#v", source.filter)
+	}
+	if source.filter.Category != applog.CategoryCreation {
+		t.Fatalf("application log category filter = %q, want creation", source.filter.Category)
 	}
 	if source.filter.AccountID == nil || *source.filter.AccountID != 42 {
 		t.Fatalf("application log account filter = %#v, want 42", source.filter.AccountID)
@@ -120,11 +123,11 @@ func TestAdminAPIApplicationLogsKeywordCompatibilityAndEmptySource(t *testing.T)
 	source := &stubApplicationLogSource{page: applog.Page{Items: []applog.Entry{}}}
 	env.server.SetApplicationLogSource(source)
 
-	response := env.request(t, http.MethodGet, "/admin/api/v1/logs?keyword=%20legacy%20", nil, "", []*http.Cookie{sessionCookie}, "")
+	response := env.request(t, http.MethodGet, "/admin/api/v1/logs?category=&keyword=%20legacy%20", nil, "", []*http.Cookie{sessionCookie}, "")
 	if response.Code != http.StatusOK {
 		t.Fatalf("legacy application log query status = %d; body=%s", response.Code, response.Body.String())
 	}
-	if source.filter.Query != "legacy" || source.filter.Limit != adminAPIDefaultLogLimit {
+	if source.filter.Query != "legacy" || source.filter.Category != "" || source.filter.Limit != adminAPIDefaultLogLimit {
 		t.Fatalf("legacy application log filter = %#v", source.filter)
 	}
 
@@ -208,6 +211,8 @@ func TestAdminAPIApplicationLogsRejectInvalidFilters(t *testing.T) {
 
 	for _, query := range []string{
 		"level=trace",
+		"category=create",
+		"category=CREATION",
 		"account_id=0",
 		"account_id=not-an-id",
 		"before_id=-1",

@@ -73,6 +73,14 @@ func (s *Server) adminAPIListApplicationLogs(c *gin.Context) {
 }
 
 func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
+	category := strings.TrimSpace(c.Query("category"))
+	switch category {
+	case "", applog.CategoryCreation:
+	default:
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "category 参数无效")
+		return applog.Filter{}, false
+	}
+
 	level := strings.ToLower(strings.TrimSpace(c.Query("level")))
 	switch level {
 	case "", "debug", "info", "warn", "error":
@@ -121,6 +129,7 @@ func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
 
 	return applog.Filter{
 		Level:           level,
+		Category:        category,
 		Query:           query,
 		AccountID:       accountID,
 		SyncRunID:       syncRunID,

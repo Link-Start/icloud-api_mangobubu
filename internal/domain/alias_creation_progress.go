@@ -2,6 +2,16 @@ package domain
 
 import "context"
 
+// AliasCreationKind describes the work selected for one automatic-creation run.
+// A new run keeps its kind while confirming the candidate it just submitted.
+type AliasCreationKind string
+
+const (
+	AliasCreationKindUndetermined AliasCreationKind = "undetermined"
+	AliasCreationKindNew          AliasCreationKind = "new"
+	AliasCreationKindReconcile    AliasCreationKind = "reconcile"
+)
+
 // AliasCreationPhase identifies one non-sensitive stage of a Hide My Email
 // automatic-creation attempt.
 type AliasCreationPhase string
@@ -32,9 +42,17 @@ type AliasCreationProgressUpdate struct {
 	Phase   AliasCreationPhase
 	Percent int
 	Attempt int
+	Kind    AliasCreationKind
 }
 
 type aliasCreationProgressReporterKey struct{}
+type aliasCreationKindKey struct{}
+
+// WithAliasCreationKind identifies the selected work for subsequent progress
+// reports, including a terminal report before the next stage starts.
+func WithAliasCreationKind(ctx context.Context, kind AliasCreationKind) context.Context {
+	return context.WithValue(ctx, aliasCreationKindKey{}, kind)
+}
 
 // WithAliasCreationProgressReporter attaches a lightweight synchronous
 // callback to an automatic-creation context. Reporters must return promptly.
@@ -67,9 +85,11 @@ func ReportAliasCreationProgress(
 	} else if percent > 100 {
 		percent = 100
 	}
+	kind, _ := ctx.Value(aliasCreationKindKey{}).(AliasCreationKind)
 	reporter(AliasCreationProgressUpdate{
 		Phase:   phase,
 		Percent: percent,
 		Attempt: attempt,
+		Kind:    kind,
 	})
 }

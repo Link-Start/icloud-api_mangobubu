@@ -30,6 +30,18 @@
 
     <div class="runtime-log-filters" role="search" aria-label="筛选全部日志">
       <label class="runtime-log-filter">
+        <span>类别</span>
+        <el-select
+          v-model="filters.category"
+          aria-label="按日志类别筛选"
+          @change="applyFilters"
+        >
+          <el-option label="全部类别" value="" />
+          <el-option label="创建" value="creation" />
+        </el-select>
+      </label>
+
+      <label class="runtime-log-filter">
         <span>级别</span>
         <el-select
           v-model="filters.level"
@@ -309,7 +321,9 @@ function routeFilterState() {
   const rawLevel = queryValue(route.query.level);
   const level = rawLevel ? normalizeRuntimeLogLevel(rawLevel) : "";
   const accountId = queryValue(route.query.account_id);
+  const category = queryValue(route.query.category).toLowerCase();
   return {
+    category: category === "creation" ? category : "",
     level: selectableLevels.has(level) ? level : "",
     accountId: /^\d+$/.test(accountId) && Number(accountId) > 0 ? accountId : "",
     query: queryValue(route.query.query),
@@ -320,6 +334,7 @@ const initialFilters = routeFilterState();
 const logs = ref([]);
 const accounts = ref([]);
 const filters = reactive({
+  category: initialFilters.category,
   level: initialFilters.level,
   accountId: initialFilters.accountId,
 });
@@ -349,13 +364,13 @@ let detailFlowAbortController = null;
 let viewActive = true;
 
 const currentFilterKey = computed(() =>
-  [filters.level, filters.accountId, appliedKeyword.value].join("\u0000"),
+  [filters.category, filters.level, filters.accountId, appliedKeyword.value].join("\u0000"),
 );
 const hasActiveFilters = computed(() =>
-  Boolean(filters.level || filters.accountId || keywordDraft.value.trim()),
+  Boolean(filters.category || filters.level || filters.accountId || keywordDraft.value.trim()),
 );
 const hasAppliedFilters = computed(() =>
-  Boolean(filters.level || filters.accountId || appliedKeyword.value),
+  Boolean(filters.category || filters.level || filters.accountId || appliedKeyword.value),
 );
 
 function formatAccountIdentity(account) {
@@ -422,6 +437,7 @@ function searchAccounts(query) {
 
 function currentRequestOptions(page = currentPage.value) {
   return {
+    category: filters.category,
     level: filters.level,
     query: appliedKeyword.value,
     accountId: filters.accountId,
@@ -528,6 +544,7 @@ function loadLatestLogs({ silent = false, force = false } = {}) {
 
 function updateRouteQuery() {
   const query = {};
+  if (filters.category) query.category = filters.category;
   if (filters.level) query.level = filters.level;
   if (filters.accountId) query.account_id = filters.accountId;
   if (appliedKeyword.value) query.query = appliedKeyword.value;
@@ -580,6 +597,7 @@ function applyFilters() {
 }
 
 function resetFilters() {
+  filters.category = "";
   filters.level = "";
   filters.accountId = "";
   keywordDraft.value = "";
@@ -670,16 +688,18 @@ watch(detailVisible, (visible) => {
 });
 
 watch(
-  () => [route.query.level, route.query.account_id, route.query.query],
+  () => [route.query.category, route.query.level, route.query.account_id, route.query.query],
   () => {
     const next = routeFilterState();
     if (
+      next.category === filters.category &&
       next.level === filters.level &&
       next.accountId === filters.accountId &&
       next.query === appliedKeyword.value
     ) {
       return;
     }
+    filters.category = next.category;
     filters.level = next.level;
     filters.accountId = next.accountId;
     keywordDraft.value = next.query;
@@ -725,6 +745,7 @@ onBeforeUnmount(() => {
 .runtime-log-filters {
   display: grid;
   grid-template-columns:
+    minmax(110px, 0.5fr)
     minmax(120px, 0.55fr)
     minmax(190px, 0.8fr)
     minmax(260px, 1.5fr)
@@ -784,7 +805,7 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid var(--border);
 }
 
-@media (max-width: 1080px) {
+@media (max-width: 1280px) {
   .runtime-log-filters {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

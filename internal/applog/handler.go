@@ -34,6 +34,7 @@ const (
 
 	DefaultListLimit = 20
 	MaxListLimit     = 1000
+	CategoryCreation = "creation"
 
 	maxSourceBytes = 512
 	fieldOverhead  = 16
@@ -55,9 +56,11 @@ type Entry struct {
 // Filter selects entries from newest to oldest. BeforeID is exclusive; zero
 // starts at the newest retained entry. Offset skips matching entries after the
 // cursor is applied. Level is empty for all levels or a slog level name such as
-// INFO, WARN, or ERROR.
+// INFO, WARN, or ERROR. Category is empty for all entries or CategoryCreation
+// for entries with a non-empty structured auto_create_run_id.
 type Filter struct {
 	Level           string
+	Category        string
 	Query           string
 	AccountID       *int64
 	SyncRunID       string
@@ -230,8 +233,8 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// List returns a reverse-chronological page. Invalid level names match no
-// entries; HTTP callers should reject them as invalid query parameters.
+// List returns a reverse-chronological page. Invalid level or category names
+// match no entries; HTTP callers should reject them as invalid query parameters.
 func (h *Handler) List(filter Filter) Page {
 	page := Page{Items: make([]Entry, 0)}
 	if h == nil || h.ring == nil {
@@ -254,6 +257,10 @@ func (h *Handler) List(filter Filter) Page {
 	if !valid {
 		return page
 	}
+	category := strings.TrimSpace(filter.Category)
+	if category != "" && category != CategoryCreation {
+		return page
+	}
 	query := strings.ToLower(strings.TrimSpace(filter.Query))
 
 	h.ring.mu.RLock()
@@ -263,6 +270,9 @@ func (h *Handler) List(filter Filter) Page {
 		index := (h.ring.head + h.ring.count - 1 - ringOffset) % len(h.ring.entries)
 		candidate := h.ring.entries[index].entry
 		if levelSet && !matchesLevel(candidate.Level, level) {
+			continue
+		}
+		if category == CategoryCreation && !entryHasNonEmptyField(candidate, "auto_create_run_id") {
 			continue
 		}
 		if filter.AccountID != nil && !entryHasAccountID(candidate, *filter.AccountID) {
@@ -345,6 +355,15 @@ func entryHasExactField(entry Entry, name, want string) bool {
 			continue
 		}
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func entryHasNonEmptyField(entry Entry, name string) bool {
+	for key, value := range entry.Fields {
+		if FieldKeyHasSuffix(key, name) && strings.TrimSpace(value) != "" {
 			return true
 		}
 	}

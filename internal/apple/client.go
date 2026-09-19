@@ -622,7 +622,9 @@ func decodeHMEResult(operation string, response responseData) (json.RawMessage, 
 		return nil, response.operationError("decode "+operation, ErrInvalidResponse, errors.New("success must be a boolean"))
 	}
 	if !*envelope.Success {
-		return nil, responseError(operation, ErrService, response)
+		err := responseError(operation, ErrService, response)
+		err.ServiceRejected = true
+		return nil, err
 	}
 	trimmed := bytes.TrimSpace(envelope.Result)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -652,7 +654,9 @@ func decodeHMEMutation(operation string, response responseData) error {
 			errors.New("success must be a boolean"))
 	}
 	if !*envelope.Success {
-		return responseError(operation, ErrService, response)
+		err := responseError(operation, ErrService, response)
+		err.ServiceRejected = true
+		return err
 	}
 	return nil
 }
@@ -1258,7 +1262,7 @@ func serviceCodeValue(raw json.RawMessage) string {
 	return string(trimmed)
 }
 
-func responseError(operation string, kind error, response responseData) error {
+func responseError(operation string, kind error, response responseData) *Error {
 	err := response.operationError(operation, kind, nil)
 	err.ServiceCode = responseServiceCode(response.body)
 	return err

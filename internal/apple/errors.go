@@ -34,7 +34,12 @@ type Error struct {
 	Kind        error
 	StatusCode  int
 	ServiceCode string
-	Retryable   bool
+	// ServiceRejected records an explicit success:false in a successful HTTP
+	// HME response. It describes this operation, not earlier remote changes.
+	ServiceRejected bool
+	// Retryable is the client's permission to replay this request. Mutations
+	// may override it even when the underlying service failure is transient.
+	Retryable bool
 	// RetryAfter is a non-sensitive server delay hint, not permission to replay
 	// the operation. Zero means no positive delay is available.
 	RetryAfter time.Duration

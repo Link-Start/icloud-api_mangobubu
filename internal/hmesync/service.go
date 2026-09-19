@@ -694,6 +694,11 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	if pendingErr != nil && !errors.Is(pendingErr, store.ErrNotFound) {
 		return domain.Alias{}, pendingErr
 	}
+	if hasPendingConfirmation {
+		ctx = domain.WithAliasCreationKind(ctx, domain.AliasCreationKindReconcile)
+	} else {
+		ctx = domain.WithAliasCreationKind(ctx, domain.AliasCreationKindNew)
+	}
 	if !hasPendingConfirmation {
 		count, err := countEnabled(ctx, accountID)
 		if err != nil {
