@@ -251,7 +251,7 @@
             </span>
           </div>
           <div v-if="aliasSyncSummary" class="apple-session-strip__summary">
-            上次同步（转发至本主号的 Apple 地址）：启用
+            上次同步（转发至 Apple 当前目标的地址）：启用
             {{ Math.max(0, aliasSyncSummary.total - aliasSyncSummary.inactiveCount) }}，停用
             {{ aliasSyncSummary.inactiveCount }}；本地已登记
             {{ account.aliasCount }}（含停用及待确认记录）。本次新增登记
@@ -730,7 +730,7 @@
           <p class="field-help form-span">
             {{ isCustomMailbox
               ? '登记由此主号接收邮件的自定义邮箱地址，并签发整套凭证。'
-              : '请先在 iCloud 创建隐私邮箱，或开启上方自动创建。此处登记 Apple 已有地址；确认地址已启用且转发至此主号后，才会签发整套凭证。' }}
+              : '请先在 iCloud 创建隐私邮箱，或开启上方自动创建。此处登记 Apple 已有地址；确认地址已启用且符合 Apple 当前转发设置后，才会签发整套凭证。' }}
           </p>
           <el-form-item
             :label="isCustomMailbox ? '邮箱地址（本地登记）' : '已在 Apple 创建的隐私邮箱地址'"
@@ -1056,9 +1056,13 @@ const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
   APPLE_ALIAS_INACTIVE:
     "Apple 目录中的候选地址已停用，本地记录已保留；请在 iCloud 重新启用，或确认不再使用后通过邮箱列表删除",
   APPLE_ACCOUNT_MISMATCH:
-    "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
+    "Apple 登录账户身份或返回的转发信息不一致，请核对登录账户和转发设置后重新开启",
   APPLE_FORWARDING_TARGET_MISSING:
-    "Apple 未能确认隐私邮箱的默认转发目标，本次没有发起创建；请确认当前主号可作为转发邮箱，或先在 iCloud 手动创建一个隐私邮箱后重新同步",
+    "Apple 未能确认隐私邮箱的默认转发目标，本次没有发起创建；请在转发设置中选择 Apple 提供的可用邮箱后重试",
+  APPLE_FORWARDING_TARGET_INVALID:
+    "Apple 返回的默认转发地址无效，请重新获取转发设置并选择可用邮箱",
+  APPLE_FORWARDING_NOT_CONFIRMED:
+    "Apple 尚未确认转发设置，请重新获取当前设置后重试",
   ACCOUNT_CHANGED: "主号信息在创建过程中发生变化，请刷新页面并确认主号信息后重试",
   ALIAS_OWNERSHIP_CONFLICT:
     "Apple 创建的隐私邮箱已属于其他主号，请检查主号归属后重试",
@@ -1825,7 +1829,7 @@ async function performAliasesSync() {
       : "，本次没有新增登记";
     const directoryNotice = `；本次自动移除 ${result.summary.removedCount} 个本地地址（Apple 已不存在），本次更新停用 ${result.summary.inactiveUpdatedCount} 个、Apple 已恢复 ${result.summary.restoredCount} 个（可手动启用）`;
     successMessage(
-      `隐私邮箱同步完成，转发至本主号的 Apple 地址：启用 ${Math.max(0, result.summary.total - result.summary.inactiveCount)} 个、停用 ${result.summary.inactiveCount} 个；本地已登记 ${account.value.aliasCount} 个（含停用及待确认记录）${createdNotice}${capacityNotice}${directoryNotice}。`,
+      `隐私邮箱同步完成，转发至 Apple 当前目标的地址：启用 ${Math.max(0, result.summary.total - result.summary.inactiveCount)} 个、停用 ${result.summary.inactiveCount} 个；本地已登记 ${account.value.aliasCount} 个（含停用及待确认记录）${createdNotice}${capacityNotice}${directoryNotice}。`,
     );
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;

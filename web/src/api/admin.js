@@ -734,6 +734,40 @@ export async function updateForwardingSettings(accountId, email, csrfToken) {
   return normalizeForwardingSettings(data);
 }
 
+export function getAccountEmails(accountId) {
+  return apiRequest(`/accounts/${encodeURIComponent(accountId)}/forwarding/emails`);
+}
+
+export function loginEmailAccount(accountId, password, csrfToken) {
+  return apiRequest(`/accounts/${encodeURIComponent(accountId)}/forwarding/email-auth`, {
+    method: "POST", body: { password }, csrfToken,
+  });
+}
+
+export function verifyEmailAccountLogin(accountId, challengeId, code, csrfToken) {
+  return apiRequest(`/accounts/${encodeURIComponent(accountId)}/forwarding/email-auth/verify`, {
+    method: "POST", body: { challenge_id: challengeId, code }, csrfToken,
+  });
+}
+
+export function beginAccountEmail(accountId, address, csrfToken) {
+  return apiRequest(`/accounts/${encodeURIComponent(accountId)}/forwarding/emails`, {
+    method: "POST", body: { address }, csrfToken,
+  });
+}
+
+export function verifyAccountEmail(accountId, challengeId, code, csrfToken) {
+  return apiRequest(`/accounts/${encodeURIComponent(accountId)}/forwarding/emails/verify`, {
+    method: "POST", body: { challenge_id: challengeId, code }, csrfToken,
+  });
+}
+
+export function deleteAccountEmail(accountId, address, csrfToken) {
+  return apiRequest(`/accounts/${encodeURIComponent(accountId)}/forwarding/emails`, {
+    method: "DELETE", body: { address }, csrfToken,
+  });
+}
+
 function normalizeSyncSummary(raw = {}) {
   return {
     total:

@@ -748,6 +748,8 @@ func isAllowedAliasCreationErrorCode(code string) bool {
 		"APPLE_ALIAS_INACTIVE",
 		"APPLE_ACCOUNT_MISMATCH",
 		"APPLE_FORWARDING_TARGET_MISSING",
+		"APPLE_FORWARDING_TARGET_INVALID",
+		"APPLE_FORWARDING_NOT_CONFIRMED",
 		"ACCOUNT_CHANGED",
 		"ALIAS_OWNERSHIP_CONFLICT",
 		"ACCOUNT_DISABLED",
@@ -775,7 +777,8 @@ func aliasCreationErrorClass(code string) string {
 	case code == "CONTEXT_CANCELED" || code == "CONTEXT_DEADLINE_EXCEEDED":
 		return "context"
 	case code == "APPLE_ACCOUNT_ACTION_REQUIRED" || code == "APPLE_ACCOUNT_MISMATCH" ||
-		code == "APPLE_FORWARDING_TARGET_MISSING" ||
+		code == "APPLE_FORWARDING_TARGET_MISSING" || code == "APPLE_FORWARDING_TARGET_INVALID" ||
+		code == "APPLE_FORWARDING_NOT_CONFIRMED" ||
 		code == "APPLE_ALIAS_CANDIDATE_DISCARDED" || code == "APPLE_ALIAS_INACTIVE" ||
 		code == "ACCOUNT_CHANGED" || code == "ALIAS_OWNERSHIP_CONFLICT" || code == "ACCOUNT_DISABLED":
 		return "account_state"
@@ -878,9 +881,13 @@ func aliasCreationErrorReason(code string) string {
 	case "APPLE_RATE_LIMITED":
 		return "Apple 请求被限流，当前周期剩余计划槽已跳过，冷却后会继续执行"
 	case "APPLE_ACCOUNT_MISMATCH":
-		return "Apple 登录账户或默认转发目标与当前主号不匹配"
+		return "Apple 登录账户身份或返回的转发信息不一致，请核对登录账户和转发设置"
 	case "APPLE_FORWARDING_TARGET_MISSING":
-		return "Apple 未能确认隐私邮箱的默认转发目标，本次未发起创建；请确认当前主号可作为转发邮箱，或先在 iCloud 手动创建一个隐私邮箱"
+		return "Apple 未能确认隐私邮箱的默认转发目标，本次未发起创建；请在转发设置中选择 Apple 提供的可用邮箱后重试"
+	case "APPLE_FORWARDING_TARGET_INVALID":
+		return "Apple 返回的默认转发地址无效，请重新获取转发设置并选择可用邮箱"
+	case "APPLE_FORWARDING_NOT_CONFIRMED":
+		return "Apple 尚未确认转发设置，请重新获取当前设置后重试"
 	case "APPLE_ALIAS_CONFIRMATION_PENDING":
 		return "Apple 隐私邮箱创建结果尚未确认；候选满 5 分钟后，若完整目录仍查无此地址，将自动清理本地记录"
 	case "APPLE_ALIAS_CANDIDATE_DISCARDED":

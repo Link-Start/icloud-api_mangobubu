@@ -32,6 +32,11 @@ func TestSyncReconcilesOnlyCompleteIdentityMatchedDirectory(t *testing.T) {
 		wantError error
 	}{
 		{name: "owned complete directory"},
+		{name: "third-party forwarding directory", mutate: func(list *apple.ListResult, _ *apple.Session) {
+			list.SelectedForwardTo = "forwarder@example.com"
+			list.ForwardToEmails = []string{list.SelectedForwardTo}
+			list.Aliases[0].ForwardToEmail = list.SelectedForwardTo
+		}},
 		{name: "owned empty directory", mutate: func(list *apple.ListResult, _ *apple.Session) { list.Aliases = nil }},
 		{name: "mixed forwarding preserves present local entries", mutate: func(list *apple.ListResult, _ *apple.Session) {
 			list.Aliases = append(list.Aliases, apple.Alias{HME: "foreign@icloud.com", ForwardToEmail: "other@icloud.com", IsActive: true})
@@ -72,6 +77,10 @@ func TestSyncReconcilesOnlyCompleteIdentityMatchedDirectory(t *testing.T) {
 			}
 			if repo.reconciliations != 1 || base.imports.Load() != 0 {
 				t.Fatal("complete directory did not use reconciliation")
+			}
+			if test.name == "third-party forwarding directory" &&
+				(len(repo.candidates) != 1 || repo.candidates[0].Address != "owned@icloud.com") {
+				t.Fatalf("third-party forwarding alias was not imported: %+v", repo.candidates)
 			}
 			if result.Summary.MissingCount != 17 || result.Summary.RemovedCount != 17 || result.Summary.InactiveUpdatedCount != 2 || result.Summary.RestoredCount != 1 {
 				t.Fatalf("summary lost reconciliation counts: %+v", result.Summary)

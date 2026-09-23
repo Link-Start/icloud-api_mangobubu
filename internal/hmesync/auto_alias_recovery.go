@@ -33,9 +33,9 @@ func (s *Service) discardMissingAutoAlias(
 		return false, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending,
 			errors.New("Apple directory omitted the pending candidate within its visibility grace period"))
 	}
-	// Keep the same mailbox-ownership and directory consistency checks used
-	// by explicit deletion. A changed forwarding identity is not absence proof.
-	if _, _, err := filterAliases(directory, account.Email); err != nil {
+	// The caller has verified Apple ID and DSID. Changing the forwarding target
+	// does not change that identity or the complete directory's absence proof.
+	if _, _, err := filterAliases(directory, forwardingTarget(directory, account.Email)); err != nil {
 		return false, err
 	}
 	repo, ok := s.repo.(AutoAliasDiscardRepository)

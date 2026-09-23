@@ -168,26 +168,7 @@ func (c *Client) SignIn(ctx context.Context, appleID, password string, region Re
 	if err := op.federate(ctx, appleID); err != nil {
 		return result, false, err
 	}
-	secret := make([]byte, 32)
-	if err := c.readRandom(secret); err != nil {
-		return result, false, operationError("initialize SRP", ErrAuthentication, 0, err)
-	}
-	srp, err := newSRPClient(bytes.NewReader(secret))
-	if err != nil {
-		return result, false, operationError("initialize SRP", ErrAuthentication, 0, err)
-	}
-	challenge, err := op.srpInit(ctx, appleID, srp.publicKey())
-	if err != nil {
-		return result, false, err
-	}
-	passwordKey, err := deriveApplePassword(password, challenge.salt, challenge.iterations, challenge.protocol)
-	if err != nil {
-		return result, false, operationError("derive SRP proof", ErrInvalidResponse, 0, err)
-	}
-	if err := srp.processChallenge([]byte(appleID), passwordKey, challenge.salt, challenge.serverPublic); err != nil {
-		return result, false, operationError("derive SRP proof", ErrInvalidResponse, 0, err)
-	}
-	status, err := op.srpComplete(ctx, appleID, challenge.challenge, srp.m1, srp.m2)
+	status, err := op.passwordSignIn(ctx, appleID, password)
 	if err != nil {
 		return result, false, err
 	}
@@ -803,6 +784,7 @@ type operation struct {
 	jar       *PersistentJar
 	http      *http.Client
 	endpoints Endpoints
+	widgetKey string
 }
 
 type responseData struct {
@@ -874,7 +856,7 @@ func (op *operation) authorize(ctx context.Context) error {
 	query.Set("language", "en_US")
 	query.Set("skVersion", "7")
 	query.Set("iframeId", frame)
-	query.Set("client_id", defaultWidgetKey)
+	query.Set("client_id", op.authWidgetKey())
 	query.Set("redirect_uri", op.endpoints.Home)
 	query.Set("response_type", "code")
 	query.Set("response_mode", "web_message")
@@ -1086,8 +1068,8 @@ func (op *operation) authHeaders() http.Header {
 	headers.Set("Origin", origin)
 	headers.Set("Referer", origin+"/")
 	headers.Set("User-Agent", userAgent)
-	headers.Set("X-Apple-Widget-Key", defaultWidgetKey)
-	headers.Set("X-Apple-OAuth-Client-Id", defaultWidgetKey)
+	headers.Set("X-Apple-Widget-Key", op.authWidgetKey())
+	headers.Set("X-Apple-OAuth-Client-Id", op.authWidgetKey())
 	headers.Set("X-Apple-OAuth-Client-Type", "firstPartyAuth")
 	headers.Set("X-Apple-OAuth-Redirect-URI", op.endpoints.Home)
 	headers.Set("X-Apple-OAuth-Require-Grant-Code", "true")
@@ -1098,6 +1080,10 @@ func (op *operation) authHeaders() http.Header {
 	headers.Set("X-Requested-With", "XMLHttpRequest")
 	headers.Set("X-Apple-Mandate-Security-Upgrade", "0")
 	headers.Set("X-Apple-I-Require-UE", "true")
+	if op.widgetKey != "" {
+		headers.Set("X-Apple-Domain-Id", "11")
+		headers.Del("X-Apple-OAuth-Require-Grant-Code")
+	}
 	headers.Set("X-Apple-I-FD-Client-Info", `{"U":"`+userAgent+`","L":"en-US","Z":"GMT+00:00","V":"1.1","F":""}`)
 	if op.session.SCNT != "" {
 		headers.Set("scnt", op.session.SCNT)

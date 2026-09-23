@@ -71,7 +71,7 @@ func (s *Service) forwardingSettings(ctx context.Context, accountID int64, targe
 	if err != nil {
 		return ForwardingSettings{}, err
 	}
-	if _, _, err := filterAliases(list, account.Email); err != nil {
+	if _, _, err := filterAliases(list, forwardingTarget(list, account.Email)); err != nil {
 		return ForwardingSettings{}, err
 	}
 	settings := forwardingSettingsFromList(list)

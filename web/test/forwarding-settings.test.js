@@ -35,7 +35,7 @@ function dialogHarness(overrides = {}) {
     ...overrides,
   };
   const setup = new Function(...Object.keys(dependencies), `${script}
-    return { loadSettings, saveSettings, closeDialog, loading, saving, loaded, error, emails, currentTarget, selectedTarget, canSave };
+    return { loadSettings, saveSettings, closeDialog, loading, saving, loaded, error, emails, currentTarget, selectedTarget, canSave, openEmailAction, finishEmailChange, emailAction, notice };
   `);
   return { ...setup(...Object.values(dependencies)), events, unmount: () => unmount() };
 }
@@ -68,6 +68,27 @@ test("dialog preselects the current target and permits only one available addres
   assert.equal(dialog.canSave.value, false);
   dialog.selectedTarget.value = "other@example.com";
   assert.equal(dialog.canSave.value, true);
+});
+
+test("email controls protect the last forwarding address and refresh choices after add/remove", async () => {
+  let calls = 0;
+  let settings = { selectedForwardTo: "owner@icloud.com", forwardToEmails: ["owner@icloud.com"] };
+  const dialog = dialogHarness({ getForwardingSettings: async () => { calls++; return settings; } });
+  await dialog.loadSettings();
+  dialog.openEmailAction("delete", "owner@icloud.com");
+  assert.equal(dialog.emailAction.value, null);
+  dialog.openEmailAction("add");
+  assert.equal(dialog.canSave.value, false);
+  settings = initialSettings;
+  await dialog.finishEmailChange({ action: "add", address: "other@example.com" });
+  assert.equal(calls, 2);
+  assert.deepEqual(dialog.emails.value, initialSettings.forwardToEmails);
+  dialog.openEmailAction("delete", "other@example.com");
+  assert.equal(dialog.emailAction.value.email, "other@example.com");
+  settings = { selectedForwardTo: "owner@icloud.com", forwardToEmails: ["owner@icloud.com"] };
+  await dialog.finishEmailChange({ action: "delete", address: "other@example.com" });
+  assert.equal(calls, 3);
+  assert.deepEqual(dialog.emails.value, ["owner@icloud.com"]);
 });
 
 test("empty choices and an unavailable current target require a valid selection", async () => {

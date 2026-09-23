@@ -184,7 +184,7 @@ func TestAutoAliasRecoveryGracePeriodUsesCreationNotUpdateTime(t *testing.T) {
 func TestAutoAliasRecoveryRetainsCandidateOnFailure(t *testing.T) {
 	for _, name := range []string{
 		"directory 503", "directory 429", "directory malformed", "validation 503", "expired session",
-		"directory DSID changed", "directory Apple ID changed", "mailbox mismatch", "duplicate directory",
+		"directory DSID changed", "directory Apple ID changed", "missing forwarding", "duplicate directory",
 		"checkpoint failure", "discard failure", "published before discard", "account changed", "account disabled", "cancelled",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -226,10 +226,10 @@ func TestAutoAliasRecoveryRetainsCandidateOnFailure(t *testing.T) {
 					return session, apple.ErrInvalidSession
 				}
 				wantCode = CodeSessionExpired
-			case "directory DSID changed", "directory Apple ID changed", "mailbox mismatch":
+			case "directory DSID changed", "directory Apple ID changed", "missing forwarding":
 				wantCode = CodeAccountMismatch
-				if name == "mailbox mismatch" {
-					directory = apple.ListResult{SelectedForwardTo: "other@example.com"}
+				if name == "missing forwarding" {
+					directory = apple.ListResult{ForwardToEmails: []string{"other@example.com"}}
 				}
 			case "duplicate directory":
 				directory.Aliases = []apple.Alias{{HME: "duplicate@icloud.com"}, {HME: "duplicate@icloud.com"}}

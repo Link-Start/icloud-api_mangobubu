@@ -425,6 +425,29 @@ func TestAliasCreationMissingForwardingTargetIsSpecificAndSafe(t *testing.T) {
 	assertFlowLogsDoNotContain(t, logs, "sensitive forwarding fixture")
 }
 
+func TestAliasCreationForwardingErrorsKeepSpecificDiagnostics(t *testing.T) {
+	for _, code := range []string{"APPLE_FORWARDING_TARGET_INVALID", "APPLE_FORWARDING_NOT_CONFIRMED"} {
+		t.Run(code, func(t *testing.T) {
+			clock := newTestClock(time.Date(2026, 9, 24, 9, 0, 0, 0, time.UTC))
+			repo := newFakeRepository()
+			manager, logs := newFlowLogManager(t, repo, clock, func(ctx context.Context, _ int64) (domain.Alias, error) {
+				domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhaseCheckingForwarding, 45, 0)
+				return domain.Alias{}, testDiagnosticError{code: code, detail: "sensitive forwarding fixture"}
+			})
+			schedule := enableForTest(t, manager, 91)
+			clock.Set(*schedule.NextRunAt)
+			manager.runDue(context.Background())
+			failed := requireAutoCreateEvent(t, logs, "run_failed")
+			if failed.Fields["error_code"] != code || failed.Fields["error_class"] != "account_state" ||
+				failed.Fields["error_context"] != aliasCreationErrorReason(code) ||
+				len(repo.failures) != 1 || repo.failures[0].message != aliasCreationErrorReason(code) {
+				t.Fatalf("forwarding error lost its diagnostic: fields=%#v failures=%#v", failed.Fields, repo.failures)
+			}
+			assertFlowLogsDoNotContain(t, logs, "sensitive forwarding fixture")
+		})
+	}
+}
+
 func TestAliasCreationForwardingInitializationReportsRemoteMutation(t *testing.T) {
 	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
 	repo := newFakeRepository()

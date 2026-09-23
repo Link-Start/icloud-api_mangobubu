@@ -73,6 +73,7 @@ type Session struct {
 	HideMyEmailActive           bool               `json:"hide_my_email_active,omitempty"`
 	HideMyEmailFeatureAvailable bool               `json:"hide_my_email_feature_available,omitempty"`
 	Cookies                     []PersistentCookie `json:"cookies,omitempty"`
+	AccountWeb                  *AccountWebSession `json:"account_web,omitempty"`
 	ValidatedAt                 time.Time          `json:"validated_at,omitempty"`
 }
 

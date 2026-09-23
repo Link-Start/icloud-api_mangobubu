@@ -104,6 +104,7 @@ type Service struct {
 	aliasDeletionWaiter          func(context.Context, time.Duration) error
 	challengeMu                  sync.Mutex
 	challenges                   map[string]challenge
+	emailChallenges              map[string]emailChallenge
 	accountFlows                 map[int64]string
 	operationMu                  sync.Mutex
 	operationLock                map[int64]*operationLock
@@ -329,10 +330,8 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		}
 		return SyncResult{}, err
 	}
-	if reconciles {
-		if err := validateSessionDSID(session.DSID, session); err != nil {
-			return SyncResult{}, err
-		}
+	if err := validateSessionDSID(session.DSID, session); err != nil {
+		return SyncResult{}, err
 	}
 	validated, err := s.client.Validate(ctx, session)
 	if err != nil {
@@ -342,11 +341,9 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		}
 		return SyncResult{}, mapped
 	}
-	if reconciles {
-		validated, err = s.registrationSession(record, session, validated)
-		if err != nil {
-			return SyncResult{}, err
-		}
+	validated, err = s.registrationSession(record, session, validated)
+	if err != nil {
+		return SyncResult{}, err
 	}
 	normalizeSession(&validated, record.AppleID, session.Region, s.now())
 	list, updated, err := s.client.ListAliases(ctx, validated)
@@ -357,15 +354,13 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		}
 		return SyncResult{}, mapped
 	}
-	if reconciles {
-		updated, err = s.registrationSession(record, session, updated)
-		if err != nil {
-			return SyncResult{}, err
-		}
+	updated, err = s.registrationSession(record, session, updated)
+	if err != nil {
+		return SyncResult{}, err
 	}
 	normalizeSession(&updated, record.AppleID, validated.Region, s.now())
 
-	filtered, inactive, err := filterAliases(list, account.Email)
+	filtered, inactive, err := filterAliases(list, forwardingTarget(list, account.Email))
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -402,18 +397,16 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		if !sameIdentity(identityOf(current), identityOf(account)) {
 			return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		}
-		if reconciles {
-			currentSession, sessionErr := s.repo.GetAppleWebSession(ctx, accountID)
-			if errors.Is(sessionErr, store.ErrNotFound) {
-				return wrapError(CodeAccountChanged, ErrAccountChanged, sessionErr)
-			}
-			if sessionErr != nil {
-				return sessionErr
-			}
-			if !currentSession.Authenticated || currentSession.Ciphertext != record.Ciphertext ||
-				currentSession.AppleID != record.AppleID || currentSession.Region != record.Region {
-				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
-			}
+		currentSession, sessionErr := s.repo.GetAppleWebSession(ctx, accountID)
+		if errors.Is(sessionErr, store.ErrNotFound) {
+			return wrapError(CodeAccountChanged, ErrAccountChanged, sessionErr)
+		}
+		if sessionErr != nil {
+			return sessionErr
+		}
+		if !currentSession.Authenticated || currentSession.Ciphertext != record.Ciphertext ||
+			currentSession.AppleID != record.AppleID || currentSession.Region != record.Region {
+			return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		}
 		saved, err = s.saveSession(ctx, accountID, updated)
 		if err != nil {
@@ -842,6 +835,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		}
 		return saved, publishErr
 	}
+	forwardTo := forwardingTarget(settings, account.Email)
 	confirmPendingAlias := func(
 		operationContext context.Context,
 		pending domain.Alias,
@@ -862,7 +856,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 			return domain.Alias{}, wrapError(CodeAliasInactive, ErrAliasInactive,
 				errors.New("Apple returned an inactive pending alias"))
 		}
-		if !sameEmail(confirmed.ForwardToEmail, account.Email) {
+		if !sameEmail(confirmed.ForwardToEmail, forwardTo) {
 			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
 		sessionRecord, err := s.autoCreateSessionRecord(accountID, record.AppleID, trustedDSID, validated.Region, returned)
@@ -911,7 +905,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		return domain.Alias{}, wrapPersistenceError(err)
 	}
 	if hasPendingConfirmation {
-		if _, _, err := filterAliases(settings, account.Email); err != nil {
+		if _, _, err := filterAliases(settings, forwardTo); err != nil {
 			return domain.Alias{}, err
 		}
 		confirmed, found := findAppleAlias(settings.Aliases, pendingConfirmation.Alias.Address)
@@ -924,7 +918,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		}
 		return confirmPendingAlias(ctx, pendingConfirmation.Alias, confirmed, listedSession, 1)
 	}
-	forwardingErr := validateAutoCreateForwardingTarget(settings, account.Email)
+	forwardingErr := validateAutoCreateForwardingTarget(settings)
 	if errors.Is(forwardingErr, ErrForwardingTargetMissing) {
 		updater, canUpdate := s.client.(ForwardingTargetUpdater)
 		if !canUpdate || len(settings.Aliases) != 0 ||
@@ -1004,7 +998,10 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		}
 		settings = verifiedSettings
 		listedSession = verifiedSession
-		forwardingErr = validateAutoCreateForwardingTarget(settings, account.Email)
+		forwardingErr = validateAutoCreateForwardingTarget(settings)
+		if forwardingErr == nil && !sameEmail(settings.SelectedForwardTo, account.Email) {
+			forwardingErr = wrapError(CodeForwardingNotConfirmed, ErrForwardingNotConfirmed, nil)
+		}
 		if callerErr := ctx.Err(); callerErr != nil {
 			return domain.Alias{}, callerErr
 		}
@@ -1015,7 +1012,8 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	if forwardingErr != nil {
 		return domain.Alias{}, forwardingErr
 	}
-	if _, _, err := filterAliases(settings, account.Email); err != nil {
+	forwardTo = forwardingTarget(settings, account.Email)
+	if _, _, err := filterAliases(settings, forwardTo); err != nil {
 		return domain.Alias{}, err
 	}
 
@@ -1163,7 +1161,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 				errors.New("Apple returned an inactive reserved alias"),
 			)
 		}
-		if !sameEmail(created.ForwardToEmail, account.Email) {
+		if !sameEmail(created.ForwardToEmail, forwardTo) {
 			reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, 1)
 			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
@@ -1222,7 +1220,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 			// A matching row inside an inconsistent directory is not confirmation.
 			// The Apple client rejects partial responses; also enforce directory
 			// shape and ownership for alternate client implementations.
-			if _, _, directoryErr := filterAliases(confirmed, account.Email); directoryErr != nil {
+			if _, _, directoryErr := filterAliases(confirmed, forwardTo); directoryErr != nil {
 				return domain.Alias{}, errors.Join(directoryErr, confirmationCause)
 			}
 		}
@@ -1553,11 +1551,14 @@ func (s *Service) expireSession(ctx context.Context, accountID int64) {
 	})
 }
 
-func filterAliases(result apple.ListResult, accountEmail string) ([]apple.Alias, int, error) {
-	accountEmail = domain.NormalizeEmail(accountEmail)
-	belongs := sameEmail(result.SelectedForwardTo, accountEmail)
+// filterAliases validates the complete directory and selects one forwarding
+// target. Callers must verify Apple session identity separately; a forwarding
+// address is not proof of Apple account identity.
+func filterAliases(result apple.ListResult, forwardTo string) ([]apple.Alias, int, error) {
+	forwardTo = domain.NormalizeEmail(forwardTo)
+	belongs := sameEmail(result.SelectedForwardTo, forwardTo)
 	for _, address := range result.ForwardToEmails {
-		belongs = belongs || sameEmail(address, accountEmail)
+		belongs = belongs || sameEmail(address, forwardTo)
 	}
 	seenAddresses := make(map[string]struct{}, len(result.Aliases))
 	seenRemoteIDs := make(map[string]struct{}, len(result.Aliases))
@@ -1583,7 +1584,7 @@ func filterAliases(result apple.ListResult, accountEmail string) ([]apple.Alias,
 			}
 			seenRemoteIDs[remoteID] = struct{}{}
 		}
-		if sameEmail(remote.ForwardToEmail, accountEmail) {
+		if sameEmail(remote.ForwardToEmail, forwardTo) {
 			belongs = true
 			remote.HME = address
 			filtered = append(filtered, remote)
@@ -1598,16 +1599,28 @@ func filterAliases(result apple.ListResult, accountEmail string) ([]apple.Alias,
 	return filtered, inactive, nil
 }
 
+// forwardingTarget follows Apple's account-wide selection, which can be a
+// third-party address or an intermediate forwarder unrelated to the local
+// account email and final IMAP username. Older directories without this field
+// retain the local mailbox fallback for existing-address operations.
+func forwardingTarget(result apple.ListResult, accountEmail string) string {
+	if selected := domain.NormalizeEmail(result.SelectedForwardTo); selected != "" {
+		return selected
+	}
+	return domain.NormalizeEmail(accountEmail)
+}
+
 // validateAutoCreateForwardingTarget requires Apple's explicit default because
-// reserve does not accept a per-request forwarding target. Candidate and
-// alias-level addresses cannot safely replace selectedForwardTo.
-func validateAutoCreateForwardingTarget(result apple.ListResult, accountEmail string) error {
+// reserve does not accept a per-request forwarding target. A third-party target
+// is valid; Apple ID and DSID checks establish the session's account identity.
+func validateAutoCreateForwardingTarget(result apple.ListResult) error {
 	selected := domain.NormalizeEmail(result.SelectedForwardTo)
 	if selected == "" {
 		return wrapError(CodeForwardingTargetMissing, ErrForwardingTargetMissing, nil)
 	}
-	if !sameEmail(selected, accountEmail) {
-		return wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	parsed, err := mail.ParseAddress(selected)
+	if err != nil || parsed.Name != "" || parsed.Address != selected || len(selected) > 320 {
+		return wrapError(CodeForwardingTargetInvalid, ErrForwardingTargetInvalid, nil)
 	}
 	return nil
 }

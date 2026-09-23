@@ -24,7 +24,8 @@ info:
     `X-ICLOUD-HME` 的 `p=`/`f=` 路由信息，再结合 `Delivered-To`、`X-Original-To`、
     `Original-Recipient` 和常见 Apple 原始收件人头恢复隐私邮箱归属；Apple 的 `f=` 可以是中间
     转发地址，不必与最终 `Delivered-To` 相同。若只在 `To/Cc` 留下隐私地址，必须显式启用弱收件人头才会匹配。
-    这些规则只控制邮件取件与归属；Apple 目录同步和自动创建仍使用现有的主号默认转发目标校验。
+    这些规则只控制邮件取件与归属；Apple 地址管理使用实时目录中的 `selectedForwardTo`，
+    支持第三方邮箱或中间转发地址，无需等于本地主号邮箱或最终 IMAP 用户名；仍校验 Apple 登录账户身份。
 
     IMAPS 用户名是隐私邮箱地址。客户端可以使用本服务签发的 IMAP 密码登录，
     或通过 `POST /oauth2/v2.0/token` 获取一小时访问令牌后使用 XOAUTH2。
@@ -81,7 +82,7 @@ paths:
         `Content-Type`。使用部署级 `ICLOUD_API_OAUTH_TOKEN` 的严格单一 Bearer 鉴权；
         成功响应直接返回 `api_key` 和 `mail_api_direct_link`；v2 凭证随后仍可由
         已认证管理端读取。iCloud 主号必须先完成 Apple 登录；登记时验证当前会话和目录身份，
-        并确认地址已在 Apple 启用且转发至该主号，成功后才保存地址并签发凭据。
+        并确认地址已在 Apple 启用且符合 Apple 当前转发设置，成功后才保存地址并签发凭据。
         该接口不会在 Apple 创建地址；custom 主号保持本地登记行为。
         验证失败不新增地址或重置邮件同步游标。query 与正文合计不得超过 4 KiB。
       x-runtime-constraint:
@@ -1291,7 +1292,7 @@ paths:
       summary: 手动登记已有邮箱地址
       description: |
         iCloud 主号须先完成 Apple 登录。服务验证当前会话和目录身份，并确认地址在 Apple
-        启用且转发至该主号，成功后才保存地址并签发凭据；不调用 Apple 创建地址。
+        启用且符合 Apple 当前转发设置，成功后才保存地址并签发凭据；不调用 Apple 创建地址。
         验证失败不会新增本地地址或重置邮件同步游标。custom 主号保持本地登记行为。
       security:
         - adminSession: []
@@ -1387,7 +1388,8 @@ paths:
       summary: 设置隐私邮箱转发地址
       description: |
         重新获取 Apple 可选邮箱后校验单个目标，调用账户级 updateForwardTo 并读取目录确认生效。
-        不修改本地主号邮箱、IMAP 配置或隐私邮箱目录。自动创建和手动登记仍要求转发目标匹配主号邮箱。
+        不修改本地主号邮箱、IMAP 配置或隐私邮箱目录。自动创建、目录同步、手动登记和删除使用
+        Apple 当前选定的转发目标，支持第三方邮箱，无需匹配主号邮箱或最终 IMAP 用户名。
         结果不确定或请求失败时不自动重试写入；客户端应重新 GET 当前设置后再提交。
       security:
         - adminSession: []
@@ -1450,7 +1452,7 @@ paths:
       summary: 同步并对账 Apple 隐私邮箱目录
       description: |
         适用于 iCloud 主号，须有有效 Apple 会话。取得完整且身份匹配的 Apple 目录后，导入
-        转发目标匹配当前主号的新地址，自动移除完整目录中已不存在的本地地址，包括停用地址
+        转发目标匹配 Apple 当前选定目标的新地址，自动移除完整目录中已不存在的本地地址，包括停用地址
         和待确认候选，并清理其凭据、分组关联、邮件映射和快照等关联数据。只移除本地数据，
         不调用 Apple 停用或删除接口，不删除主号共享的归档邮件和原始邮件文件。
         缺失判断使用完整目录；仍存在但因转发目标不同而被导入过滤的地址不会被误删。
@@ -2135,6 +2137,9 @@ components:
             - ACCOUNT_EXISTS
             - ACCOUNT_IDENTITY_LOCKED
             - APPLE_ACCOUNT_MISMATCH
+            - APPLE_FORWARDING_TARGET_MISSING
+            - APPLE_FORWARDING_TARGET_INVALID
+            - APPLE_FORWARDING_NOT_CONFIRMED
             - APPLE_ALIAS_NOT_FOUND
             - APPLE_ALIAS_INACTIVE
             - APPLE_ALIAS_UNAVAILABLE
@@ -2735,7 +2740,7 @@ components:
         address:
           type: string
           format: email
-          description: 已在 Apple 启用且转发至当前主号的地址；custom 模式按本地规则登记。
+          description: 已在 Apple 启用且符合 Apple 当前转发设置的地址；custom 模式按本地规则登记。
         label:
           type: string
           maxLength: 100
@@ -2782,7 +2787,7 @@ components:
         total:
           type: integer
           minimum: 0
-          description: Apple 目录中转发目标匹配当前主号的地址数，包含 active 和 inactive。
+          description: Apple 目录中转发目标匹配当前 selectedForwardTo 的地址数，包含 active 和 inactive；旧目录缺少该字段时沿用主号邮箱。
         created_count:
           type: integer
           minimum: 0

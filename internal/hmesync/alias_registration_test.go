@@ -47,10 +47,10 @@ func TestRegisterExistingAliasVerifiesOnlyTargetBeforePublication(t *testing.T) 
 			assertNetworkOutsideAccountLock(t, locker)
 			session.SessionToken = "refreshed"
 			return apple.ListResult{
-				SelectedForwardTo: "primary@icloud.com",
+				SelectedForwardTo: "forwarder@example.com",
 				Aliases: []apple.Alias{
-					{HME: "EXISTING@ICLOUD.COM", ForwardToEmail: "primary@icloud.com", IsActive: true},
-					{HME: "unrelated@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true},
+					{HME: "EXISTING@ICLOUD.COM", ForwardToEmail: "forwarder@example.com", IsActive: true},
+					{HME: "unrelated@icloud.com", ForwardToEmail: "forwarder@example.com", IsActive: true},
 				},
 			}, session, nil
 		},

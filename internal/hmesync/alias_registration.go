@@ -65,14 +65,15 @@ func (s *Service) RegisterExistingAlias(ctx context.Context, alias domain.Alias)
 		return domain.Alias{}, err
 	}
 	// Validate the complete directory shape before trusting a single entry.
-	if _, _, err := filterAliases(list, account.Email); err != nil {
+	forwardTo := forwardingTarget(list, account.Email)
+	if _, _, err := filterAliases(list, forwardTo); err != nil {
 		return domain.Alias{}, err
 	}
 	remote, exists := findAppleAlias(list.Aliases, alias.Address)
 	if !exists {
 		return domain.Alias{}, wrapError(CodeAliasNotFound, ErrAliasNotFound, nil)
 	}
-	if !sameEmail(remote.ForwardToEmail, account.Email) {
+	if !sameEmail(remote.ForwardToEmail, forwardTo) {
 		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 	}
 	if !remote.IsActive {

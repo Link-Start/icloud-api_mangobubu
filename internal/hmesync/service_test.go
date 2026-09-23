@@ -188,9 +188,9 @@ func TestSyncFiltersByForwardingMailboxAndReturnsOnlyNewAliases(t *testing.T) {
 			SelectedForwardTo: "elsewhere@example.com",
 			ForwardToEmails:   []string{"primary@icloud.com", "elsewhere@example.com"},
 			Aliases: []apple.Alias{
-				{AnonymousID: "one", HME: "NEW@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true, Label: " New "},
-				{AnonymousID: "two", HME: "old@icloud.com", ForwardToEmail: "PRIMARY@ICLOUD.COM", IsActive: false},
-				{AnonymousID: "three", HME: "other@icloud.com", ForwardToEmail: "elsewhere@example.com", IsActive: true},
+				{AnonymousID: "one", HME: "NEW@icloud.com", ForwardToEmail: "elsewhere@example.com", IsActive: true, Label: " New "},
+				{AnonymousID: "two", HME: "old@icloud.com", ForwardToEmail: "ELSEWHERE@EXAMPLE.COM", IsActive: false},
+				{AnonymousID: "three", HME: "other@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true},
 			},
 		}, session, nil
 	}
@@ -236,6 +236,7 @@ func TestSyncRejectsMismatchedAppleAccountWithoutWrites(t *testing.T) {
 	client := &fakeAppleClient{
 		validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
 		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			session.DSID = "different-apple-account"
 			return apple.ListResult{
 				SelectedForwardTo: "other@example.com",
 				ForwardToEmails:   []string{"other@example.com"},
@@ -258,7 +259,7 @@ func TestSyncRejectsMismatchedAppleAccountWithoutWrites(t *testing.T) {
 	}
 }
 
-func TestCreateAutoAliasChecksSelectedForwardBeforeReserve(t *testing.T) {
+func TestCreateAutoAliasChecksMissingSelectedForwardBeforeReserve(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
@@ -270,12 +271,11 @@ func TestCreateAutoAliasChecksSelectedForwardBeforeReserve(t *testing.T) {
 		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
 			session.SessionToken = "rotated-by-forwarding-preflight"
 			return apple.ListResult{
-				SelectedForwardTo: "other@example.com",
-				ForwardToEmails:   []string{"primary@icloud.com", "other@example.com"},
+				ForwardToEmails: []string{"other@example.com"},
 			}, session, nil
 		},
 		create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
-			t.Fatal("mismatched forwarding target reached Apple reserve")
+			t.Fatal("missing forwarding target reached Apple reserve")
 			return apple.Alias{}, apple.Session{}, nil
 		},
 	}
@@ -283,11 +283,11 @@ func TestCreateAutoAliasChecksSelectedForwardBeforeReserve(t *testing.T) {
 	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
 
 	_, err := service.CreateAutoAlias(ctx, 3)
-	if !errors.Is(err, ErrAccountMismatch) || Code(err) != CodeAccountMismatch {
-		t.Fatalf("forwarding mismatch error = %v code=%q", err, Code(err))
+	if !errors.Is(err, ErrForwardingTargetMissing) || Code(err) != CodeForwardingTargetMissing {
+		t.Fatalf("missing forwarding error = %v code=%q", err, Code(err))
 	}
 	if client.createCalls.Load() != 0 || repo.creates.Load() != 0 {
-		t.Fatalf("mismatched target caused side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
+		t.Fatalf("missing target caused side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
 	}
 	if ctx.Err() != nil {
 		t.Fatalf("forwarding preflight session checkpoint re-entered the account lock: %v", ctx.Err())
@@ -859,13 +859,17 @@ func TestValidateAutoCreateForwardingTarget(t *testing.T) {
 			result: apple.ListResult{SelectedForwardTo: " PRIMARY@ICLOUD.COM ", ForwardToEmails: []string{"other@example.com"}},
 		},
 		{
-			name: "selected mismatch is not overridden",
+			name: "third-party selection is accepted",
 			result: apple.ListResult{
 				SelectedForwardTo: "other@example.com",
 				ForwardToEmails:   []string{"primary@icloud.com"},
 			},
-			wantCode: CodeAccountMismatch,
-			wantKind: ErrAccountMismatch,
+		},
+		{
+			name:     "invalid selection is rejected",
+			result:   apple.ListResult{SelectedForwardTo: "not-an-email"},
+			wantCode: CodeForwardingTargetInvalid,
+			wantKind: ErrForwardingTargetInvalid,
 		},
 		{
 			name:     "available target does not replace missing selection",
@@ -884,7 +888,7 @@ func TestValidateAutoCreateForwardingTarget(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateAutoCreateForwardingTarget(test.result, "primary@icloud.com")
+			err := validateAutoCreateForwardingTarget(test.result)
 			if Code(err) != test.wantCode {
 				t.Fatalf("error = %v code=%q, want %q", err, Code(err), test.wantCode)
 			}
@@ -1170,8 +1174,8 @@ func TestCreateAutoAliasRequiresExplicitForwardingReadback(t *testing.T) {
 		{
 			name:     "selection changed to another mailbox",
 			verified: apple.ListResult{SelectedForwardTo: "other@example.com"},
-			wantCode: CodeAccountMismatch,
-			wantKind: ErrAccountMismatch,
+			wantCode: CodeForwardingNotConfirmed,
+			wantKind: ErrForwardingNotConfirmed,
 		},
 	}
 	for _, test := range tests {

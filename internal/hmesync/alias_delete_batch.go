@@ -329,7 +329,8 @@ type aliasDeletionBatch struct {
 	ready             bool
 	stopped           error
 	directory         map[string]apple.Alias // Includes foreign aliases for ownership checks.
-	initialPending    map[int64]bool         // Pending marker observed before batch admission.
+	forwardTo         string
+	initialPending    map[int64]bool // Pending marker observed before batch admission.
 	valid             bool
 	recovery          *aliasDeletionRecovery // Only opt-in DeleteAliases, never DeleteAlias.
 	waitCooldown      func(context.Context, time.Duration) error
@@ -752,9 +753,11 @@ func (b *aliasDeletionBatch) refreshDirectory(ctx context.Context, reconcile boo
 			return err
 		}
 	}
-	if _, _, err := filterAliases(directory, b.account.Email); err != nil {
+	forwardTo := forwardingTarget(directory, b.account.Email)
+	if _, _, err := filterAliases(directory, forwardTo); err != nil {
 		return err
 	}
+	b.forwardTo = forwardTo
 	b.directory = make(map[string]apple.Alias, len(directory.Aliases))
 	for _, remote := range directory.Aliases {
 		b.directory[domain.NormalizeEmail(remote.HME)] = remote
@@ -765,7 +768,7 @@ func (b *aliasDeletionBatch) refreshDirectory(ctx context.Context, reconcile boo
 
 func (b *aliasDeletionBatch) find(address string) (apple.Alias, bool, error) {
 	remote, found := b.directory[domain.NormalizeEmail(address)]
-	if found && !sameEmail(remote.ForwardToEmail, b.account.Email) {
+	if found && !sameEmail(remote.ForwardToEmail, b.forwardTo) {
 		return apple.Alias{}, false, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 	}
 	return remote, found, nil

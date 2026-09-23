@@ -193,7 +193,7 @@ test("directory synchronization distinguishes Apple active addresses from all lo
   await synchronize();
 
   assert.equal(messages.length, 1);
-  assert.match(messages[0], /转发至本主号的 Apple 地址：启用 168 个、停用 12 个/);
+  assert.match(messages[0], /转发至 Apple 当前目标的地址：启用 168 个、停用 12 个/);
   assert.match(messages[0], /本地已登记 180 个（含停用及待确认记录）/);
   assert.match(messages[0], /本次自动移除 5 个本地地址（Apple 已不存在）/);
   assert.doesNotMatch(messages[0], /本地归档保留/);

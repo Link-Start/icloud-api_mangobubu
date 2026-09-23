@@ -429,6 +429,18 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 		}
 	}
 	switch code {
+	case hmesync.CodeEmailAccountAuthRequired:
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "添加或删除邮箱需要验证 Apple 账户，请登录后继续"}
+	case hmesync.CodeEmailInvalid:
+		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "Apple 不接受此邮箱，请检查地址是否已添加或已用于其他 Apple 账户"}
+	case hmesync.CodeEmailCodeInvalid:
+		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "邮箱验证码不正确或已失效，请重新输入或重新获取"}
+	case hmesync.CodeEmailFlowExpired:
+		return adminAPIAppleError{Status: http.StatusGone, Code: code, Message: "验证流程已过期，请重新开始此操作"}
+	case hmesync.CodeEmailLastAddress:
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "至少需要保留一个可转发邮箱，不能删除最后一个"}
+	case hmesync.CodeEmailNotRemovable:
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "此邮箱不支持移除；Apple 主邮箱或自有别名需在 Apple 账户设置中处理"}
 	case hmesync.CodeLoginRequired:
 		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "请先连接 Apple 账户"}
 	case hmesync.CodeSessionExpired:
@@ -444,7 +456,7 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 	case hmesync.CodeRateLimited:
 		return adminAPIAppleError{Status: http.StatusTooManyRequests, Code: code, Message: "Apple 请求过于频繁，请稍后再试"}
 	case hmesync.CodeAccountMismatch:
-		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 登录账户或转发邮箱与该主号不匹配"}
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 登录账户身份或返回的转发信息不一致，请核对登录账户和转发设置"}
 	case hmesync.CodeForwardingTargetInvalid:
 		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "该邮箱已不可用于转发，请重新获取并选择可用邮箱"}
 	case hmesync.CodeForwardingNotConfirmed:
