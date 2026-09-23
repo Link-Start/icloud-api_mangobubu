@@ -13,10 +13,20 @@ import (
 	"time"
 
 	"icloud-api/internal/domain"
+	"icloud-api/internal/mail"
 	"icloud-api/internal/secure"
 )
 
 func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
+	for _, newestOTP := range []string{"876543", "610-313"} {
+		t.Run(newestOTP, func(t *testing.T) {
+			testOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t, newestOTP)
+		})
+	}
+}
+
+func testOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T, newestOTP string) {
+	t.Helper()
 	env := newAdminAPITestEnv(t)
 	env.server.sync = nil
 	env.server.cfg.Timezone = time.FixedZone("UTC+8", 8*60*60)
@@ -52,8 +62,8 @@ func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
 				},
 				{
 					AccountID: account.ID, UIDValidity: 77, UID: 3,
-					InternalDate: newer, Subject: "newer", RawMIME: []byte("Subject: newer\r\n\r\n876543"),
-					OTP: "876543", AliasIDs: []int64{alias.ID},
+					InternalDate: newer, Subject: "newer", RawMIME: []byte("Subject: newer\r\n\r\nVerification code: **" + newestOTP + "**"),
+					OTP: mail.ExtractOTP("newer", "Verification code: **"+newestOTP+"**", ""), AliasIDs: []int64{alias.ID},
 				},
 			},
 			State: domain.IMAPSyncState{
@@ -92,7 +102,7 @@ func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
 	if err := json.Unmarshal(bearer.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode bare OTP response: %v", err)
 	}
-	if len(got) != 2 || got[0].OTP != "876543" || got[1].OTP != "123456" ||
+	if len(got) != 2 || got[0].OTP != newestOTP || got[1].OTP != "123456" ||
 		got[0].Time != "2026-08-11T12:00:00+08:00" || got[1].Time != "2026-08-11T11:00:00+08:00" {
 		t.Fatalf("OTP history = %#v", got)
 	}
@@ -136,7 +146,7 @@ func TestOTPV2ReturnsBareRepeatableHistoryForBearerAndDerivedURL(t *testing.T) {
 	if err := json.Unmarshal(latestOnlyBearer.Body.Bytes(), &latestOnly); err != nil {
 		t.Fatalf("decode latest-only OTP response: %v", err)
 	}
-	if latestOnly.OTP != "876543" || latestOnly.Time != "2026-08-11T12:00:00+08:00" {
+	if latestOnly.OTP != newestOTP || latestOnly.Time != "2026-08-11T12:00:00+08:00" {
 		t.Fatalf("latest-only OTP = %#v", latestOnly)
 	}
 	if !strings.HasPrefix(latestOnlyBearer.Body.String(), "{") {

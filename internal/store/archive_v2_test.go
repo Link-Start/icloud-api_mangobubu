@@ -158,7 +158,7 @@ func TestArchiveRejectsNewInvalidOTPAndFiltersLegacyInvalidHistory(t *testing.T)
 		{
 			AccountID: account.ID, UIDValidity: 42, UID: 1, InternalDate: base,
 			Subject: "valid OTP", ContentState: domain.ArchiveContentMetadata,
-			OTP: "654321", AliasIDs: []int64{alias.ID},
+			OTP: "610-313", AliasIDs: []int64{alias.ID},
 		},
 		{
 			AccountID: account.ID, UIDValidity: 42, UID: 2, InternalDate: base.Add(time.Minute),
@@ -171,7 +171,7 @@ func TestArchiveRejectsNewInvalidOTPAndFiltersLegacyInvalidHistory(t *testing.T)
 	if err != nil || len(archived) != 2 {
 		t.Fatalf("archived OTP validation messages = %#v, %v", archived, err)
 	}
-	if archived[0].OTP != "654321" || archived[1].OTP != "" {
+	if archived[0].OTP != "610-313" || archived[1].OTP != "" {
 		t.Fatalf("stored OTP values = first:%q second:%q", archived[0].OTP, archived[1].OTP)
 	}
 
@@ -185,7 +185,7 @@ func TestArchiveRejectsNewInvalidOTPAndFiltersLegacyInvalidHistory(t *testing.T)
 		t.Fatalf("seed legacy invalid OTP: %v", err)
 	}
 	otps, err := db.ListAliasOTPs(ctx, alias.ID, 1)
-	if err != nil || len(otps) != 1 || otps[0].OTP != "654321" {
+	if err != nil || len(otps) != 1 || otps[0].OTP != "610-313" {
 		t.Fatalf("filtered legacy OTP history = %#v, %v", otps, err)
 	}
 }

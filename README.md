@@ -188,7 +188,7 @@ curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN'
 {"otp":"876543","time":"2026-08-11T12:00:00+08:00"}
 ```
 
-旧变量 `ICLOUD_API_OTP_RETURN_LAST_ONLY` 继续作为兼容别名，开启后同样返回最新 OTP；同时配置两个变量时，以 `ICLOUD_API_OTP_RETURN_LATEST_ONLY` 为准。两种模式在没有验证码时都返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。迁移和轮换后 OTP URL 仍使用 `/api/v1/otp`；v2 alias 的 OTP token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名，不能通过改写 URL 路径或信封版本互换。这里的 v3 仅指 OTP token 信封版本，不是新的 alias credential mode。原 v1 直达 token 只继续用于尚未执行全量迁移的 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，只接受未与字母或数字相邻的 6 位 ASCII 数字；每封邮件最多保存一个候选，升级前保存的非 6 位历史值也会在读取时忽略。
+旧变量 `ICLOUD_API_OTP_RETURN_LAST_ONLY` 继续作为兼容别名，开启后同样返回最新 OTP；同时配置两个变量时，以 `ICLOUD_API_OTP_RETURN_LATEST_ONLY` 为准。两种模式在没有验证码时都返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。迁移和轮换后 OTP URL 仍使用 `/api/v1/otp`；v2 alias 的 OTP token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名，不能通过改写 URL 路径或信封版本互换。这里的 v3 仅指 OTP token 信封版本，不是新的 alias credential mode。原 v1 直达 token 只继续用于尚未执行全量迁移的 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，支持未与字母或数字相邻的连续 6 位 ASCII 数字，以及 Grok 使用的 `610-313` 这种三位数字加连字符再加三位数字的格式，返回时保留连字符；不会从更长的连字符分组号码中截取片段。每封邮件最多保存一个候选，升级前保存的不符合这两种格式的历史值也会在读取时忽略。
 
 ## 旧接口兼容
 

@@ -23,7 +23,8 @@ type otpCandidate struct {
 }
 
 // ExtractOTP returns one bounded numeric code. A candidate must contain exactly
-// six ASCII digits and must not touch another letter or number.
+// six ASCII digits, optionally separated by a hyphen into two groups of three,
+// and must not touch another letter or number. The hyphen is preserved.
 func ExtractOTP(subject, textBody, htmlBody string) string {
 	sources := []string{subject, textBody}
 	if strings.TrimSpace(htmlBody) != "" {
@@ -44,7 +45,10 @@ func ExtractOTP(subject, textBody, htmlBody string) string {
 				continue
 			}
 			start := index
-			for index < len(source) && source[index] >= '0' && source[index] <= '9' {
+			// Consume every hyphen-linked digit group so longer numbers cannot
+			// contribute a partial code such as 610-313 from 610-313-1234.
+			for index < len(source) && (source[index] >= '0' && source[index] <= '9' ||
+				source[index] == '-' && index+1 < len(source) && source[index+1] >= '0' && source[index+1] <= '9') {
 				index++
 			}
 			if !domain.IsSixDigitOTP(source[start:index]) || adjacentLetterOrNumber(source, start, index) {

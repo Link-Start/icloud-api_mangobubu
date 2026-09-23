@@ -219,6 +219,9 @@ paths:
         裸对象，也就是真正最新的有效 OTP。旧变量 `ICLOUD_API_OTP_RETURN_LAST_ONLY`
         保留为兼容别名；同时设置时以正式变量为准。
         重复读取不会消费验证码，也不会修改邮件已读状态。两种模式没有验证码时均返回 `200 []`。
+        验证码支持连续的 6 位 ASCII 数字及 Grok 使用的三位数字加连字符再加三位数字
+        （如 `610-313`），返回时保留连字符。两种格式均从主题、纯文本和 HTML 可读文本中提取，
+        不接受与字母或数字相邻的候选，也不会从更长的连字符分组号码中截取片段。
         调用方必须二选一：使用 Bearer API Key，或传入管理端签发取码 URL 中的 OTP
         专用派生 token。迁移或轮换后 URL 路径仍为 `/api/v1/otp`；v2 alias 的 OTP
         token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名。
@@ -2513,7 +2516,8 @@ components:
       properties:
         otp:
           type: string
-          pattern: "^[0-9]{6}$"
+          description: 6 位 ASCII 数字，可在中间包含一个连字符；如 123456 或 610-313，保留原格式。
+          pattern: "^[0-9]{3}-?[0-9]{3}$"
         time:
           type: string
           format: date-time

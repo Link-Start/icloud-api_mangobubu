@@ -304,8 +304,12 @@ type OTPRecord struct {
 	Time time.Time
 }
 
-// IsSixDigitOTP reports whether value is exactly six ASCII digits.
+// IsSixDigitOTP reports whether value is six ASCII digits, optionally separated
+// by a hyphen into two groups of three digits.
 func IsSixDigitOTP(value string) bool {
+	if len(value) == 7 && value[3] == '-' {
+		value = value[:3] + value[4:]
+	}
 	if len(value) != 6 {
 		return false
 	}
