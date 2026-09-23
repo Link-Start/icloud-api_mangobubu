@@ -160,6 +160,7 @@ const actionLabels = {
   update: "更新",
   delete: "删除",
   sync: "同步主号",
+  update_hme_forwarding: "设置隐私邮箱转发",
   rotate_key: "轮换 API Key",
   rotate_credentials: "轮换整套凭证",
   rotate_all_credentials: "轮换全部令牌",

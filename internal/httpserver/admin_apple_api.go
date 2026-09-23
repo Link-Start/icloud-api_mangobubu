@@ -408,6 +408,10 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 			code = hmesync.CodeRateLimited
 		case errors.Is(err, hmesync.ErrAccountMismatch):
 			code = hmesync.CodeAccountMismatch
+		case errors.Is(err, hmesync.ErrForwardingTargetInvalid):
+			code = hmesync.CodeForwardingTargetInvalid
+		case errors.Is(err, hmesync.ErrForwardingNotConfirmed):
+			code = hmesync.CodeForwardingNotConfirmed
 		case errors.Is(err, hmesync.ErrAliasNotFound):
 			code = hmesync.CodeAliasNotFound
 		case errors.Is(err, hmesync.ErrAliasInactive):
@@ -441,6 +445,10 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 		return adminAPIAppleError{Status: http.StatusTooManyRequests, Code: code, Message: "Apple 请求过于频繁，请稍后再试"}
 	case hmesync.CodeAccountMismatch:
 		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 登录账户或转发邮箱与该主号不匹配"}
+	case hmesync.CodeForwardingTargetInvalid:
+		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "该邮箱已不可用于转发，请重新获取并选择可用邮箱"}
+	case hmesync.CodeForwardingNotConfirmed:
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 尚未确认转发设置，请重新获取当前设置后再试"}
 	case hmesync.CodeAliasNotFound:
 		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "Apple 中没有这个隐私邮箱，请先在 Apple 创建，或使用自动创建功能"}
 	case hmesync.CodeAliasInactive:

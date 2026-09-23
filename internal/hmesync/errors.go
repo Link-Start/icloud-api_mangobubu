@@ -18,6 +18,8 @@ const (
 	CodeRateLimited              = "APPLE_RATE_LIMITED"
 	CodeUpstreamError            = "APPLE_UPSTREAM_ERROR"
 	CodeForwardingTargetMissing  = "APPLE_FORWARDING_TARGET_MISSING"
+	CodeForwardingTargetInvalid  = "APPLE_FORWARDING_TARGET_INVALID"
+	CodeForwardingNotConfirmed   = "APPLE_FORWARDING_NOT_CONFIRMED"
 	CodeAliasConfirmationPending = domain.AppleAliasConfirmationPending
 	CodeAliasCandidateDiscarded  = "APPLE_ALIAS_CANDIDATE_DISCARDED"
 	CodeAliasInactive            = "APPLE_ALIAS_INACTIVE"
@@ -40,6 +42,8 @@ var (
 	ErrRateLimited              = errors.New("Apple request rate limited")
 	ErrUpstream                 = errors.New("Apple upstream request failed")
 	ErrForwardingTargetMissing  = errors.New("Apple forwarding target is missing")
+	ErrForwardingTargetInvalid  = errors.New("Apple forwarding target is unavailable")
+	ErrForwardingNotConfirmed   = errors.New("Apple forwarding update was not confirmed")
 	ErrAliasConfirmationPending = errors.New("Apple alias confirmation pending")
 	ErrAliasCandidateDiscarded  = errors.New("absent Apple alias candidate discarded locally")
 	ErrAliasInactive            = errors.New("Apple alias is inactive")

@@ -1341,6 +1341,96 @@ paths:
         "504":
           $ref: "#/components/responses/AppleUpstreamError"
 
+  /api/v1/accounts/{id}/forwarding:
+    servers:
+      - url: https://HOST/{admin_path}
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+      - url: https://HOST/admin
+    parameters:
+      - $ref: "#/components/parameters/AdminAccountID"
+    get:
+      tags: [Admin Accounts]
+      operationId: getAdminAppleForwarding
+      summary: 获取隐私邮箱当前转发地址和可选邮箱
+      description: 读取 Apple 完整目录中的 selectedForwardTo 和 forwardToEmails，不导入或删除本地隐私邮箱。仅适用于已登录 Apple 的 iCloud 主号。
+      security:
+        - adminSession: []
+      responses:
+        "200":
+          description: 当前设置；没有可选邮箱时 forward_to_emails 为空数组。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminForwardingResponse"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          $ref: "#/components/responses/AdminNotFound"
+        "409":
+          description: Apple 会话失效、账户不匹配、主号信息变化或自定义邮箱不支持此操作。
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/AppleUpstreamError"
+        "503":
+          description: Apple 服务未就绪。
+        "504":
+          $ref: "#/components/responses/AppleUpstreamError"
+    put:
+      tags: [Admin Accounts]
+      operationId: updateAdminAppleForwarding
+      summary: 设置隐私邮箱转发地址
+      description: |
+        重新获取 Apple 可选邮箱后校验单个目标，调用账户级 updateForwardTo 并读取目录确认生效。
+        不修改本地主号邮箱、IMAP 配置或隐私邮箱目录。自动创建和手动登记仍要求转发目标匹配主号邮箱。
+        结果不确定或请求失败时不自动重试写入；客户端应重新 GET 当前设置后再提交。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [forward_to_email]
+              properties:
+                forward_to_email:
+                  type: string
+                  format: email
+                  maxLength: 320
+      responses:
+        "200":
+          description: 已确认的转发设置。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminForwardingResponse"
+        "400":
+          description: JSON 或邮箱格式不正确。
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          $ref: "#/components/responses/AdminNotFound"
+        "409":
+          description: Apple 会话或账户异常，或更新未被 Apple 确认（APPLE_FORWARDING_NOT_CONFIRMED）。
+        "422":
+          description: 所选邮箱已不可用（APPLE_FORWARDING_TARGET_INVALID），请重新获取可选邮箱；也可能是 Apple 凭据失效。
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/AppleUpstreamError"
+        "503":
+          description: Apple 服务未就绪。
+        "504":
+          $ref: "#/components/responses/AppleUpstreamError"
+
   /api/v1/accounts/{id}/aliases/sync:
     servers:
       - url: https://HOST/{admin_path}
@@ -2289,6 +2379,23 @@ components:
         updated_at:
           type: string
           format: date-time
+
+    AdminForwardingResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [selected_forward_to, forward_to_emails]
+          properties:
+            selected_forward_to:
+              type: string
+              description: 当前转发目标，尚未设置时为空字符串。
+            forward_to_emails:
+              type: array
+              items:
+                type: string
+                format: email
 
     AdminAppleSession:
       type: object

@@ -706,6 +706,34 @@ export function deleteAppleSession(accountId, csrfToken) {
   );
 }
 
+function normalizeForwardingSettings(data = {}) {
+  return {
+    selectedForwardTo: data.selected_forward_to || "",
+    forwardToEmails: Array.isArray(data.forward_to_emails)
+      ? data.forward_to_emails
+      : [],
+  };
+}
+
+export async function getForwardingSettings(accountId) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/forwarding`,
+  );
+  return normalizeForwardingSettings(data);
+}
+
+export async function updateForwardingSettings(accountId, email, csrfToken) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/forwarding`,
+    {
+      method: "PUT",
+      body: { forward_to_email: email },
+      csrfToken,
+    },
+  );
+  return normalizeForwardingSettings(data);
+}
+
 function normalizeSyncSummary(raw = {}) {
   return {
     total:

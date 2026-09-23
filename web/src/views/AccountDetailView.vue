@@ -17,6 +17,15 @@
     </div>
 
     <template v-else-if="account">
+      <ForwardingSettingsDialog
+        v-if="forwardingVisible && !isCustomMailbox"
+        :key="account.id"
+        :account-id="account.id"
+        :csrf-token="auth.state.csrfToken"
+        @close="forwardingVisible = false"
+        @auth-required="handleForwardingAuthRequired"
+        @saved="finishForwardingSettings"
+      />
       <el-dialog
         v-model="appleAuthVisible"
         class="apple-auth-dialog"
@@ -220,6 +229,13 @@
               @click="syncAliasesFromApple"
             >
               同步隐私邮箱
+            </el-button>
+            <el-button
+              v-if="!isCustomMailbox"
+              :disabled="appleAliasControlsDisabled || aliasesSyncLoading || appleDisconnectLoading"
+              @click="openForwardingSettings"
+            >
+              转发设置
             </el-button>
           </template>
         </SectionHeader>
@@ -815,6 +831,7 @@ import {
   verifyAppleSession,
 } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
+import ForwardingSettingsDialog from "../components/ForwardingSettingsDialog.vue";
 import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
@@ -870,6 +887,7 @@ const aliasesSyncLoading = ref(false);
 const createLoading = ref(false);
 const accountDeleteLoading = ref(false);
 const appleDisconnectLoading = ref(false);
+const forwardingVisible = ref(false);
 const aliasFormRef = ref(null);
 const aliasFormError = ref(null);
 const appleAuthVisible = ref(false);
@@ -900,6 +918,7 @@ let detailAbortController = null;
 let viewActive = true;
 let resumeAliasSyncAfterAuth = false;
 let resumeAutoCreationAfterAuth = false;
+let resumeForwardingAfterAuth = false;
 
 const syncActive = computed(() => Boolean(account.value?.syncProgress?.active));
 const hasAliasSearch = computed(() =>
@@ -989,6 +1008,7 @@ const appleSessionAuthenticated = computed(
   () => appleSession.value?.status === "authenticated",
 );
 function appleVerificationActionLabel() {
+  if (resumeForwardingAfterAuth) return "验证并继续";
   if (resumeAutoCreationAfterAuth) return "验证并开启";
   if (resumeAliasSyncAfterAuth) return "验证并同步";
   return "验证";
@@ -1494,10 +1514,12 @@ function openAppleLogin({
   error = null,
   resumeSync = false,
   resumeAutoCreation = false,
+  resumeForwarding = false,
 } = {}) {
   if (!account.value) return;
   resumeAliasSyncAfterAuth = resumeSync;
   resumeAutoCreationAfterAuth = resumeAutoCreation;
+  resumeForwardingAfterAuth = resumeForwarding;
   appleAuthStep.value = "login";
   appleAuthError.value = error;
   appleLoginForm.appleId = appleSession.value?.appleId || account.value.email || "";
@@ -1513,6 +1535,7 @@ function cancelAppleAuth() {
   if (appleAuthLoading.value) return;
   resumeAliasSyncAfterAuth = false;
   resumeAutoCreationAfterAuth = false;
+  resumeForwardingAfterAuth = false;
   appleAuthVisible.value = false;
   resetAppleAuthForm();
 }
@@ -1521,6 +1544,7 @@ function closeAppleAuthDialog(done) {
   if (appleAuthLoading.value) return;
   resumeAliasSyncAfterAuth = false;
   resumeAutoCreationAfterAuth = false;
+  resumeForwardingAfterAuth = false;
   resetAppleAuthForm();
   done();
 }
@@ -1550,11 +1574,16 @@ async function finishAppleAuthentication(result, accountId) {
   appleSession.value = mergedAppleSession(result);
   const shouldResumeSync = resumeAliasSyncAfterAuth;
   const shouldResumeAutoCreation = resumeAutoCreationAfterAuth;
+  const shouldResumeForwarding = resumeForwardingAfterAuth;
   resumeAliasSyncAfterAuth = false;
   resumeAutoCreationAfterAuth = false;
+  resumeForwardingAfterAuth = false;
   appleAuthVisible.value = false;
   resetAppleAuthForm();
   successMessage("Apple 账户已登录。");
+  if (shouldResumeForwarding) {
+    forwardingVisible.value = true;
+  }
   if (shouldResumeAutoCreation) {
     await nextTick();
     await performSetAutoCreation(true);
@@ -1647,6 +1676,7 @@ async function submitAppleVerification() {
         error,
         resumeSync: resumeAliasSyncAfterAuth,
         resumeAutoCreation: resumeAutoCreationAfterAuth,
+        resumeForwarding: resumeForwardingAfterAuth,
       });
       return;
     }
@@ -1711,6 +1741,37 @@ async function performSetAutoCreation(enabled) {
     autoCreationLoading.value = false;
     autoCreationLock.release();
   }
+}
+
+function openForwardingSettings() {
+  if (
+    !account.value ||
+    isCustomMailbox.value ||
+    appleAliasControlsDisabled.value ||
+    aliasesSyncLoading.value ||
+    appleDisconnectLoading.value
+  ) {
+    return;
+  }
+  if (!appleSessionAuthenticated.value) {
+    openAppleLogin({ resumeForwarding: true });
+    return;
+  }
+  forwardingVisible.value = true;
+}
+
+function handleForwardingAuthRequired(error) {
+  forwardingVisible.value = false;
+  if (appleSession.value) {
+    appleSession.value = { ...appleSession.value, status: "expired" };
+  }
+  openAppleLogin({ error, resumeForwarding: true });
+}
+
+function finishForwardingSettings(settings) {
+  forwardingVisible.value = false;
+  aliasSyncSummary.value = null;
+  successMessage(`隐私邮箱已转发至 ${settings.selectedForwardTo}。`);
 }
 
 function syncAliasesFromApple() {
@@ -2221,6 +2282,8 @@ watch(
       detailAbortController?.abort();
       loading.value = false;
       cancelAppleAuth();
+      forwardingVisible.value = false;
+      resumeForwardingAfterAuth = false;
       account.value = null;
       aliases.value = [];
       currentPage.value = 1;
