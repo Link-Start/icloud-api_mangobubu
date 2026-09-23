@@ -20,8 +20,8 @@ var (
 	ErrAccountWebIdentity  = errors.New("Apple account management identity mismatch")
 )
 
-// AccountWebSession is separate from iCloud authentication: the portal uses
-// its own OAuth service key, SCNT and cookies. It contains no password or code.
+// AccountWebSession keeps the portal's OAuth context separate after attempting
+// to reuse the current iCloud login. It contains no password or code.
 type AccountWebSession struct {
 	AppleID        string             `json:"apple_id"`
 	AccountName    string             `json:"account_name,omitempty"`
@@ -146,29 +146,7 @@ func (c *Client) SignInAccount(ctx context.Context, state AccountWebSession, pas
 		return result, false, err
 	}
 	defer persist()
-	response, err := op.request(ctx, "open Apple account portal", http.MethodGet, accountPortalOrigin+"/", nil, op.accountHeaders(""))
-	if err != nil {
-		return result, false, err
-	}
-	if err := accountResponseError(response, "open account portal", nil); err != nil {
-		return result, false, err
-	}
-	response, err = op.request(ctx, "bootstrap Apple account portal", http.MethodGet, accountPortalOrigin+"/bootstrap/portal", nil, op.accountHeaders(""))
-	if err != nil {
-		return result, false, err
-	}
-	if err := accountResponseError(response, "bootstrap account portal", nil); err != nil {
-		return result, false, err
-	}
-	var bootstrap struct {
-		ServiceKey string `json:"serviceKey"`
-	}
-	if json.Unmarshal(response.body, &bootstrap) != nil || bootstrap.ServiceKey == "" || len(bootstrap.ServiceKey) > 512 {
-		return result, false, ErrInvalidResponse
-	}
-	result.ServiceKey, op.widgetKey = bootstrap.ServiceKey, bootstrap.ServiceKey
-	op.session.FrameID, err = c.newUUID()
-	if err != nil {
+	if err := op.bootstrapAccountPortal(ctx, &result); err != nil {
 		return result, false, err
 	}
 	if err := op.authorize(ctx); err != nil {
@@ -187,6 +165,32 @@ func (c *Client) SignInAccount(ctx context.Context, state AccountWebSession, pas
 	}
 	_, err = op.finishAccountSignIn(ctx, &result)
 	return result, false, err
+}
+
+func (op *operation) bootstrapAccountPortal(ctx context.Context, state *AccountWebSession) error {
+	response, err := op.request(ctx, "open Apple account portal", http.MethodGet, accountPortalOrigin+"/", nil, op.accountHeaders(""))
+	if err != nil {
+		return err
+	}
+	if err := accountResponseError(response, "open account portal", nil); err != nil {
+		return err
+	}
+	response, err = op.request(ctx, "bootstrap Apple account portal", http.MethodGet, accountPortalOrigin+"/bootstrap/portal", nil, op.accountHeaders(""))
+	if err != nil {
+		return err
+	}
+	if err := accountResponseError(response, "bootstrap account portal", nil); err != nil {
+		return err
+	}
+	var bootstrap struct {
+		ServiceKey string `json:"serviceKey"`
+	}
+	if json.Unmarshal(response.body, &bootstrap) != nil || bootstrap.ServiceKey == "" || len(bootstrap.ServiceKey) > 512 {
+		return ErrInvalidResponse
+	}
+	state.ServiceKey, op.widgetKey = bootstrap.ServiceKey, bootstrap.ServiceKey
+	op.session.FrameID, err = op.owner.newUUID()
+	return err
 }
 
 func (c *Client) VerifyAccountCode(ctx context.Context, state AccountWebSession, code string) (result AccountWebSession, err error) {
@@ -228,16 +232,56 @@ func (op *operation) finishAccountSignIn(ctx context.Context, state *AccountWebS
 	return op.accountEmailProfile(ctx, state)
 }
 
+// ResumeAccountSession attempts portal authorization using the existing Apple
+// login's domain-scoped cookies and auth context. The iCloud session itself is
+// never modified, and no password submission or device-code request is sent.
+func (c *Client) ResumeAccountSession(ctx context.Context, session Session) (AccountEmailProfile, AccountWebSession, error) {
+	state := AccountWebSession{
+		AppleID: session.AppleID, SCNT: session.SCNT, SessionID: session.SessionID,
+		AuthAttributes: session.AuthAttributes, Cookies: append([]PersistentCookie(nil), session.Cookies...),
+	}
+	if strings.TrimSpace(state.AppleID) == "" {
+		return AccountEmailProfile{}, state, ErrInvalidSession
+	}
+	if session.AccountWeb != nil {
+		if !strings.EqualFold(session.AccountWeb.AppleID, session.AppleID) {
+			return AccountEmailProfile{}, state, ErrAccountWebIdentity
+		}
+		state.AccountName = session.AccountWeb.AccountName
+	}
+	return c.ListAccountEmails(ctx, state)
+}
+
 func (c *Client) ListAccountEmails(ctx context.Context, state AccountWebSession) (profile AccountEmailProfile, result AccountWebSession, err error) {
 	result = state
-	if result.ServiceKey == "" {
-		return profile, result, ErrAccountWebAuth
-	}
 	op, persist, err := c.accountOperation(&result)
 	if err != nil {
 		return profile, result, err
 	}
 	defer persist()
+	if result.ServiceKey == "" {
+		if err := op.bootstrapAccountPortal(ctx, &result); err != nil {
+			return profile, result, err
+		}
+		if err := op.authorize(ctx); err != nil {
+			// The shared authorization helper classifies every non-200 reply
+			// as authentication failure. Only actual auth denials require login.
+			var upstream *Error
+			if errors.As(err, &upstream) && upstream.Kind == ErrAuthentication {
+				copy := *upstream
+				copy.Kind = ErrService
+				if upstream.StatusCode == http.StatusUnauthorized || upstream.StatusCode == http.StatusForbidden {
+					copy.Kind = ErrAccountWebAuth
+				} else if upstream.StatusCode == http.StatusPreconditionFailed {
+					copy.Kind = ErrTermsRequired
+				}
+				err = &copy
+			}
+			return profile, result, err
+		}
+		profile, err = op.finishAccountSignIn(ctx, &result)
+		return profile, result, err
+	}
 	profile, err = op.accountEmailProfile(ctx, &result)
 	return profile, result, err
 }

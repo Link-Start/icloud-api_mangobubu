@@ -32,6 +32,11 @@ type AccountEmailClient interface {
 	DeleteAccountEmail(context.Context, apple.AccountWebSession, apple.AccountEmail) (apple.AccountWebSession, error)
 }
 
+// Optional for compatibility with existing account-email client adapters.
+type AccountSessionReuser interface {
+	ResumeAccountSession(context.Context, apple.Session) (apple.AccountEmailProfile, apple.AccountWebSession, error)
+}
+
 type EmailActionResult struct {
 	Status      string `json:"status"`
 	ChallengeID string `json:"challenge_id,omitempty"`
@@ -117,7 +122,18 @@ func (s *Service) withEmailAccount(ctx context.Context, accountID int64, fn func
 }
 
 func (op *emailAccountOperation) profile(ctx context.Context) (apple.AccountEmailProfile, error) {
-	profile, updated, err := op.client.ListAccountEmails(ctx, op.portal)
+	var profile apple.AccountEmailProfile
+	var updated apple.AccountWebSession
+	var err error
+	reuser, canReuse := op.client.(AccountSessionReuser)
+	if op.portal.ServiceKey == "" && canReuse {
+		profile, updated, err = reuser.ResumeAccountSession(ctx, op.session)
+	} else {
+		profile, updated, err = op.client.ListAccountEmails(ctx, op.portal)
+		if errors.Is(err, apple.ErrAccountWebAuth) && canReuse {
+			profile, updated, err = reuser.ResumeAccountSession(ctx, op.session)
+		}
+	}
 	op.portal, op.portalChanged = updated, true
 	return profile, mapEmailManagementError(err)
 }

@@ -92,6 +92,20 @@ test("portal login and device verification return to the email action without au
   assert.deepEqual(dialog.events, []);
 });
 
+test("session reuse failures do not prompt for a password unless Apple requests authentication", async () => {
+  for (const code of ["NETWORK_ERROR", "APPLE_UPSTREAM_ERROR", "APPLE_RATE_LIMITED", "APPLE_ACCOUNT_MISMATCH"]) {
+    const dialog = harness({ getAccountEmails: async () => { throw { code, message: "Failed to restore session" }; } });
+    await dialog.prepare();
+    assert.equal(dialog.step.value, "blocked", code);
+    assert.equal(dialog.error.value.code, code);
+    assert.deepEqual(dialog.events, []);
+  }
+  const reused = harness();
+  await reused.prepare();
+  assert.equal(reused.step.value, "address");
+  assert.deepEqual(reused.events, []);
+});
+
 test("deletion requires a removable email and an explicit confirmation", async () => {
   let deletes = 0;
   const dialog = harness({ deleteAccountEmail: async () => { deletes++; return { status: "complete", address: "alternate@example.com" }; } }, "delete", "alternate@example.com");

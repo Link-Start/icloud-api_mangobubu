@@ -13,7 +13,7 @@
     <el-skeleton v-if="step === 'loading'" :rows="3" animated />
     <el-form v-else label-position="top" :disabled="busy" @submit.prevent="submit">
       <template v-if="step === 'login'">
-        <p class="email-lead">添加或删除邮箱需要验证当前 Apple 账户。请输入该账户的密码。</p>
+        <p class="email-lead">已尝试复用当前登录，Apple 要求重新验证账户。请输入该账户的密码。</p>
         <el-form-item label="Apple 账户密码">
           <el-input v-model="password" type="password" show-password autocomplete="current-password" />
         </el-form-item>

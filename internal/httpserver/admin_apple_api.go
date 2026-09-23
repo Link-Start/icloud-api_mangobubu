@@ -430,7 +430,7 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 	}
 	switch code {
 	case hmesync.CodeEmailAccountAuthRequired:
-		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "添加或删除邮箱需要验证 Apple 账户，请登录后继续"}
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 要求重新验证账户，请登录后继续"}
 	case hmesync.CodeEmailInvalid:
 		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "Apple 不接受此邮箱，请检查地址是否已添加或已用于其他 Apple 账户"}
 	case hmesync.CodeEmailCodeInvalid:
